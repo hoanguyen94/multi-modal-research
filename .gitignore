@@ -1,0 +1,94 @@
+# Data and generated artifacts
+/data/
+/outputs/
+/results/
+/runs/
+/checkpoints/
+/wandb/
+/mlruns/
+*.ckpt
+*.pth
+*.pt
+*.onnx
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Python environments
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+
+# Packaging and builds
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# LaTeX generated files
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.dvi
+*.fdb_latexmk
+*.fls
+*.glg
+*.glo
+*.gls
+*.idx
+*.ilg
+*.ind
+*.lof
+*.lot
+*.nav
+*.out
+*.snm
+*.run.xml
+*.synctex.gz
+*.toc
+*.vrb
+*.xdv
+/latex/*.pdf
+/latex/_minted-*/
+/latex/auto/
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.code-workspace
+
+# Operating systems
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini

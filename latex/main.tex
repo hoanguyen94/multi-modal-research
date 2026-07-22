@@ -1,0 +1,2818 @@
+\documentclass[11pt]{article}
+
+% =========================================================
+% Packages
+% =========================================================
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{natbib}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\ind}{\mathbb{I}}
+\newcommand{\sigmoid}{\operatorname{sigmoid}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\BCE}{\mathcal{L}_{\mathrm{BCE}}}
+\newcommand{\TSFM}{\mathrm{TSFM}}
+
+% =========================================================
+% Title
+% =========================================================
+\title{
+\textbf{Direction-Aware Multimodal Transfer Learning\\
+for Stock Forecasting with Time-Series Foundation Models}
+}
+
+\author{
+Hoa Nguyen
+}
+
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+% =========================================================
+% Abstract
+% =========================================================
+\begin{abstract}
+This proposal develops a multimodal forecasting framework for predicting the
+direction of four-week-ahead stock-price movements using historical market
+data and precomputed text embeddings. The central design principle is alignment
+with the competition's hit-rate evaluation metric. Rather than treating the
+problem primarily as point forecasting, we formulate it as binary directional
+classification.
+
+The proposed framework transfers information from competition-permitted
+pretrained time-series foundation models, including Chronos, Moirai, and
+TimesFM, through three progressively more adaptive mechanisms: forecast
+stacking, frozen latent-representation extraction, and parameter-efficient
+fine-tuning. Price representations are combined with the supplied text
+embedding vectors using gated fusion or cross-attention. A cross-sectional
+Transformer can additionally model dependencies among stocks at each
+prediction date.
+
+The empirical study will compare simple tabular classifiers, neural
+time-series models trained from scratch, zero-shot foundation-model forecasts,
+and multimodal transfer-learning architectures under purged walk-forward
+validation. The primary outcome is out-of-sample directional hit rate, with
+particular attention to robustness across time, stocks, sectors, and market
+regimes.
+\end{abstract}
+
+% =========================================================
+\section{Motivation}
+% =========================================================
+
+Financial return forecasting is difficult because returns exhibit low
+signal-to-noise ratios, non-stationarity, structural breaks, and weak temporal
+persistence. Recent time-series foundation models have been pretrained on
+large and diverse collections of time series and can therefore provide useful
+inductive priors in data-limited forecasting settings.
+
+However, several issues prevent the direct use of a pretrained numerical
+forecast as the final solution.
+
+First, the competition evaluates predictions using directional hit rate rather
+than a standard regression loss such as mean squared error. A forecast can have
+small numerical error while predicting the wrong direction. Conversely, a
+forecast can have relatively large numerical error while correctly predicting
+whether the future price will be above or below its current level.
+
+Second, pretrained forecasting models are generally trained on numerical time
+series and do not directly incorporate the competition-provided text
+embeddings. The text vectors may contain information about firm-specific,
+sector-level, and macroeconomic developments that is not observable from price
+history alone.
+
+Third, recent evidence suggests that time-series foundation models can be
+strong forecasting priors in financial applications, but no single model
+consistently dominates across all assets. Locally trained models can still
+outperform pretrained models for particular stocks or regimes. This motivates
+a hybrid approach that combines pretrained temporal representations,
+competition-specific supervised learning, and multimodal information.
+
+The main research question is therefore:
+
+\begin{quote}
+\emph{How can competition-permitted pretrained time-series models be adapted
+and combined with precomputed text embeddings to maximize out-of-sample
+directional hit rate?}
+\end{quote}
+
+% =========================================================
+\section{Problem Formulation}
+% =========================================================
+
+Let $i \in \{1,\ldots,N\}$ denote a stock and let $t$ denote a prediction date.
+Let $P_{i,t}$ be the closing price of stock $i$ at time $t$. The forecasting
+horizon is $H$, corresponding approximately to four trading weeks.
+
+The future cumulative log return is
+
+\begin{equation}
+R_{i,t}^{(H)}
+=
+\log\left(
+\frac{P_{i,t+H}}{P_{i,t}}
+\right).
+\end{equation}
+
+The directional target is
+
+\begin{equation}
+y_{i,t}
+=
+\ind\left\{
+R_{i,t}^{(H)} > 0
+\right\}.
+\end{equation}
+
+Thus, although the forecast is indexed by its origin date $t$, its realized
+label is determined by the endpoint $t+H$. All inputs used to produce a
+forecast at $t$ must be observable by the competition's prediction cutoff on
+that date.
+
+Let
+
+\begin{equation}
+X^{P}_{i,t-L+1:t}
+\in
+\R^{L \times F_P}
+\end{equation}
+
+denote the historical price-related feature sequence over a lookback window
+of length $L$, and let
+
+\begin{equation}
+z^T_{i,t}
+\in
+\R^{D_T}
+\end{equation}
+
+denote the supplied precomputed text embedding or a derived aggregation of
+the supplied text embeddings.
+
+The primary model estimates
+
+\begin{equation}
+p_{i,t}
+=
+\Prob
+\left(
+y_{i,t}=1
+\mid
+X^P_{i,t-L+1:t},
+z^T_{i,t}
+\right).
+\end{equation}
+
+The predicted direction is
+
+\begin{equation}
+\widehat{y}_{i,t}
+=
+\ind\left\{
+p_{i,t} > q
+\right\},
+\end{equation}
+
+where $q$ is a classification threshold selected using validation data.
+
+The principal evaluation metric is
+
+\begin{equation}
+\mathrm{HitRate}
+=
+\frac{1}{|\mathcal{D}_{\mathrm{test}}|}
+\sum_{(i,t)\in\mathcal{D}_{\mathrm{test}}}
+\ind
+\left\{
+\widehat{y}_{i,t}=y_{i,t}
+\right\}.
+\end{equation}
+
+If the submission format requires a numerical future price rather than a
+binary direction, probabilities can be converted into valid price forecasts
+using
+
+\begin{equation}
+\widehat{P}_{i,t+H}
+=
+P_{i,t}
+\exp
+\left[
+c(2p_{i,t}-1)
+\right],
+\end{equation}
+
+where $c>0$ is a small fixed constant. This conversion preserves the predicted
+direction:
+
+\begin{equation}
+\widehat{P}_{i,t+H} > P_{i,t}
+\quad\Longleftrightarrow\quad
+p_{i,t}>0.5.
+\end{equation}
+
+% =========================================================
+\section{Notation and Symbol Definitions}
+% =========================================================
+
+Superscripts identify either a data modality or a model; they are not powers
+unless stated otherwise. In particular, $P$ denotes the price modality, $T$
+denotes the text modality, and a superscript $\top$ denotes matrix transpose.
+A tilde denotes a transformed or fused representation, a hat denotes an
+estimate or prediction, and a bar denotes an empirical average. The notation
+used throughout the paper is defined below.
+
+{\renewcommand{\arraystretch}{1.12}
+\begin{longtable}{@{}p{0.25\textwidth}p{0.69\textwidth}@{}}
+\caption{Core indices, targets, predictions, and datasets.}
+\label{tab:notation-core}\\
+\toprule
+\textbf{Symbol} & \textbf{Concrete definition} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Symbol} & \textbf{Concrete definition} \\
+\midrule
+\endhead
+$i\in\{1,\ldots,N\}$ & Stock index; $N$ is the number of stocks in the competition universe. \\
+$t$ & Forecast-origin date. Every input indexed by $t$ is restricted to information observable by the prediction cutoff on that date. \\
+$H$ & Fixed forecast horizon in trading days; approximately four trading weeks (typically 20 trading days). \\
+$L$ & Number of historical dates in the price lookback window. \\
+$P_{i,t}$ & Observed closing price of stock $i$ on date $t$. \\
+$\widehat P_{i,t+H}$ & Predicted closing price for stock $i$ at the endpoint $t+H$. \\
+$R_{i,t}^{(H)}$ & Realized cumulative log return, $\log(P_{i,t+H}/P_{i,t})$, from the forecast origin to the endpoint. \\
+$y_{i,t}$ & Direction label, equal to one when $R_{i,t}^{(H)}>0$ and zero otherwise; it becomes observable only at $t+H$. \\
+$p_{i,t}$ & Model-estimated probability, computed at $t$, that $y_{i,t}=1$, equivalently that $P_{i,t+H}>P_{i,t}$. \\
+$\widehat y_{i,t}$ & Binary direction forecast $\ind\{p_{i,t}>q\}$. \\
+$q$; $q^\star$ & Classification threshold; $q^\star$ is the threshold selected exclusively from validation predictions. \\
+$c$ & Positive log-return magnitude used only to convert a probability into a valid numerical price forecast. \\
+$\mathcal D_{\mathrm{train}}$, $\mathcal D_{\mathrm{validation}}$, $\mathcal D_{\mathrm{test}}$ & Sets of stock--date observations assigned to training, validation, and testing. \\
+$|\mathcal D|$ & Number of observations in dataset or index set $\mathcal D$. \\
+$\ind\{\cdot\}$ & Indicator function: one if its condition is true and zero otherwise. \\
+$\Prob(\cdot)$, $\E[\cdot]$, $\R^d$ & Probability, expectation, and the $d$-dimensional real vector space. \\
+\bottomrule
+\end{longtable}
+
+\begin{longtable}{@{}p{0.25\textwidth}p{0.69\textwidth}@{}}
+\caption{Input-feature and representation notation.}
+\label{tab:notation-inputs}\\
+\toprule
+\textbf{Symbol} & \textbf{Concrete definition} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Symbol} & \textbf{Concrete definition} \\
+\midrule
+\endhead
+$X^P_{i,t-L+1:t}\in\R^{L\times F_P}$ & Ordered price-feature sequence for stock $i$ ending at $t$; rows are dates and the $F_P$ columns are price, return, volatility, volume, market, or related variables. \\
+$x^P_{i,t}\in\R^{F_{\mathrm{tab}}}$ & Fixed-length tabular price vector evaluated at $t$, formed from the engineered price statistics listed in the Price Features subsection. \\
+$F_P$; $F_{\mathrm{tab}}$ & Number of features per sequential time step and number of engineered features in the tabular price vector, respectively. \\
+$r_{i,t}^{(k)}$ & Log return from date $t-k$ to date $t$, $\log(P_{i,t}/P_{i,t-k})$; $r_{i,t}^{(1)}$ is the return from $t-1$ to $t$. \\
+$\bar r_{i,t}^{(k)}$; $\sigma_{i,t}^{(k)}$ & Mean and sample standard deviation of the $k$ one-day returns from $t-k+1$ through $t$. \\
+$e^{(k)}_{i,t,j}\in\R^{D_k}$ & Supplied embedding from text-embedding family $k$ for text item $j$ associated with stock $i$ and date $t$; $D_k$ is its original dimension. \\
+$n_{i,t}$ & Number of distinct text items associated with stock $i$ and date $t$. \\
+$\mu_k$; $U_k\in\R^{D_k\times d_k}$ & Training-set mean and PCA loading matrix for embedding family $k$. \\
+$\widetilde e^{(k)}_{i,t,j}\in\R^{d_k}$ & PCA-compressed embedding of text item $j$ from family $k$. \\
+$\bar{\widetilde e}^{(k)}_{i,t}\in\R^{d_k}$ & Family-$k$ stock-date vector obtained by averaging its PCA-compressed vectors over the distinct associated text items. \\
+$K_T$ & Number of supplied text-embedding families used by the model. \\
+$z^T_{i,t}\in\R^{D_T}$ & Uncompressed supplied or aggregated text-feature vector available for stock $i$ by date $t$; $D_T$ is its dimension. \\
+$s^T_{i,t}\in\R^{F_T}$ & Optional text-summary vector containing features such as item count, embedding norm, temporal averages, or similarity statistics. \\
+$\widetilde z^T_{i,t}\in\R^{\widetilde D_T}$ & Tabular text vector obtained by concatenating the article-averaged vector from every embedding family and $s^T_{i,t}$; a missing family vector is zero. \\
+$h^{T,k}_{i,t,j}$; $h^T_{i,t}$; $H^T_{i,t}$ & Projected representation of item $j$ from family $k$, a single pooled text vector, and a sequence of $J$ text tokens, respectively. \\
+$J$; $d$ & Number of text tokens and shared latent width used by the multimodal model. \\
+\bottomrule
+\end{longtable}
+
+\begin{longtable}{@{}p{0.25\textwidth}p{0.69\textwidth}@{}}
+\caption{Model, fusion, and optimization notation.}
+\label{tab:notation-models}\\
+\toprule
+\textbf{Symbol} & \textbf{Concrete definition} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Symbol} & \textbf{Concrete definition} \\
+\midrule
+\endhead
+$f_\theta$, $g_\psi$ & Predictive mapping and task-specific head with learned parameter collections $\theta$ and $\psi$. Subscripts identify the corresponding model. \\
+$m$; $M_{\mathrm{mod}}$ & Model index and number of models or ensemble members. \\
+$\theta_m^0$; $\theta_0$ & Frozen pretrained parameters of foundation model $m$, or of the selected backbone when no model index is needed. \\
+$H^{P,m}_{i,t}\in\R^{M_m\times d_m}$ & Hidden price-token matrix from foundation model $m$; $M_m$ and $d_m$ are its token count and hidden width. \\
+$H^P_{i,t}\in\R^{M_P\times d}$; $h^P_{i,t}$ & Price-token matrix in the shared latent space and its pooled vector; $M_P$ is the number of price tokens. \\
+$p^{(m)}_{i,t}$; $a^{(m)}_{i,t}$ & Model-$m$ probability of an upward endpoint and its signed point-forecast log-return score. \\
+$S_m$; $\widehat P^{(m,s)}_{i,t+H}$ & Number of forecast samples from model $m$ and its $s$th sampled endpoint price. \\
+$u^{(m)}_{i,t}$; $h^{\mathrm{FM}}_{i,t}$ & Model-$m$ uncertainty summaries and the concatenated foundation-model forecast-feature vector. \\
+$W_0$, $W$, $\Delta W$ & Original pretrained weight matrix, adapted weight matrix, and learned LoRA update. \\
+$A_{\mathrm{LoRA}}$, $B_{\mathrm{LoRA}}$, $r$ & LoRA down-projection, up-projection, and rank, with $r\ll\min(d_{\mathrm{in}},d_{\mathrm{out}})$. \\
+$d_{\mathrm{in}}$; $d_{\mathrm{out}}$ & Input and output widths of the adapted weight matrix. \\
+$\phi$; $\phi_{\mathrm{LoRA}}$ & Optional adapter parameters and the collection of all trainable LoRA parameters. \\
+$W_T,b_T,\phi_T$ & Text-projection matrix, bias, and nonlinear projection mapping. \\
+$Q^T,K^P,V^P$ & Text queries and price keys/values used in text-to-price cross-attention. \\
+$W_Q,W_K,W_V$; $d_{\mathrm{att}}$ & Learned attention projections and per-head query/key width. \\
+$\widetilde H^T_{i,t}$; $\widetilde H^P_{i,t}$ & Cross-attended text-token and price-token matrices. \\
+$g^P_{i,t},g^T_{i,t}$ & Elementwise price and text gates in $[0,1]^d$. \\
+$W_g,b_g,U_g,c_g$ & Trainable matrices and biases used to construct the two gates. \\
+$\widetilde h^P_{i,t}$; $\widetilde h^T_{i,t}$ & Price and text vectors after elementwise gating. \\
+$c^{(\ell)}_{i,\tau}$; $B_{\mathrm{TCN}}$ & TCN hidden vector at date $\tau$ after residual block $\ell$, and the total number of TCN blocks. \\
+$K_{\mathrm{TCN}}$; $\delta_\ell$ & TCN convolution-kernel width and dilation of block $\ell$, with $\delta_\ell=2^{\ell-1}$. \\
+$h^{\mathrm{TCN}}_{i,t}$; $u^{\mathrm{TCN}}_{i,t}$ & Final causal TCN price state at forecast origin $t$, and its fused price--text representation. \\
+$p^{\mathrm{TCN}}_{i,t}$ & Probability of an upward endpoint produced by the train-from-scratch TCN with text fusion. \\
+$v_{i,\tau}$; $h^{\mathrm{GRU}}_{i,\tau}$ & Multimodal input vector and recurrent GRU hidden state at historical date $\tau$. \\
+$a^{\mathrm{upd}}_{i,\tau}$; $a^{\mathrm{rst}}_{i,\tau}$ & GRU update and reset gates. \\
+$\bar h^{\mathrm{GRU}}_{i,\tau}$; $d_g$ & Candidate GRU state and GRU hidden-state width. \\
+$\odot$; $[a;b]$ & Elementwise multiplication and vector concatenation. \\
+$u_{i,t}\in\R^{d_u}$ & Fused representation of stock $i$ at date $t$; $d_u$ is its dimension. \\
+$U_t\in\R^{N\times d_u}$; $\widetilde U_t$ & Matrix of all stock representations at date $t$ and its cross-sectionally contextualized version. \\
+$\widetilde u_{i,t}$; $w,b$ & Row of $\widetilde U_t$ for stock $i$, and the final classifier's weight vector and scalar bias. \\
+$X\in\R^{L\times F}$; $x^{(f)}$ & Generic iTransformer input with $F$ variables, and the length-$L$ trajectory of variable $f$. \\
+$W_{\mathrm{emb}},b_{\mathrm{emb}},h_f^{(0)}$ & iTransformer trajectory-embedding matrix, bias, and initial token for variable $f$. \\
+$\mathcal A\in\R^{F\times F}$ & iTransformer attention-weight matrix across variables. \\
+\bottomrule
+\end{longtable}
+
+\begin{longtable}{@{}p{0.25\textwidth}p{0.69\textwidth}@{}}
+\caption{Loss, validation, ensemble, and evaluation notation.}
+\label{tab:notation-evaluation}\\
+\toprule
+\textbf{Symbol} & \textbf{Concrete definition} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Symbol} & \textbf{Concrete definition} \\
+\midrule
+\endhead
+$\mathcal B$; $B=|\mathcal B|$ & Training mini-batch of stock--date observations and its size. \\
+$q_{i,t}$; $p^{\mathrm{LR}}_{i,t}$ & Logistic-regression input vector and its predicted probability of an upward endpoint. \\
+$\beta_0$; $\beta$ & Unpenalized logistic-regression intercept and coefficient vector. \\
+$\lambda_2$; $\mathcal L_{\mathrm{LR}}$ & Nonnegative $L_2$ regularization strength and the penalized logistic-regression objective. \\
+$\BCE$ & Mean binary cross-entropy over the current mini-batch. \\
+$\mathcal L_{\mathrm{weighted}}$; $\mathcal L$ & Confidence-weighted classification loss and the combined classification--regression objective. \\
+$w_{i,t}$; $w_{\max}$ & Confidence weight assigned to observation $(i,t)$ and its upper cap. \\
+$\alpha$; $\widehat\sigma_{i,t}^{(H)}$; $\epsilon$ & Weighting strength, estimated scale of the $H$-day return, and a small positive numerical stabilizer. \\
+$\widehat R_{i,t}^{(H)}$; $g_R$ & Predicted $H$-day log return and its auxiliary regression head. \\
+$\lambda_R$; $\lambda_D$ & Nonnegative weights on the auxiliary return loss and distillation loss. \\
+$\operatorname{Huber}$; $\operatorname{KL}$ & Huber regression loss and Kullback--Leibler divergence. \\
+$p^{\mathrm{teacher}}_{i,t}$; $p^{\mathrm{student}}_{i,t}$ & Ensemble teacher probability and student-model probability used for distillation. \\
+$w_S,b_S$ & Weight vector and scalar bias of the standalone student classifier. \\
+$\mathcal L_{\mathrm{distill}}$ & Combined binary-classification and teacher--student distillation objective. \\
+$\alpha_m$ & Nonnegative weight for model $m$; the relevant model weights sum to one. \\
+$\kappa$; $K_{\mathrm{fold}}$ & Walk-forward fold index and total number of validation folds. \\
+$T_\kappa$; $V_\kappa$; $G$ & Last training date, last validation date, and purge/embargo length for fold $\kappa$, with $G\geq H$. \\
+$S_{\mathrm{robust}}$; $\gamma$ & Mean fold hit rate minus $\gamma$ times its fold-to-fold standard deviation, and the nonnegative instability penalty. \\
+$\mathrm{HitRate}_\kappa(q)$ & Hit rate in validation fold $\kappa$ when probabilities are converted to labels using threshold $q$. \\
+$\mathcal Q$ & Finite candidate set searched when selecting $q^\star$. \\
+$p^{\mathrm{ens}}_{i,t}$; $D_{i,t}$ & Ensemble probability and standard deviation of member probabilities (model disagreement). \\
+$\widehat h$; $n$ & Observed hit rate and number of evaluated predictions used in its elementary standard-error calculation. \\
+$A,B$ (model labels) & Two prediction methods being compared in the paired statistical analysis; these labels are unrelated to the LoRA matrices. \\
+$N_t$; $d_t$ & Number of evaluated stocks on date $t$ and the date-level difference in hit rate between models $A$ and $B$. \\
+\bottomrule
+\end{longtable}
+}
+
+% =========================================================
+\section{Competition Constraints}
+% =========================================================
+
+The proposed methodology is designed around the following restrictions:
+
+\begin{enumerate}[label=(\arabic*)]
+    \item No external datasets may be used.
+    \item External pretrained models are prohibited except for the explicitly
+    permitted models Chronos, Moirai, TimesFM, and TabPFN.
+    \item Text may only be used through the precomputed embedding vectors
+    supplied by the competition.
+    \item Raw text may not be processed through prompts, external APIs, or
+    additional language models.
+    \item All trainable preprocessing procedures, including normalization,
+    feature selection, and dimensionality reduction, must be fitted using only
+    the competition training data.
+\end{enumerate}
+
+Before implementing model fine-tuning, the rules must be checked to determine
+whether permission to use the four pretrained models includes:
+
+\begin{itemize}
+    \item zero-shot inference only;
+    \item extraction of internal hidden representations;
+    \item partial or full fine-tuning;
+    \item parameter-efficient adaptation such as LoRA.
+\end{itemize}
+
+The proposed experiment therefore separates methods by their level of
+adaptation. If fine-tuning is disallowed, the frozen-forecast and frozen-feature
+variants remain valid candidate methods.
+
+% =========================================================
+\section{Input Construction}
+% =========================================================
+
+\subsection{Price Features}
+
+For each stock and date, the raw price sequence will be transformed into
+stationary or approximately stationary variables. Candidate features include:
+
+\begin{align}
+r_{i,t}^{(1)}
+&=
+\log\left(\frac{P_{i,t}}{P_{i,t-1}}\right),\\
+r_{i,t}^{(k)}
+&=
+\log\left(\frac{P_{i,t}}{P_{i,t-k}}\right),
+\qquad
+k\in\{5,10,20,40,60\},\\
+\bar r_{i,t}^{(k)}
+&=
+\frac{1}{k}
+\sum_{j=0}^{k-1}r_{i,t-j}^{(1)},\\
+\sigma_{i,t}^{(k)}
+&=
+\sqrt{
+\frac{1}{k-1}
+\sum_{j=0}^{k-1}
+\left(
+r_{i,t-j}^{(1)}
+-
+\bar r_{i,t}^{(k)}
+\right)^2
+}.
+\end{align}
+
+Additional candidate features include:
+
+\begin{itemize}
+    \item rolling high--low range;
+    \item close-to-open return;
+    \item rolling drawdown;
+    \item moving-average gaps;
+    \item momentum acceleration;
+    \item rolling return skewness;
+    \item rolling return kurtosis;
+    \item volume level and volume changes, when supplied;
+    \item stock return relative to the supplied stock universe;
+    \item cross-sectional return rank;
+    \item sector-relative return, if sector labels are supplied.
+\end{itemize}
+
+All cross-sectional features will be constructed solely from the competition
+universe.
+
+For a tabular classifier, these quantities are evaluated at the forecast
+origin and collected into the fixed-length vector
+
+\begin{equation}
+x^P_{i,t}
+=
+\operatorname{Tabularize}
+\left(X^P_{i,t-L+1:t}\right)
+\in\R^{F_{\mathrm{tab}}},
+\end{equation}
+
+where $\operatorname{Tabularize}$ denotes the deterministic construction of
+the listed lagged returns, rolling statistics, market-relative variables, and
+other engineered price features. Its parameters are fitted using training
+data only.
+
+\subsection{Text Embeddings}
+
+Suppose the competition provides one or more allowed embedding vectors for
+stock $i$ and date $t$. For embedding family $k$, let
+
+\begin{equation}
+e^{(k)}_{i,t,j}
+\in
+\R^{D_k}
+\end{equation}
+
+denote the embedding of text item $j$.
+
+For each embedding family, a dimensionality-reduction mapping is fitted using
+training observations only and is applied separately to every text item:
+
+\begin{equation}
+\widetilde e^{(k)}_{i,t,j}
+=
+U_k^\top
+\left(
+e^{(k)}_{i,t,j}
+-
+\mu_k
+\right),
+\end{equation}
+
+where $U_k$ may be obtained from principal component analysis, with candidate
+retained dimensions
+
+\begin{equation}
+d_k \in \{16,32,64,128\}.
+\end{equation}
+
+For a tabular model, the compressed articles are averaged only within the same
+embedding family:
+
+\begin{equation}
+\bar{\widetilde e}^{(k)}_{i,t}
+=
+\frac{1}{n_{i,t}}
+\sum_{j=1}^{n_{i,t}}
+\widetilde e^{(k)}_{i,t,j}
+\in\R^{d_k}.
+\end{equation}
+
+Embedding families are never averaged with one another because independently
+fitted PCA axes are not aligned across families.  If no usable article is
+available for family $k$, its aggregated vector is set to zero, while separate
+count and availability features identify the missing-text case.
+
+For neural models, dimensionality reduction may instead be learned through a
+trainable projector:
+
+\begin{equation}
+h^{T,k}_{i,t,j}
+=
+\rho
+\left(
+W_k e^{(k)}_{i,t,j}+b_k
+\right),
+\end{equation}
+
+where $W_k$ and $b_k$ are the family-specific projection parameters and
+$\rho$ is a fixed nonlinear activation.
+
+For tabular models, the family-specific article means and optional summary
+statistics are concatenated as
+
+\begin{equation}
+\widetilde z^T_{i,t}
+=
+\left[
+\bar{\widetilde e}^{(1)}_{i,t};
+\ldots;
+\bar{\widetilde e}^{(K_T)}_{i,t};
+s^T_{i,t}
+\right]
+\in\R^{\widetilde D_T},
+\end{equation}
+
+where $s^T_{i,t}$ contains text counts and availability indicators and
+$\widetilde D_T=\sum_{k=1}^{K_T}d_k+F_T$ is the dimension of the resulting
+concatenated vector.  Attention-based models instead retain the item-level
+vectors $\widetilde e^{(k)}_{i,t,j}$ as separate tokens.
+
+% =========================================================
+\section{Baseline Models}
+% =========================================================
+
+\subsection{Naive Directional Baselines}
+
+The following baselines are necessary to determine whether the learned models
+provide genuine incremental directional information:
+
+\begin{enumerate}
+    \item always predict an upward movement;
+    \item predict the sign of the previous one-day return;
+    \item predict the sign of the previous 20-day return;
+    \item predict the sign of the stock's excess return relative to the market;
+    \item sector momentum, if sector information is available.
+\end{enumerate}
+
+The always-up baseline is particularly important because long-run positive
+equity drift may result in an unconditional upward frequency above 50\%.
+
+\subsection{Tabular Classification}
+
+LightGBM or CatBoost will be trained on engineered price variables and
+compressed text embeddings:
+
+\begin{equation}
+p^{\mathrm{tab}}_{i,t}
+=
+f_{\theta_{\mathrm{tab}}}
+\left(
+x^P_{i,t},
+\widetilde z^T_{i,t}
+\right)
+=
+\widehat{\Prob}_{\theta_{\mathrm{tab}}}
+\left(
+P_{i,t+H}>P_{i,t}
+\mid
+x^P_{i,t},\widetilde z^T_{i,t}
+\right).
+\end{equation}
+
+Here $p^{\mathrm{tab}}_{i,t}$ is indexed by $t$ because it is produced at the
+forecast origin; the event it predicts is explicitly evaluated at $t+H$.
+
+This model provides a strong low-variance benchmark and can capture nonlinear
+interactions between price conditions and embedding dimensions.
+
+TabPFN will also be tested when computationally feasible:
+
+\begin{equation}
+p^{\mathrm{TabPFN}}_{i,t}
+=
+f_{\mathrm{TabPFN}}
+\left(
+x^P_{i,t},
+\widetilde z^T_{i,t};
+\mathcal{D}_{\mathrm{train}}
+\right).
+\end{equation}
+
+\subsection{Train-from-Scratch Sequential Baselines}
+
+The principal train-from-scratch models will include:
+
+\begin{itemize}
+    \item temporal convolutional network;
+    \item gated recurrent unit;
+    \item PatchTST-style encoder;
+    \item iTransformer.
+\end{itemize}
+
+Each model will be equipped with a binary classification head rather than only
+a numerical forecasting head.
+
+% =========================================================
+\section{Pretrained Time-Series Foundation Models}
+% =========================================================
+
+Let $m$ index a permitted pretrained model:
+
+\begin{equation}
+m
+\in
+\{
+\mathrm{Chronos},
+\mathrm{Moirai},
+\mathrm{TimesFM}
+\}.
+\end{equation}
+
+Let $\theta_m^0$ denote its pretrained parameters.
+
+\subsection{Frozen Forecast Features}
+
+The simplest transfer strategy uses each model without updating its parameters.
+For model $m$, obtain either a point forecast, forecast samples, or forecast
+quantiles.
+
+If forecast samples are available, define
+
+\begin{equation}
+p^{(m)}_{i,t}
+=
+\frac{1}{S_m}
+\sum_{s=1}^{S_m}
+\ind
+\left\{
+\widehat P^{(m,s)}_{i,t+H}
+>
+P_{i,t}
+\right\}.
+\end{equation}
+
+Here $S_m$ is the number of predictive samples drawn from model $m$, and
+$\widehat P^{(m,s)}_{i,t+H}$ is sample $s$ of its endpoint-price forecast.
+
+This quantity estimates the model-implied probability of a positive terminal
+return.
+
+If only a point forecast is available, define the signed score
+
+\begin{equation}
+a^{(m)}_{i,t}
+=
+\log
+\left(
+\frac{
+\widehat P^{(m)}_{i,t+H}
+}{
+P_{i,t}
+}
+\right).
+\end{equation}
+
+Foundation-model features are collected as
+
+\begin{equation}
+h^{\mathrm{FM}}_{i,t}
+=
+\left[
+p^{(\mathrm{Chronos})}_{i,t},
+p^{(\mathrm{Moirai})}_{i,t},
+p^{(\mathrm{TimesFM})}_{i,t},
+u^{(\mathrm{Chronos})}_{i,t},
+u^{(\mathrm{Moirai})}_{i,t},
+u^{(\mathrm{TimesFM})}_{i,t}
+\right],
+\end{equation}
+
+where $u^{(m)}_{i,t}$ represents uncertainty statistics such as forecast
+dispersion or interquantile range.
+
+These features are supplied to a competition-trained classifier:
+
+\begin{equation}
+p_{i,t}
+=
+f_\psi
+\left(
+x^P_{i,t},
+z^T_{i,t},
+h^{\mathrm{FM}}_{i,t}
+\right).
+\end{equation}
+
+\subsection{Frozen Latent Representation Transfer}
+
+A richer use of pretraining is to extract internal hidden states rather than
+only the final forecast.
+
+For model $m$, let
+
+\begin{equation}
+H^{P,m}_{i,t}
+=
+f^{\mathrm{hidden}}_{\theta_m^0}
+\left(
+X^P_{i,t-L+1:t}
+\right)
+\in
+\R^{M_m \times d_m}
+\end{equation}
+
+denote its sequence of hidden price tokens.
+
+The pooling operator is defined as mean pooling over the token dimension:
+
+\begin{equation}
+\operatorname{Pool}
+\left(
+H^{P,m}_{i,t}
+\right)
+=
+\frac{1}{M_m}
+\sum_{\ell=1}^{M_m}
+H^{P,m}_{i,t}[\ell,:]
+\in
+\R^{d_m},
+\end{equation}
+
+where $H^{P,m}_{i,t}[\ell,:]$ is the $d_m$-dimensional hidden vector of
+token $\ell$. If padding tokens are present, the average is taken only over
+valid, non-padding tokens and $M_m$ denotes their count.
+
+The pretrained backbone remains frozen, while a competition-specific pooling
+and classification network is trained:
+
+\begin{align}
+h^{P,m}_{i,t}
+&=
+\operatorname{Pool}
+\left(
+H^{P,m}_{i,t}
+\right),\\
+p_{i,t}
+&=
+\sigmoid
+\left[
+g_\psi
+\left(
+h^{P,m}_{i,t},
+z^T_{i,t}
+\right)
+\right].
+\end{align}
+
+This approach tests whether the foundation model's latent representation
+contains useful information that is discarded by its original numerical
+forecast head.
+
+\subsection{Parameter-Efficient Adaptation}
+
+If permitted by the competition rules, the main adaptive model will use
+low-rank adaptation. For a pretrained weight matrix $W_0$, LoRA defines
+
+\begin{equation}
+W
+=
+W_0 + \Delta W,
+\qquad
+\Delta W = B_{\mathrm{LoRA}}A_{\mathrm{LoRA}},
+\end{equation}
+
+where
+
+\begin{equation}
+A_{\mathrm{LoRA}}\in\R^{r\times d_{\mathrm{in}}},
+\qquad
+B_{\mathrm{LoRA}}\in\R^{d_{\mathrm{out}}\times r},
+\end{equation}
+
+and $r$ is much smaller than the original matrix dimensions.
+
+The backbone becomes
+
+\begin{equation}
+H^P_{i,t}
+=
+f_{\theta_0,\phi_{\mathrm{LoRA}}}
+\left(
+X^P_{i,t-L+1:t}
+\right),
+\end{equation}
+
+where $\theta_0$ remains frozen and only $\phi_{\mathrm{LoRA}}$ is updated.
+
+This allows the pretrained model to adapt to:
+
+\begin{itemize}
+    \item financial return dynamics;
+    \item the four-week prediction horizon;
+    \item the directional classification objective;
+    \item the specific stock universe;
+    \item interactions with text-derived information.
+\end{itemize}
+
+% =========================================================
+\section{Proposed Multimodal Architecture}
+% =========================================================
+
+\subsection{Pretrained Price Encoder}
+
+The preferred initial backbone is TimesFM because it provides a pretrained
+temporal representation and can potentially be adapted using a limited number
+of trainable parameters.
+
+The price representation is
+
+\begin{equation}
+H^P_{i,t}
+=
+f_{\theta_0,\phi}
+\left(
+X^P_{i,t-L+1:t}
+\right)
+\in
+\R^{M_P\times d},
+\end{equation}
+
+where:
+
+\begin{itemize}
+    \item $\theta_0$ denotes frozen pretrained parameters;
+    \item $\phi$ denotes optional LoRA or adapter parameters;
+    \item $M_P$ denotes the number of temporal or patch tokens;
+    \item $d$ denotes the shared latent width of each token.
+\end{itemize}
+
+When internal representation extraction is unavailable, a train-from-scratch
+TCN or PatchTST encoder will be used instead.
+
+\subsection{Text Encoder}
+
+The supplied embedding vectors are projected into a shared latent dimension:
+
+\begin{equation}
+h^T_{i,t}
+=
+\operatorname{LayerNorm}
+\left[
+\phi_T
+\left(
+W_T z^T_{i,t}+b_T
+\right)
+\right]
+\in
+\R^d.
+\end{equation}
+
+If several embedding families or several temporal text aggregates are used,
+the text representation is retained as multiple tokens:
+
+\begin{equation}
+H^T_{i,t}
+=
+\left[
+h^{T,1}_{i,t},
+\ldots,
+h^{T,J}_{i,t}
+\right]
+\in
+\R^{J\times d}.
+\end{equation}
+
+\subsection{TCN (Temporal Convolution Network) with Text Fusion}
+
+The TCN with text fusion is a supervised, train-from-scratch model rather than
+a pretrained model.  It uses causal dilated convolutions to encode the price
+history and combines the resulting price state with the supplied text
+embedding.  First project each historical price-feature vector into the TCN
+hidden width:
+
+\begin{equation}
+c^{(0)}_{i,\tau}
+=
+W_{\mathrm{in}}x^P_{i,\tau}+b_{\mathrm{in}},
+\qquad
+\tau\in\{t-L+1,\ldots,t\}.
+\end{equation}
+
+For residual block $\ell\in\{1,\ldots,B_{\mathrm{TCN}}\}$, use the causal
+dilated update
+
+\begin{equation}
+c^{(\ell)}_{i,\tau}
+=
+c^{(\ell-1)}_{i,\tau}
++
+\rho\left(
+\sum_{q=0}^{K_{\mathrm{TCN}}-1}
+W^{(\ell,q)}_{\mathrm{TCN}}
+c^{(\ell-1)}_{i,\tau-q\delta_\ell}
++b^{(\ell)}_{\mathrm{TCN}}
+\right),
+\qquad
+\delta_\ell=2^{\ell-1},
+\end{equation}
+
+where $B_{\mathrm{TCN}}$ is the number of residual blocks,
+$K_{\mathrm{TCN}}$ is the convolution-kernel width, $\delta_\ell$ is the
+dilation, and values before $t-L+1$ are zero padded.  The activation $\rho$
+may be ReLU or GELU.  Because the convolution is causal, the representation at
+$t$ uses no observations after the forecast origin.  The final price state is
+
+\begin{equation}
+h^{\mathrm{TCN}}_{i,t}
+=
+c^{(B_{\mathrm{TCN}})}_{i,t}.
+\end{equation}
+
+The basic concatenation-based text fusion model is
+
+\begin{align}
+u^{\mathrm{TCN}}_{i,t}
+&=
+\rho\left(
+W_{\mathrm{fuse}}
+\left[
+h^{\mathrm{TCN}}_{i,t};h^T_{i,t}
+\right]
++b_{\mathrm{fuse}}
+\right),\\
+p^{\mathrm{TCN}}_{i,t}
+&=
+\sigmoid\left(
+w_{\mathrm{TCN}}^\top u^{\mathrm{TCN}}_{i,t}
++b_{\mathrm{TCN}}
+\right).
+\end{align}
+
+Here $p^{\mathrm{TCN}}_{i,t}$ estimates
+$\Pr(P_{i,t+H}>P_{i,t})$.  All TCN, text-projection, fusion, and classification
+parameters are learned only from the competition training data.  In the gated
+variant, the concatenation projector is replaced by the elementwise gates
+defined below.  In the cross-attention variant, the sequence
+$[c^{(B_{\mathrm{TCN}})}_{i,t-L+1},\ldots,
+c^{(B_{\mathrm{TCN}})}_{i,t}]$ serves as the price tokens attended to by the
+text representation.
+
+\subsection{Encoder--Fusion Summary}
+
+The two principal price-encoder choices are summarized by
+
+\begin{equation}
+h^P_{i,t}
+=
+\begin{cases}
+\operatorname{TCN}\left(X^P_{i,t-L+1:t}\right),
+& \text{trained from scratch},\\[2mm]
+\operatorname{Pool}\!\left(
+\operatorname{TimesFM}_{\theta_0}
+\left(X^P_{i,t-L+1:t}\right)
+\right),
+& \text{pretrained and frozen}.
+\end{cases}
+\end{equation}
+
+After the price history has been encoded, either price encoder can be paired
+with each of the same three text-fusion choices:
+
+\begin{equation}
+u_{i,t}
+=
+\begin{cases}
+[h^P_{i,t};h^T_{i,t}],
+& \text{concatenation},\\
+[\widetilde h^P_{i,t};\widetilde h^T_{i,t}],
+& \text{elementwise gating},\\
+\operatorname{CrossAttention}\left(H^T_{i,t},H^P_{i,t}\right),
+& \text{cross-attention}.
+\end{cases}
+\end{equation}
+
+Consequently, the TCN and frozen-TimesFM paths each produce three distinct
+model variants rather than one generic ``model with text.''  When permitted,
+the same three fusion variants can also be evaluated with a LoRA-adapted
+TimesFM encoder in place of the frozen encoder.
+
+A Temporal Fusion Transformer (TFT) may additionally be trained from scratch
+using only competition-provided price variables and text embeddings.  This
+does not introduce another pretrained model: all TFT variable-selection,
+gating, recurrent, attention, and classification parameters are initialized
+and learned on the competition training data.  Any known-future inputs used by
+the TFT must likewise be supplied or deterministically available at forecast
+time; unavailable future market or text information cannot be used.
+
+\subsection{Why Cross-Attention is Appropriate}
+
+Simple concatenation,
+
+\begin{equation}
+[h^P_{i,t};h^T_{i,t}],
+\end{equation}
+
+allows an MLP to learn interactions, but it compresses the temporal sequence
+before the text is introduced.
+
+Cross-attention preserves the temporal tokens and allows the text
+representation to select relevant historical price patterns. Text-to-price
+cross-attention is defined by
+
+\begin{align}
+Q^T
+&=
+H^T_{i,t}W_Q,\\
+K^P
+&=
+H^P_{i,t}W_K,\\
+V^P
+&=
+H^P_{i,t}W_V,\\
+\widetilde H^T_{i,t}
+&=
+\softmax
+\left(
+\frac{
+Q^T(K^P)^\top
+}{
+\sqrt{d_{\mathrm{att}}}
+}
+\right)
+V^P.
+\end{align}
+
+Here $W_Q$, $W_K$, and $W_V$ are learned projection matrices and
+$d_{\mathrm{att}}$ is the per-head query/key dimension used for attention
+scaling. The superscripts $T$ and $P$ label the text and price modalities;
+only $\top$ denotes transpose.
+
+This operation asks:
+
+\begin{quote}
+Given the current text representation, which portions of the historical price
+trajectory are relevant for the directional prediction?
+\end{quote}
+
+A bidirectional variant additionally lets price tokens attend to text tokens:
+
+\begin{equation}
+\widetilde H^P_{i,t}
+=
+\operatorname{Attention}
+\left(
+Q=H^P_{i,t},
+K=H^T_{i,t},
+V=H^T_{i,t}
+\right).
+\end{equation}
+
+\subsection{Gated Fusion Alternatives}
+
+\subsubsection{Elementwise Cross-Modal Gating}
+
+Because full cross-attention may overfit in a limited-data environment, a
+lower-parameter gated fusion module will be evaluated:
+
+\begin{align}
+g^P_{i,t}
+&=
+\sigmoid
+\left(
+W_g h^T_{i,t}+b_g
+\right),\\
+\widetilde h^P_{i,t}
+&=
+g^P_{i,t}
+\odot
+h^P_{i,t},\\
+g^T_{i,t}
+&=
+\sigmoid
+\left(
+U_g h^P_{i,t}+c_g
+\right),\\
+\widetilde h^T_{i,t}
+&=
+g^T_{i,t}
+\odot
+h^T_{i,t}.
+\end{align}
+
+The fused stock representation is
+
+\begin{equation}
+u_{i,t}
+=
+\left[
+\widetilde h^P_{i,t};
+\widetilde h^T_{i,t};
+h^{\mathrm{FM}}_{i,t}
+\right].
+\end{equation}
+
+This module is an elementwise cross-modal gate, not a recurrent unit.
+
+\subsubsection{GRU-Based Temporal Fusion}
+
+A genuine gated recurrent unit (GRU) will be evaluated as a train-from-scratch
+alternative when aligned price and text features are available throughout the
+lookback window. For each historical date
+$\tau\in\{t-L+1,\ldots,t\}$, define the multimodal input
+
+\begin{equation}
+v_{i,\tau}
+=
+\left[
+x^P_{i,\tau};
+\widetilde z^T_{i,\tau}
+\right].
+\end{equation}
+
+Starting from $h^{\mathrm{GRU}}_{i,t-L}=0\in\R^{d_g}$, the recurrent update is
+
+\begin{align}
+a^{\mathrm{upd}}_{i,\tau}
+&=
+\sigmoid\left(
+W_{\mathrm{upd}}v_{i,\tau}
++U_{\mathrm{upd}}h^{\mathrm{GRU}}_{i,\tau-1}
++b_{\mathrm{upd}}
+\right),\\
+a^{\mathrm{rst}}_{i,\tau}
+&=
+\sigmoid\left(
+W_{\mathrm{rst}}v_{i,\tau}
++U_{\mathrm{rst}}h^{\mathrm{GRU}}_{i,\tau-1}
++b_{\mathrm{rst}}
+\right),\\
+\bar h^{\mathrm{GRU}}_{i,\tau}
+&=
+\tanh\left(
+W_hv_{i,\tau}
++U_h\left(
+a^{\mathrm{rst}}_{i,\tau}
+\odot
+h^{\mathrm{GRU}}_{i,\tau-1}
+\right)
++b_h
+\right),\\
+h^{\mathrm{GRU}}_{i,\tau}
+&=
+\left(1-a^{\mathrm{upd}}_{i,\tau}\right)
+\odot h^{\mathrm{GRU}}_{i,\tau-1}
++a^{\mathrm{upd}}_{i,\tau}
+\odot\bar h^{\mathrm{GRU}}_{i,\tau}.
+\end{align}
+
+Here $a^{\mathrm{upd}}_{i,\tau}$ and $a^{\mathrm{rst}}_{i,\tau}$ are the
+update and reset gates, $\bar h^{\mathrm{GRU}}_{i,\tau}$ is the candidate
+state, $d_g$ is the hidden-state width, and all $W$, $U$, and $b$ terms in
+these equations are trainable GRU parameters. The final recurrent state is
+combined with the foundation-model features as
+
+\begin{align}
+u^{\mathrm{GRU}}_{i,t}
+&=
+\left[
+h^{\mathrm{GRU}}_{i,t};
+h^{\mathrm{FM}}_{i,t}
+\right],\\
+p^{\mathrm{GRU}}_{i,t}
+&=
+\sigmoid\left(
+w_{\mathrm{GRU}}^\top u^{\mathrm{GRU}}_{i,t}
++b_{\mathrm{GRU}}
+\right),
+\end{align}
+
+where $u^{\mathrm{GRU}}_{i,t}$ is the fused GRU representation and
+$w_{\mathrm{GRU}}$ and $b_{\mathrm{GRU}}$ are the classification-head
+parameters. Unlike elementwise gating, this alternative explicitly models
+the temporal order of the multimodal inputs.
+
+% =========================================================
+\section{Cross-Sectional Stock Interaction}
+% =========================================================
+
+At each date $t$, collect the fused representations of all $N$ stocks:
+
+\begin{equation}
+U_t
+=
+\left[
+u_{1,t},
+u_{2,t},
+\ldots,
+u_{N,t}
+\right]^\top
+\in
+\R^{N\times d_u}.
+\end{equation}
+
+A Transformer encoder can model dependencies among stocks:
+
+\begin{equation}
+\widetilde U_t
+=
+\operatorname{TransformerEncoder}
+\left(
+U_t
+\right).
+\end{equation}
+
+For stock $i$, the probability of an upward movement is
+
+\begin{equation}
+p_{i,t}
+=
+\sigmoid
+\left(
+w^\top
+\widetilde u_{i,t}
++
+b
+\right).
+\end{equation}
+
+This cross-sectional module can capture:
+
+\begin{itemize}
+    \item common market movements;
+    \item sector-level dependence;
+    \item lead--lag relationships;
+    \item information spillovers across firms;
+    \item relative momentum and reversal;
+    \item interactions between one firm's text information and related stocks.
+\end{itemize}
+
+To control complexity, the cross-sectional module will be introduced only after
+a strong local stock-level model has been established.
+
+% =========================================================
+\section{iTransformer Alternative}
+% =========================================================
+
+The iTransformer reverses the conventional time-series Transformer
+tokenization. Given
+
+\begin{equation}
+X
+\in
+\R^{L\times F},
+\end{equation}
+
+each feature trajectory is treated as one token:
+
+\begin{equation}
+x^{(f)}
+=
+\left[
+X_{1,f},
+X_{2,f},
+\ldots,
+X_{L,f}
+\right].
+\end{equation}
+
+The trajectory is embedded as
+
+\begin{equation}
+h_f^{(0)}
+=
+W_{\mathrm{emb}}x^{(f)}
++
+b_{\mathrm{emb}}.
+\end{equation}
+
+Self-attention is then applied across variables:
+
+\begin{equation}
+\mathcal A
+=
+\softmax
+\left(
+\frac{QK^\top}{\sqrt{d_{\mathrm{att}}}}
+\right),
+\qquad
+\mathcal A\in\R^{F\times F}.
+\end{equation}
+
+Here $Q$ and $K$ are the projected variable-token query and key matrices,
+$d_{\mathrm{att}}$ is their per-head width, and $\mathcal A$ contains the
+resulting attention weights between all pairs of variables.
+
+This explicitly models relationships such as:
+
+\begin{equation}
+\text{return}
+\leftrightarrow
+\text{volatility}
+\leftrightarrow
+\text{volume}
+\leftrightarrow
+\text{text-derived factors}.
+\end{equation}
+
+Two iTransformer configurations will be evaluated:
+
+\begin{enumerate}
+    \item \textbf{Within-stock iTransformer:} variables represent price,
+    volatility, market, and compressed text features for one stock.
+
+    \item \textbf{Cross-stock iTransformer:} variables represent the return
+    histories of the different stocks, allowing attention to learn
+    cross-sectional dependence.
+\end{enumerate}
+
+The iTransformer is trained from scratch using competition data and serves as
+a locally supervised alternative to the pretrained backbone.
+
+% =========================================================
+\section{Training Objectives}
+% =========================================================
+
+\subsection{Primary Directional Loss}
+
+The main training objective is binary cross-entropy:
+
+\begin{equation}
+\BCE
+=
+-
+\frac{1}{B}
+\sum_{(i,t)\in\mathcal{B}}
+\left[
+y_{i,t}\log p_{i,t}
++
+(1-y_{i,t})\log(1-p_{i,t})
+\right].
+\end{equation}
+
+Model selection will be based on validation hit rate, not validation
+cross-entropy.
+
+\subsection{Confidence-Weighted Classification}
+
+Returns close to zero may have unstable labels. A weighted loss can give
+greater emphasis to observations with clearer movements:
+
+\begin{equation}
+w_{i,t}
+=
+\min
+\left(
+w_{\max},
+1+
+\alpha
+\frac{
+|R_{i,t}^{(H)}|
+}{
+\widehat \sigma_{i,t}^{(H)}+\epsilon
+}
+\right).
+\end{equation}
+
+The loss becomes
+
+\begin{equation}
+\mathcal{L}_{\mathrm{weighted}}
+=
+-
+\frac{1}{B}
+\sum_{(i,t)\in\mathcal B}
+w_{i,t}
+\left[
+y_{i,t}\log p_{i,t}
++
+(1-y_{i,t})\log(1-p_{i,t})
+\right].
+\end{equation}
+
+This modification will be treated as an ablation because weighting examples
+can improve representation learning but may also create a mismatch with an
+unweighted hit-rate metric.
+
+\subsection{Optional Auxiliary Return Loss}
+
+Although regression is not required for hit-rate optimization, an auxiliary
+return-prediction head may regularize the latent representation:
+
+\begin{equation}
+\widehat R_{i,t}^{(H)}
+=
+g_R(u_{i,t}).
+\end{equation}
+
+The combined loss is
+
+\begin{equation}
+\mathcal{L}
+=
+\BCE
++
+\lambda_R
+\operatorname{Huber}
+\left(
+\widehat R_{i,t}^{(H)},
+R_{i,t}^{(H)}
+\right).
+\end{equation}
+
+The coefficient $\lambda_R$ will be selected from
+
+\begin{equation}
+\lambda_R
+\in
+\{0,0.01,0.05,0.1,0.2\}.
+\end{equation}
+
+The pure classification model corresponds to $\lambda_R=0$ and remains the
+default.
+
+\subsection{Distillation Objective}
+
+When multiple allowed pretrained models are available, a student model may
+learn from their directional distributions.
+
+The student is defined as the standalone multimodal GRU introduced above. It
+processes the competition-provided price and text sequence
+
+\begin{equation}
+v_{i,\tau}
+=
+\left[
+x^P_{i,\tau};
+\widetilde z^T_{i,\tau}
+\right],
+\qquad
+\tau=t-L+1,\ldots,t,
+\end{equation}
+
+and produces
+
+\begin{equation}
+p^{\mathrm{student}}_{i,t}
+=
+\sigmoid\left(
+w_S^\top h^{\mathrm{GRU}}_{i,t}+b_S
+\right).
+\end{equation}
+
+Here $h^{\mathrm{GRU}}_{i,t}$ is the final recurrent state and $w_S$ and
+$b_S$ are the student's classification-head parameters. The student does not
+receive $h^{\mathrm{FM}}_{i,t}$ or any teacher output as an inference-time
+input. Consequently, after training it can make predictions without running
+the foundation-model teachers; otherwise, the method would be forecast
+stacking rather than distillation.
+
+Let
+
+\begin{equation}
+p^{\mathrm{teacher}}_{i,t}
+=
+\sum_{m=1}^{M_{\mathrm{mod}}}
+\alpha_m p^{(m)}_{i,t},
+\qquad
+\alpha_m\geq 0,
+\qquad
+\sum_{m=1}^{M_{\mathrm{mod}}} \alpha_m=1.
+\end{equation}
+
+Here $M_{\mathrm{mod}}$ is the number of teacher models and $\alpha_m$ is the
+nonnegative weight assigned to teacher $m$.
+
+The student objective is
+
+\begin{equation}
+\mathcal{L}_{\mathrm{distill}}
+=
+\mathcal{L}^{\mathrm{student}}_{\mathrm{BCE}}
++
+\frac{\lambda_D}{B}
+\sum_{(i,t)\in\mathcal B}
+\operatorname{KL}
+\left[
+\operatorname{Bern}\left(p^{\mathrm{teacher}}_{i,t}\right)
+\parallel
+\operatorname{Bern}\left(p^{\mathrm{student}}_{i,t}\right)
+\right],
+\end{equation}
+
+where
+
+\begin{equation}
+\mathcal{L}^{\mathrm{student}}_{\mathrm{BCE}}
+=
+-\frac{1}{B}
+\sum_{(i,t)\in\mathcal B}
+\left[
+y_{i,t}\log p^{\mathrm{student}}_{i,t}
++(1-y_{i,t})\log\left(1-p^{\mathrm{student}}_{i,t}\right)
+\right].
+\end{equation}
+
+Thus, the first term trains the student on the realized directional labels,
+whereas the second term transfers the soft probabilities of the teacher
+ensemble. The operator $\operatorname{Bern}(p)$ denotes a Bernoulli
+distribution with success probability $p$, and $\lambda_D\geq 0$ controls the
+strength of distillation.
+
+Distillation will only be used if the competition rules allow outputs from the
+permitted models to serve as training targets.
+
+% =========================================================
+\section{Validation Protocol}
+% =========================================================
+
+Random train--validation splitting is inappropriate because four-week targets
+from nearby dates overlap heavily. It would create information leakage and
+overstate out-of-sample performance.
+
+The study will therefore use purged walk-forward validation. For fold
+$\kappa\in\{1,\ldots,K_{\mathrm{fold}}\}$:
+
+\begin{align}
+\mathcal D_{\mathrm{train}}^{(\kappa)}
+&=
+\{(i,t): t\leq T_\kappa\},\\
+\mathcal D_{\mathrm{validation}}^{(\kappa)}
+&=
+\{(i,t): T_\kappa+G < t\leq V_\kappa\},
+\end{align}
+
+where $T_\kappa$ is the final training date, $V_\kappa$ is the final
+validation date, and $G\geq H$ is the purge or embargo interval.
+
+The following validation statistics will be reported:
+
+\begin{itemize}
+    \item overall hit rate;
+    \item hit rate by stock;
+    \item hit rate by sector;
+    \item hit rate by calendar period;
+    \item hit rate by volatility regime;
+    \item balanced accuracy;
+    \item upward and downward class accuracy;
+    \item probability calibration;
+    \item fold-to-fold standard deviation.
+\end{itemize}
+
+A robust model-selection score may be defined as
+
+\begin{equation}
+S_{\mathrm{robust}}
+=
+\frac{1}{K_{\mathrm{fold}}}
+\sum_{\kappa=1}^{K_{\mathrm{fold}}}
+\mathrm{HitRate}_\kappa
+-
+\gamma
+\operatorname{Std}
+\left(
+\mathrm{HitRate}_1,
+\ldots,
+\mathrm{HitRate}_{K_{\mathrm{fold}}}
+\right).
+\end{equation}
+
+The hyperparameter $\gamma\geq 0$ controls the penalty assigned to
+fold-to-fold instability.
+
+This penalizes models that achieve high average performance through one
+exceptionally favorable validation period.
+
+% =========================================================
+\section{Threshold Selection}
+% =========================================================
+
+The default threshold $q=0.5$ may not maximize hit rate because:
+
+\begin{itemize}
+    \item equity returns may have a positive unconditional drift;
+    \item predicted probabilities may be miscalibrated;
+    \item class proportions may change across regimes;
+    \item asymmetric model errors may shift the optimal decision threshold.
+\end{itemize}
+
+A global threshold will be selected as
+
+\begin{equation}
+q^\star
+=
+\arg\max_{q\in\mathcal Q}
+\frac{1}{K_{\mathrm{fold}}}
+\sum_{\kappa=1}^{K_{\mathrm{fold}}}
+\mathrm{HitRate}_\kappa(q),
+\end{equation}
+
+where
+
+\begin{equation}
+\mathcal Q
+=
+\{0.35,0.36,\ldots,0.65\}.
+\end{equation}
+
+Sector-specific or regime-specific thresholds will be considered only if they
+improve several validation folds consistently. Stock-specific thresholds are
+likely to overfit and will not be used unless there is sufficient history.
+
+% =========================================================
+\section{Ensemble Construction}
+% =========================================================
+
+Let
+
+\begin{equation}
+p^{(1)}_{i,t},
+p^{(2)}_{i,t},
+\ldots,
+p^{(M_{\mathrm{mod}})}_{i,t}
+\end{equation}
+
+denote out-of-fold directional predictions from different models.
+
+A linear ensemble is
+
+\begin{equation}
+p^{\mathrm{ens}}_{i,t}
+ =
+\sum_{m=1}^{M_{\mathrm{mod}}}
+\alpha_m p^{(m)}_{i,t},
+\qquad
+\alpha_m\geq 0,
+\qquad
+\sum_{m=1}^{M_{\mathrm{mod}}}\alpha_m=1.
+\end{equation}
+
+Each architecture--fusion combination that produces a separate out-of-fold
+probability is treated as a separate ensemble member.  The candidate members
+are:
+
+\begin{itemize}
+    \item LightGBM and CatBoost classifiers;
+    \item TabPFN using engineered price and supplied text features;
+    \item Chronos directional forecast;
+    \item Moirai directional forecast;
+    \item TimesFM directional forecast;
+    \item TCN price encoder with concatenated text;
+    \item TCN price encoder with elementwise gated text fusion;
+    \item TCN price encoder with text-to-price cross-attention;
+    \item frozen TimesFM price encoder with concatenated text;
+    \item frozen TimesFM price encoder with elementwise gated text fusion;
+    \item frozen TimesFM price encoder with text-to-price cross-attention;
+    \item LoRA-adapted TimesFM price encoder with concatenated text, if
+    permitted;
+    \item LoRA-adapted TimesFM price encoder with elementwise gated text
+    fusion, if permitted;
+    \item LoRA-adapted TimesFM price encoder with text-to-price
+    cross-attention, if permitted;
+    \item GRU-based temporal price--text fusion;
+    \item train-from-scratch TFT using price and supplied text inputs;
+    \item train-from-scratch PatchTST-style classifier;
+    \item train-from-scratch iTransformer classifier;
+    \item cross-sectional Transformer classifier.
+\end{itemize}
+
+The ensemble weights will be selected using only out-of-fold predictions.
+A nonlinear stacking model may additionally use:
+
+\begin{itemize}
+    \item individual model probabilities;
+    \item model disagreement;
+    \item forecast dispersion;
+    \item recent volatility;
+    \item stock or sector indicator;
+    \item strength of the supplied text signal.
+\end{itemize}
+
+Model disagreement is defined as
+
+\begin{equation}
+D_{i,t}
+=
+\operatorname{Std}
+\left(
+p^{(1)}_{i,t},
+\ldots,
+p^{(M_{\mathrm{mod}})}_{i,t}
+\right).
+\end{equation}
+
+High disagreement may indicate low-confidence cases or regime-dependent model
+performance.
+
+% =========================================================
+\section{Experimental Design}
+% =========================================================
+
+The empirical study will proceed in stages.
+
+\subsection{Stage 1: Establish Simple Baselines}
+
+\begin{enumerate}
+    \item always-up prediction;
+    \item momentum and reversal rules;
+    \item logistic regression with price features only;
+    \item logistic regression with price and compressed text embeddings;
+    \item LightGBM using price features only;
+    \item LightGBM using price and compressed text embeddings;
+    \item CatBoost using price features only;
+    \item CatBoost using price and compressed text embeddings;
+    \item XGBoost using price features only;
+    \item XGBoost using price and compressed text embeddings.
+\end{enumerate}
+
+The logistic-regression baselines will use an $L_2$ penalty, also called a
+ridge or squared-coefficient penalty.  For an input vector $q_{i,t}$, where
+$q_{i,t}=x^P_{i,t}$ in the price-only model and
+$q_{i,t}=[x^P_{i,t};\widetilde z^T_{i,t}]$ in the multimodal model, define
+
+\begin{equation}
+p^{\mathrm{LR}}_{i,t}
+=
+\sigmoid\left(
+\beta_0+\beta^\top q_{i,t}
+\right).
+\end{equation}
+
+The coefficients are estimated by minimizing
+
+\begin{equation}
+\begin{aligned}
+\mathcal L_{\mathrm{LR}}
+={}&
+-\frac{1}{B}
+\sum_{(i,t)\in\mathcal B}
+\left[
+y_{i,t}\log p^{\mathrm{LR}}_{i,t}
++(1-y_{i,t})\log\left(1-p^{\mathrm{LR}}_{i,t}\right)
+\right]
++\lambda_2\lVert\beta\rVert_2^2,
+\end{aligned}
+\end{equation}
+
+where $\beta_0$ is the unpenalized intercept, $\beta$ is the coefficient
+vector, and $\lambda_2\geq0$ controls the squared penalty.  All continuous
+inputs are standardized using training-fold statistics only, and
+$\lambda_2$ is selected using the purged walk-forward validation folds.  The
+penalty is particularly useful for the price-plus-text model because its
+compressed embedding features may remain correlated or high-dimensional.
+
+\subsection{Stage 2: Evaluate Pretrained Forecasts}
+
+\begin{enumerate}
+    \item zero-shot Chronos;
+    \item zero-shot Moirai;
+    \item zero-shot TimesFM;
+    \item majority vote;
+    \item weighted forecast ensemble;
+    \item tabular classifier using all foundation-model outputs.
+\end{enumerate}
+
+\subsection{Stage 3: Train Local Sequential Models}
+
+\begin{enumerate}
+    \item TCN with price features;
+    \item TCN with concatenated text embeddings;
+    \item TCN with gated text fusion;
+    \item TCN with cross-attention;
+    \item GRU baseline;
+    \item Temporal Fusion Transformer trained from scratch;
+    \item PatchTST-style classifier;
+    \item iTransformer classifier.
+\end{enumerate}
+
+\subsection{Stage 4: Transfer Pretrained Representations}
+
+\begin{enumerate}
+    \item frozen TimesFM representation plus classification head;
+    \item frozen representation plus gated text fusion;
+    \item frozen representation plus text-to-price cross-attention;
+    \item LoRA adaptation, if permitted;
+    \item partial unfreezing of the final backbone blocks, if permitted.
+\end{enumerate}
+
+\subsection{Stage 5: Model Cross-Stock Relationships}
+
+\begin{enumerate}
+    \item cross-sectional engineered features;
+    \item Transformer attention across stock representations;
+    \item sector-restricted attention;
+    \item cross-sectional iTransformer;
+    \item local-plus-cross-sectional ensemble.
+\end{enumerate}
+
+% =========================================================
+\section{Ablation Studies}
+% =========================================================
+
+The following ablations will identify which components provide incremental
+directional information.
+
+\begin{table}[ht]
+\centering
+\caption{Planned ablation experiments.}
+\begin{tabular}{p{0.29\textwidth}p{0.61\textwidth}}
+\toprule
+\textbf{Component} & \textbf{Comparison} \\
+\midrule
+Text information
+&
+Price only versus price plus each supplied embedding family.
+\\
+
+Embedding fusion
+&
+Concatenation versus averaging versus gated fusion versus cross-attention.
+\\
+
+Pretrained information
+&
+No pretrained model versus forecast features versus frozen latent states.
+\\
+
+Adaptation
+&
+Frozen backbone versus LoRA versus partial fine-tuning.
+\\
+
+Pretrained model
+&
+Chronos versus Moirai versus TimesFM versus their ensemble.
+\\
+
+Temporal encoder
+&
+TCN versus GRU versus TFT versus PatchTST versus iTransformer.
+\\
+
+Objective
+&
+Binary cross-entropy versus weighted BCE versus BCE plus auxiliary regression.
+\\
+
+Context length
+&
+$L\in\{64,128,256,512\}$.
+\\
+
+Cross-sectional modeling
+&
+Independent stock predictions versus cross-stock Transformer.
+\\
+
+Threshold
+&
+Fixed $0.5$ versus validation-selected global threshold.
+\\
+
+Embedding dimension
+&
+PCA or projection dimensions in $\{16,32,64,128\}$.
+\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =========================================================
+\section{Statistical Evaluation}
+% =========================================================
+
+For each model, the hit rate is a sample proportion. A simple standard error is
+
+\begin{equation}
+\operatorname{SE}
+\left(
+\widehat{\mathrm{HitRate}}
+\right)
+=
+\sqrt{
+\frac{
+\widehat h(1-\widehat h)
+}{
+n
+}
+},
+\end{equation}
+
+where $\widehat h$ is the observed hit rate and $n$ is the number of predictions.
+
+Because stock-date observations are cross-sectionally and temporally
+dependent, naive independent-observation standard errors may be misleading.
+The analysis will therefore also use:
+
+\begin{itemize}
+    \item date-level block bootstrap;
+    \item paired comparison of daily hit rates;
+    \item stock-level performance dispersion;
+    \item fold-level robustness analysis.
+\end{itemize}
+
+For models $A$ and $B$, define the date-level difference
+
+\begin{equation}
+d_t
+=
+\frac{1}{N_t}
+\sum_i
+\left[
+\ind\{\widehat y^A_{i,t}=y_{i,t}\}
+-
+\ind\{\widehat y^B_{i,t}=y_{i,t}\}
+\right].
+\end{equation}
+
+Block-bootstrap confidence intervals for $\E[d_t]$ will be used to determine
+whether improvements are robust rather than driven by isolated dates.
+
+% =========================================================
+\section{Expected Contributions}
+% =========================================================
+
+The proposed work offers four main contributions.
+
+\begin{enumerate}
+    \item \textbf{Metric-aligned adaptation.}
+    It reformulates pretrained numerical forecasting as directional
+    classification aligned with the competition's hit-rate objective.
+
+    \item \textbf{Richer use of foundation models.}
+    It compares final forecast stacking, hidden-representation extraction, and
+    parameter-efficient weight adaptation rather than treating pretrained
+    models only as black-box point forecasters.
+
+    \item \textbf{Rule-compliant multimodal fusion.}
+    It integrates historical market information with only the supplied
+    precomputed text embeddings, without external text processing or
+    prohibited language models.
+
+    \item \textbf{Cross-sectional modeling.}
+    It investigates whether relationships among the competition stocks improve
+    directional prediction beyond independent per-stock forecasting.
+\end{enumerate}
+
+% =========================================================
+\section{Risks and Mitigation}
+% =========================================================
+
+\subsection{Overfitting}
+
+The primary risk is overfitting due to a limited number of distinct market
+regimes. Mitigation measures include:
+
+\begin{itemize}
+    \item purged chronological validation;
+    \item small trainable heads;
+    \item frozen pretrained backbones;
+    \item low-rank adaptation;
+    \item dropout and weight decay;
+    \item early stopping based on validation hit rate;
+    \item avoiding stock-specific hyperparameters without strong evidence.
+\end{itemize}
+
+\subsection{Weak Foundation-Model Directional Skill}
+
+A pretrained model may have good point-forecast MAE without useful directional
+accuracy. Therefore, each foundation model will be evaluated independently on
+hit rate before its outputs are included in the ensemble.
+
+\subsection{Noisy or Redundant Embeddings}
+
+The supplied embedding vectors may be high-dimensional, correlated, or weakly
+related to four-week returns. Each embedding family will first be evaluated
+separately, and low-dimensional projection or embedding dropout will be used
+to reduce overfitting.
+
+\subsection{Architectural Incompatibility}
+
+Weights from TimesFM, Chronos, or Moirai cannot be directly copied into an
+unrelated TCN, GRU, or iTransformer. Weight initialization is therefore used
+only when retaining the corresponding pretrained architecture. For unrelated
+student architectures, transfer will occur through forecast features,
+representations, or distillation.
+
+\subsection{Rule Interpretation}
+
+The phrase ``use of pretrained models is allowed'' may not necessarily imply
+that arbitrary fine-tuning or hidden-state extraction is allowed. The final
+pipeline will include only methods explicitly compliant with the organizers'
+interpretation.
+
+% =========================================================
+\section{Recommended Initial Model}
+% =========================================================
+
+The initial high-priority model is
+
+\begin{equation}
+\boxed{
+\begin{aligned}
+H^P_{i,t}
+&=
+\operatorname{TimesFM}_{\theta_0}
+\left(
+X^P_{i,t-L+1:t}
+\right),\\
+H^T_{i,t}
+&=
+\operatorname{TextProjector}
+\left(
+z^T_{i,t}
+\right),\\
+u_{i,t}
+&=
+\operatorname{GatedFusion}
+\left(
+\operatorname{Pool}(H^P_{i,t}),
+\operatorname{Pool}(H^T_{i,t})
+\right),\\
+p_{i,t}
+&=
+\sigmoid
+\left(
+\operatorname{MLP}(u_{i,t})
+\right).
+\end{aligned}
+}
+\end{equation}
+
+The first implementation will keep TimesFM frozen. The subsequent versions
+will add:
+
+\begin{enumerate}
+    \item text-to-price cross-attention;
+    \item foundation-model forecast and uncertainty features;
+    \item LoRA adaptation, if permitted;
+    \item cross-sectional attention across stocks.
+\end{enumerate}
+
+This staged construction makes it possible to determine whether each increase
+in architectural complexity produces a genuine improvement in purged
+out-of-sample hit rate.
+
+% =========================================================
+\section{Implementation Plan}
+% =========================================================
+
+\begin{table}[ht]
+\centering
+\caption{Proposed implementation sequence.}
+\begin{tabular}{clp{0.55\textwidth}}
+\toprule
+\textbf{Phase} & \textbf{Model} & \textbf{Purpose} \\
+\midrule
+1
+&
+Naive and tabular baselines
+&
+Establish unconditional drift, momentum, and text-feature benchmarks.
+\\
+
+2
+&
+Frozen TSFM forecasts
+&
+Measure zero-shot directional value of Chronos, Moirai, and TimesFM.
+\\
+
+3
+&
+Forecast stacking
+&
+Combine TSFM predictions with engineered price and text features.
+\\
+
+4
+&
+TCN multimodal classifier
+&
+Establish a compact train-from-scratch neural benchmark.
+\\
+
+5
+&
+Frozen TSFM representation
+&
+Test whether latent temporal features outperform final forecasts.
+\\
+
+6
+&
+Gated or attention fusion
+&
+Model conditional interactions between text and price patterns.
+\\
+
+7
+&
+LoRA adaptation
+&
+Adapt the pretrained backbone to the directional financial task.
+\\
+
+8
+&
+Cross-stock Transformer
+&
+Capture sector, market, and inter-stock information spillovers.
+\\
+
+9
+&
+Out-of-fold ensemble
+&
+Combine complementary model errors and improve robustness.
+\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =========================================================
+\section{Conclusion}
+% =========================================================
+
+This proposal presents a rule-compliant framework for directional stock
+forecasting using historical market variables, supplied text embeddings, and
+competition-permitted time-series foundation models. The framework does not
+assume that a low numerical forecasting error automatically produces a high
+directional hit rate. Instead, it directly optimizes the probability of a
+positive four-week return and selects all models according to purged
+out-of-sample hit rate.
+
+The main hypothesis is that pretrained time-series models are most useful not
+only through their final numerical forecasts, but also through their internal
+representations and carefully constrained parameter adaptation. These temporal
+priors can be combined with text embeddings through gated fusion or
+cross-attention and, when justified by validation, extended with attention
+across stocks.
+
+The proposed staged evaluation will determine whether the strongest practical
+solution is a simple stacked classifier, a frozen-representation model, a
+LoRA-adapted multimodal foundation model, or an ensemble of these approaches.
+
+
+% =========================================================
+\section{Methodological Novelty}
+% =========================================================
+
+The proposed work is not intended to contribute only a new architecture for
+one financial forecasting competition. Its broader methodological objective is
+to develop a decision-aligned and parameter-efficient adaptation framework for
+pretrained time-series foundation models.
+
+Existing time-series foundation models are generally pretrained to minimize
+numerical forecasting losses. In many practical applications, however, the
+forecast itself is not the final object of interest. The forecast is used to
+make a downstream decision, such as determining whether a future quantity will
+cross a threshold, selecting among alternatives, triggering an intervention,
+or choosing an action.
+
+This creates a potential mismatch between the pretraining objective and the
+downstream evaluation criterion.
+
+\subsection{Forecasting Loss versus Decision Loss}
+
+Let $Y$ denote the future quantity of interest and let $\widehat Y$ denote the
+model forecast. A conventional forecasting model minimizes a numerical loss
+
+\begin{equation}
+\mathcal{L}_{\mathrm{forecast}}
+=
+\ell(\widehat Y,Y),
+\end{equation}
+
+where $\ell$ may be the mean squared error, mean absolute error, negative
+log-likelihood, or quantile loss.
+
+The downstream decision is determined through a decision map
+
+\begin{equation}
+d:
+\mathcal{Y}
+\rightarrow
+\mathcal{A},
+\end{equation}
+
+where $\mathcal{A}$ is the action space. In the directional forecasting task,
+
+\begin{equation}
+d(Y)
+=
+\ind\{Y>0\}.
+\end{equation}
+
+The corresponding decision loss is
+
+\begin{equation}
+\mathcal{L}_{\mathrm{decision}}
+=
+\ind
+\left\{
+d(\widehat Y)
+\neq
+d(Y)
+\right\}.
+\end{equation}
+
+A model can achieve a low numerical forecasting error while producing the
+wrong downstream decision. For example, when $Y$ is close to zero, even a
+small forecasting error can reverse the predicted sign. Conversely, a large
+magnitude error may leave the sign unchanged and therefore have no effect on
+directional accuracy.
+
+The first methodological contribution is therefore to adapt pretrained
+time-series models explicitly for downstream decision quality rather than
+treating numerical forecast accuracy as a sufficient surrogate.
+
+\subsection{Decision Regret Formulation}
+
+The framework can be generalized beyond binary direction prediction. Let
+
+\begin{equation}
+U(a,Y)
+\end{equation}
+
+denote the utility obtained from taking action $a$ when the realized outcome is
+$Y$. The optimal action under perfect information is
+
+\begin{equation}
+a^\star(Y)
+=
+\arg\max_{a\in\mathcal A}
+U(a,Y).
+\end{equation}
+
+A learned model chooses an action
+
+\begin{equation}
+a_\theta(X)
+\end{equation}
+
+from historical information $X$. The decision regret is
+
+\begin{equation}
+\mathcal{R}_{\mathrm{decision}}
+\left(
+a_\theta(X),Y
+\right)
+=
+U\left(a^\star(Y),Y\right)
+-
+U\left(a_\theta(X),Y\right).
+\end{equation}
+
+The proposed framework minimizes expected decision regret:
+
+\begin{equation}
+\min_\theta
+\E
+\left[
+\mathcal{R}_{\mathrm{decision}}
+\left(
+a_\theta(X),Y
+\right)
+\right].
+\end{equation}
+
+For directional classification with zero-one utility, this reduces to
+minimizing sign-prediction error. In other domains, the same formulation can
+represent:
+
+\begin{itemize}
+    \item whether energy demand will exceed available capacity;
+    \item whether traffic volume will exceed a congestion threshold;
+    \item whether inventory should be replenished;
+    \item whether an anomaly alarm should be triggered;
+    \item whether a physiological variable will enter a risky region;
+    \item which item or asset should be ranked above another.
+\end{itemize}
+
+This formulation makes the proposed method applicable beyond financial
+forecasting.
+
+\subsection{Decision-Conditioned Parameter-Efficient Adaptation}
+
+Let a pretrained time-series foundation model with frozen parameters
+$\theta_0$ generate temporal representations
+
+\begin{equation}
+H
+=
+f_{\theta_0}(X)
+=
+\left[
+h_1,
+h_2,
+\ldots,
+h_M
+\right]
+\in
+\R^{M\times d}.
+\end{equation}
+
+Standard low-rank adaptation modifies selected pretrained matrices using
+
+\begin{equation}
+W
+=
+W_0 + BA,
+\end{equation}
+
+where
+
+\begin{equation}
+A\in\R^{r\times d_{\mathrm{in}}},
+\qquad
+B\in\R^{d_{\mathrm{out}}\times r},
+\end{equation}
+
+and $r$ is much smaller than the original weight dimensions.
+
+The proposed novelty is to condition the magnitude and location of the
+low-rank adaptation on downstream decision relevance. Rather than applying the
+same adapter uniformly to all temporal representations, the model learns which
+tokens or temporal regions are most important for the decision.
+
+Let $c$ denote contextual information, such as precomputed text embeddings,
+metadata, or other permitted covariates. Define a decision-conditioning score
+
+\begin{equation}
+\alpha_j
+=
+\frac{
+\exp
+\left(
+q(c)^\top k(h_j)
+\right)
+}{
+\sum_{\ell=1}^{M}
+\exp
+\left(
+q(c)^\top k(h_\ell)
+\right)
+},
+\end{equation}
+
+where $q(\cdot)$ and $k(\cdot)$ are learned projection functions.
+
+A token-level decision-conditioned adapter is then
+
+\begin{equation}
+\Delta h_j
+=
+\alpha_j
+B A h_j,
+\end{equation}
+
+and the adapted representation is
+
+\begin{equation}
+\widetilde h_j
+=
+h_j+\Delta h_j.
+\end{equation}
+
+Equivalently,
+
+\begin{equation}
+\widetilde H
+=
+H+
+\operatorname{Diag}(\alpha)
+H A^\top B^\top.
+\end{equation}
+
+This mechanism has two intended effects:
+
+\begin{enumerate}
+    \item it allocates limited adaptation capacity to temporal patterns that
+    are most relevant to the downstream decision;
+
+    \item it allows contextual information to control how the pretrained
+    representation is modified, rather than only being appended after the
+    frozen price encoder.
+\end{enumerate}
+
+This differs from standard cross-attention. In ordinary cross-attention,
+context is used to construct a fused representation after the price
+representation has already been computed. In the proposed method, context
+directly governs the adaptation applied to the pretrained temporal
+representation.
+
+\subsection{Decision-Aligned Surrogate Objective}
+
+The zero-one directional loss is non-differentiable. A smooth surrogate is
+therefore required.
+
+For a realized future return $Y$ and a scalar model score $s_\theta(X)$, define
+
+\begin{equation}
+\mathcal{L}_{\mathrm{margin}}
+=
+\log
+\left[
+1+
+\exp
+\left(
+-
+\frac{
+Y\,s_\theta(X)
+}{
+\tau_\theta(X)+\epsilon
+}
+\right)
+\right],
+\end{equation}
+
+where $\tau_\theta(X)>0$ is a learned local uncertainty or noise scale.
+
+The product
+
+\begin{equation}
+Y\,s_\theta(X)
+\end{equation}
+
+is positive when the prediction and the realized outcome have the same sign.
+The loss therefore encourages directional agreement. The uncertainty scale
+prevents observations with intrinsically high noise from dominating the
+training objective.
+
+The full objective may combine decision quality, forecast information, and
+adaptation regularization:
+
+\begin{equation}
+\mathcal{L}
+=
+\lambda_d
+\mathcal{L}_{\mathrm{margin}}
++
+\lambda_f
+\mathcal{L}_{\mathrm{forecast}}
++
+\lambda_c
+\mathcal{L}_{\mathrm{consistency}}
++
+\lambda_p
+\|\phi\|_2^2,
+\end{equation}
+
+where:
+
+\begin{itemize}
+    \item $\phi$ denotes the trainable adapter and task-head parameters;
+    \item $\mathcal{L}_{\mathrm{forecast}}$ preserves useful numerical
+    forecasting information;
+    \item $\mathcal{L}_{\mathrm{consistency}}$ prevents excessive deviation
+    from the pretrained representation;
+    \item $\mathcal{L}_{\mathrm{margin}}$ directly aligns the model with the
+    downstream decision.
+\end{itemize}
+
+The pure decision-aligned model is obtained by setting $\lambda_f=0$.
+
+\subsection{Representation Consistency}
+
+Parameter-efficient adaptation may overfit the downstream dataset and destroy
+transferable information learned during pretraining. To reduce catastrophic
+specialization, the adapted representation can be regularized toward the
+frozen representation:
+
+\begin{equation}
+\mathcal{L}_{\mathrm{consistency}}
+=
+\frac{1}{M}
+\sum_{j=1}^{M}
+\left\|
+\widetilde h_j-h_j
+\right\|_2^2.
+\end{equation}
+
+A relational alternative preserves pairwise token geometry:
+
+\begin{equation}
+\mathcal{L}_{\mathrm{rel}}
+=
+\left\|
+\operatorname{sim}(\widetilde H,\widetilde H)
+-
+\operatorname{sim}(H,H)
+\right\|_F^2,
+\end{equation}
+
+where $\operatorname{sim}$ denotes a cosine-similarity matrix.
+
+This encourages the adapter to modify only the information needed for the
+downstream decision while preserving the global structure of the pretrained
+representation.
+
+\subsection{Robust Adaptation under Temporal Distribution Shift}
+
+Time-series applications commonly exhibit temporal distribution shift:
+
+\begin{equation}
+P_{\mathrm{train}}(X,Y)
+\neq
+P_{\mathrm{test}}(X,Y).
+\end{equation}
+
+The proposed framework therefore includes an optional robust decision
+objective:
+
+\begin{equation}
+\min_{\phi}
+\sup_{Q:
+D(Q,\widehat P)\leq\rho}
+\E_Q
+\left[
+\mathcal{L}_{\mathrm{margin}}
+\left(
+f_{\theta_0,\phi}(X),Y
+\right)
+\right],
+\end{equation}
+
+where:
+
+\begin{itemize}
+    \item $\widehat P$ is the empirical training distribution;
+    \item $D$ is a statistical divergence or transport distance;
+    \item $\rho$ controls the size of the ambiguity set.
+\end{itemize}
+
+A computationally simpler latent-robustness formulation is
+
+\begin{equation}
+\min_{\phi}
+\E
+\left[
+\max_{\|\delta\|_2\leq\epsilon}
+\mathcal{L}_{\mathrm{margin}}
+\left(
+g_\phi(H+\delta),Y
+\right)
+\right].
+\end{equation}
+
+The perturbation $\delta$ represents uncertainty or regime variation in the
+pretrained latent space. The model is trained to preserve decision quality
+under locally adverse changes in the representation.
+
+\subsection{Theoretical Motivation}
+
+For the directional task, let
+
+\begin{equation}
+d^\star
+=
+\operatorname{sign}(Y),
+\qquad
+\widehat d
+=
+\operatorname{sign}(\widehat Y).
+\end{equation}
+
+A sign error can occur only if the numerical forecast error is at least as
+large as the absolute decision margin:
+
+\begin{equation}
+\ind
+\left\{
+\widehat d\neq d^\star
+\right\}
+\leq
+\ind
+\left\{
+|\widehat Y-Y|
+\geq
+|Y|
+\right\}.
+\end{equation}
+
+For any $a>0$,
+
+\begin{equation}
+\Prob
+\left(
+\widehat d\neq d^\star
+\right)
+\leq
+\Prob(|Y|\leq a)
++
+\Prob
+\left(
+|\widehat Y-Y|\geq a
+\right).
+\end{equation}
+
+If the $p$-th moment of the forecasting error is finite, Markov's inequality
+gives
+
+\begin{equation}
+\Prob
+\left(
+\widehat d\neq d^\star
+\right)
+\leq
+\Prob(|Y|\leq a)
++
+\frac{
+\E|\widehat Y-Y|^p
+}{
+a^p
+}.
+\end{equation}
+
+This decomposition highlights two distinct causes of directional error:
+
+\begin{enumerate}
+    \item substantial probability mass close to the decision boundary;
+    \item large forecasting error away from the boundary.
+\end{enumerate}
+
+Minimizing average numerical forecasting error addresses only the second term
+indirectly and may ignore the concentration of observations near the decision
+boundary. The proposed margin-aware adaptation explicitly focuses model
+capacity on representations that matter for downstream decisions.
+
+A more complete theoretical analysis will investigate:
+
+\begin{itemize}
+    \item classification calibration of the proposed decision surrogate;
+    \item upper bounds on decision regret;
+    \item the effect of low-rank adapter complexity on generalization;
+    \item robustness guarantees under bounded temporal distribution shift.
+\end{itemize}
+
+\subsection{General Research Hypotheses}
+
+The main hypotheses are:
+
+\begin{description}
+    \item[H1.]
+    Direct decision-aligned adaptation produces lower downstream decision
+    regret than forecast-then-threshold approaches, even when numerical
+    forecasting accuracy is similar.
+
+    \item[H2.]
+    Frozen latent representations contain more useful decision information
+    than final point forecasts alone.
+
+    \item[H3.]
+    Decision-conditioned low-rank adaptation outperforms standard LoRA because
+    it allocates adaptation capacity selectively across temporal tokens.
+
+    \item[H4.]
+    Conditioning adaptation on an auxiliary modality is more effective than
+    introducing that modality only after temporal representation pooling.
+
+    \item[H5.]
+    Restricting adaptation through low-rank structure and representation
+    consistency improves generalization under limited labels and temporal
+    distribution shift.
+
+    \item[H6.]
+    The proposed method generalizes across time-series domains involving
+    direction, ranking, and threshold-based decisions.
+\end{description}
+
+\subsection{Claimed Contributions}
+
+The proposed research aims to make the following contributions:
+
+\begin{enumerate}
+    \item A general formulation of decision-aligned adaptation for pretrained
+    time-series foundation models.
+
+    \item A decision-conditioned low-rank adapter that selectively modifies
+    temporal representations according to downstream decision relevance.
+
+    \item A multimodal adaptation mechanism in which contextual embeddings
+    control the adaptation of the pretrained temporal backbone.
+
+    \item A margin-aware surrogate objective that accounts for both directional
+    correctness and local outcome uncertainty.
+
+    \item An optional robustness framework for maintaining decision quality
+    under temporal distribution shift.
+
+    \item A theoretical analysis connecting forecasting error, decision
+    margins, and downstream decision regret.
+
+    \item A multi-domain empirical evaluation across several time-series
+    foundation-model backbones and downstream decision tasks.
+\end{enumerate}
+
+The intended high-level contribution can be summarized as follows:
+
+\begin{quote}
+We introduce a parameter-efficient adaptation framework that selectively
+modifies pretrained time-series representations according to downstream
+decision sensitivity, and we evaluate whether this approach reduces decision
+regret under limited supervision and temporal distribution shift.
+\end{quote}
+
+
+
+% =========================================================
+% Bibliography
+% =========================================================
+\bibliographystyle{plainnat}
+
+\begin{thebibliography}{99}
+
+\bibitem[Ansari et al.(2024)]{chronos}
+Ansari, A. F., Stella, L., Turkmen, C., Zhang, X., Mercado, P.,
+Shen, H., Shchur, O., Rangapuram, S. S., Arango, S. P.,
+Kapoor, S., Zschiegner, J., Maddix, D. C., Wang, H.,
+Mahoney, M. W., Torkkola, K., Wilson, A. G., Bohlke-Schneider, M.,
+and Wang, Y.
+\newblock Chronos: Learning the language of time series.
+\newblock \emph{arXiv preprint arXiv:2403.07815}, 2024.
+
+\bibitem[Das et al.(2024)]{timesfm}
+Das, A., Kong, W., Sen, R., and Zhou, Y.
+\newblock A decoder-only foundation model for time-series forecasting.
+\newblock \emph{Proceedings of the 41st International Conference on
+Machine Learning}, 2024.
+
+\bibitem[Liu et al.(2024)]{itransformer}
+Liu, Y., Hu, T., Zhang, H., Wu, H., Wang, S., Ma, L., and Long, M.
+\newblock iTransformer: Inverted Transformers are effective for time series
+forecasting.
+\newblock \emph{International Conference on Learning Representations}, 2024.
+
+\bibitem[Noguer i Alonso and Pereira Franklin(2026)]{financialtsfm}
+Noguer i Alonso, M. and Pereira Franklin, R.
+\newblock Pretrained time-series foundation models for financial return
+forecasting.
+\newblock \emph{arXiv preprint arXiv:2606.27100}, 2026.
+
+\bibitem[Woo et al.(2024)]{moirai}
+Woo, G., Liu, C., Kumar, A., Xiong, C., Savarese, S., and Sahoo, D.
+\newblock Unified training of universal time series forecasting transformers.
+\newblock \emph{Proceedings of the 41st International Conference on
+Machine Learning}, 2024.
+
+\bibitem[Bai et al.(2018)]{tcn}
+Bai, S., Kolter, J. Z., and Koltun, V.
+\newblock An empirical evaluation of generic convolutional and recurrent
+networks for sequence modeling.
+\newblock \emph{arXiv preprint arXiv:1803.01271}, 2018.
+
+\bibitem[Cho et al.(2014)]{gru}
+Cho, K., van Merri\"enboer, B., Gulcehre, C., Bahdanau, D.,
+Bougares, F., Schwenk, H., and Bengio, Y.
+\newblock Learning phrase representations using RNN encoder--decoder for
+statistical machine translation.
+\newblock \emph{Proceedings of EMNLP}, 2014.
+
+\end{thebibliography}
+
+\end{document}
