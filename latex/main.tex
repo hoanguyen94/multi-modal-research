@@ -8,7 +8,6 @@
 \usepackage{booktabs}
 \usepackage{graphicx}
 \usepackage{microtype}
-\usepackage{hyperref}
 \usepackage{enumitem}
 \usepackage{xcolor}
 \usepackage{multirow}
@@ -17,6 +16,7 @@
 \usepackage{algorithm}
 \usepackage{algpseudocode}
 \usepackage{natbib}
+\usepackage{hyperref}
 
 \hypersetup{
     colorlinks=true,
@@ -391,7 +391,7 @@ $\kappa$; $K_{\mathrm{fold}}$ & Walk-forward fold index and total number of vali
 $T_\kappa$; $V_\kappa$; $G$ & Last training date, last validation date, and purge/embargo length for fold $\kappa$, with $G\geq H$. \\
 $S_{\mathrm{robust}}$; $\gamma$ & Mean fold hit rate minus $\gamma$ times its fold-to-fold standard deviation, and the nonnegative instability penalty. \\
 $\mathrm{HitRate}_\kappa(q)$ & Hit rate in validation fold $\kappa$ when probabilities are converted to labels using threshold $q$. \\
-$\mathcal Q$ & Finite candidate set searched when selecting $q^\star$. \\
+$\mathcal Q_{\mathrm{ROC}}$ & Exact candidate thresholds induced by the pooled inner-validation prediction scores when selecting $q^\star$. \\
 $p^{\mathrm{ens}}_{i,t}$; $D_{i,t}$ & Ensemble probability and standard deviation of member probabilities (model disagreement). \\
 $\widehat h$; $n$ & Observed hit rate and number of evaluated predictions used in its elementary standard-error calculation. \\
 $A,B$ (model labels) & Two prediction methods being compared in the paired statistical analysis; these labels are unrelated to the LoRA matrices. \\
@@ -1101,9 +1101,15 @@ w_o^\top\operatorname{LayerNorm}(u^{(B_F)}_{i,t})+b_o
 TimesFM remains frozen. The TFT, family adapters, identity embeddings, text
 self-attention, cross-attention, fusion blocks, and classifier are optimized
 jointly within each expanding training fold. Imputation and scaling parameters
-are also fitted within the fold. Hyperparameters and the decision threshold
-are selected from out-of-fold predictions before the chosen architecture is
-refitted on all labeled training observations.
+are also fitted within the fold. Each outer training scope contains three
+expanding, purged inner-validation windows. Hyperparameters are selected by
+their mean inner-window balanced accuracy, checkpoints minimize
+class-balanced validation BCE, and the refit epoch count is the median of the
+three window-specific best epochs. One decision threshold is selected from
+the pooled inner-window predictions before the chosen architecture is refitted
+on all observations available in the outer training scope. The same
+inner-selection procedure is repeated on the complete labeled training set
+before the final model is refitted on all labeled observations.
 
 \subsection{TCN (Temporal Convolution Network) with Text Fusion}
 
@@ -1517,23 +1523,24 @@ a locally supervised alternative to the pretrained backbone.
 
 \subsection{Primary Directional Loss}
 
-The main training objective is binary cross-entropy:
+The active fusion models use class-balanced binary cross-entropy. For
+$\mathcal B_+$ and $\mathcal B_-$ denoting the positive and negative examples
+in a training scope, respectively,
 
 \begin{equation}
-\BCE
+\mathcal L_{\mathrm{balanced}}
 =
 -
-\frac{1}{B}
-\sum_{(i,t)\in\mathcal{B}}
-\left[
-y_{i,t}\log p_{i,t}
-+
-(1-y_{i,t})\log(1-p_{i,t})
-\right].
+\frac{1}{2|\mathcal B_+|}
+\sum_{(i,t)\in\mathcal B_+}\log p_{i,t}
+-
+\frac{1}{2|\mathcal B_-|}
+\sum_{(i,t)\in\mathcal B_-}\log(1-p_{i,t}).
 \end{equation}
 
-Model selection will be based on validation hit rate, not validation
-cross-entropy.
+Checkpoint selection minimizes class-balanced validation BCE, while Optuna
+selects hyperparameters by mean inner-window balanced accuracy under the
+pooled inner-validation threshold.
 
 \subsection{Confidence-Weighted Classification}
 
@@ -1727,6 +1734,15 @@ $\kappa\in\{1,\ldots,K_{\mathrm{fold}}\}$:
 where $T_\kappa$ is the final training date, $V_\kappa$ is the final
 validation date, and $G\geq H$ is the purge or embargo interval.
 
+Model selection is nested inside every outer training fold. Specifically,
+three nonoverlapping chronological inner-validation windows are formed. Their
+training sets expand through time, and each training--validation boundary has
+a 20-trading-date purge. Numeric scalers are fitted separately using only the
+training observations of the corresponding inner window. Every candidate is
+trained with class-balanced BCE and checkpointed using class-balanced
+validation BCE. Its selection score is the mean balanced accuracy across the
+three windows under one threshold fitted from their pooled predictions.
+
 The following validation statistics will be reported:
 
 \begin{itemize}
@@ -1783,19 +1799,19 @@ A global threshold will be selected as
 \begin{equation}
 q^\star
 =
-\arg\max_{q\in\mathcal Q}
-\frac{1}{K_{\mathrm{fold}}}
-\sum_{\kappa=1}^{K_{\mathrm{fold}}}
-\mathrm{HitRate}_\kappa(q),
+\arg\max_{q\in\mathcal Q_{\mathrm{ROC}}}
+\operatorname{BalancedAccuracy}
+\left(
+y_{\mathrm{inner}},
+\ind[\widehat p_{\mathrm{inner}}\geq q]
+\right),
 \end{equation}
 
-where
-
-\begin{equation}
-\mathcal Q
-=
-\{0.35,0.36,\ldots,0.65\}.
-\end{equation}
+where $y_{\mathrm{inner}}$ and $\widehat p_{\mathrm{inner}}$ concatenate the
+labels and predictions from all three purged inner-validation windows.
+$\mathcal Q_{\mathrm{ROC}}$ contains the exact thresholds induced by those
+scores; it is not restricted to a fixed probability interval. Ties are
+resolved in favor of the threshold closest to $0.5$.
 
 Sector-specific or regime-specific thresholds will be considered only if they
 improve several validation folds consistently. Stock-specific thresholds are
@@ -2152,7 +2168,7 @@ regimes. Mitigation measures include:
     \item frozen pretrained backbones;
     \item low-rank adaptation;
     \item dropout and weight decay;
-    \item early stopping based on validation hit rate;
+    \item early stopping based on class-balanced validation BCE;
     \item avoiding stock-specific hyperparameters without strong evidence.
 \end{itemize}
 

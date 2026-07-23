@@ -60,7 +60,7 @@ FUSION_HIDDEN_DIM = 256
 MARKET_DEPTH = 2
 FUSION_DEPTH = 2
 RESIDUAL_EXPANSION = 2
-FUSION_DROPOUT = 0.10
+FUSION_DROPOUT = 0.20
 FUSION_EPOCHS = 100
 PRICE_BATCH_SIZE = 16
 FUSION_BATCH_SIZE = 128
@@ -112,12 +112,18 @@ def parse_args() -> argparse.Namespace:
         help="Use the default residual-network hyperparameters.",
     )
     parser.add_argument(
+        "--inner-validation-windows",
+        type=int,
+        default=3,
+        help="Number of rolling purged windows used for inner selection.",
+    )
+    parser.add_argument(
         "--training-mode",
         choices=("nested-folds", "full-only"),
         default="nested-folds",
         help=(
             "Run five nested walk-forward folds before the final refit, or "
-            "skip them and tune on one purged inner split of all training data."
+            "skip them and tune on rolling purged windows of all training data."
         ),
     )
     parser.add_argument(
@@ -188,12 +194,24 @@ def main() -> None:
         raise ValueError(
             "--no-price-extraction and --force-price-refresh cannot be combined"
         )
+    if args.inner_validation_windows < 1:
+        raise ValueError("--inner-validation-windows must be positive")
+    if args.optuna_trials < 0:
+        raise ValueError("--optuna-trials cannot be negative")
     args.families = list(dict.fromkeys(args.families))
+    usable_family_count = 0
     for family in args.families:
         path = DATA_DIR / f"{family}_textemb.parquet"
-        if not path.exists():
-            raise FileNotFoundError(f"Requested embedding family is absent: {path}")
-        parquet_embedding_dim(path)
+        try:
+            parquet_embedding_dim(path)
+            usable_family_count += 1
+        except Exception as error:
+            print(
+                f"Warning: skipping unusable embedding family "
+                f"{family!r}: {error}"
+            )
+    if not usable_family_count:
+        raise RuntimeError("No requested text-embedding family is usable")
     if not args.no_tune and importlib.util.find_spec("optuna") is None:
         raise ImportError(
             "Optuna tuning is enabled. Install it in this environment with "
@@ -237,6 +255,13 @@ def main() -> None:
         "raw_text_shared_dim": RAW_TEXT_DIM,
         "text_attention_heads": TEXT_ATTENTION_HEADS,
         "text_attention_layers": TEXT_ATTENTION_LAYERS,
+        "adapter_learning_rate_multiplier": 0.1,
+        "inner_validation_windows": args.inner_validation_windows,
+        "training_loss": "class_balanced_bce",
+        "checkpoint_metric": "validation_balanced_bce",
+        "early_stopping_patience": 10,
+        "early_stopping_min_delta": 1e-5,
+        "threshold_selection": "pooled_exact_balanced_accuracy",
         "training_mode": args.training_mode,
     }, indent=2))
 
@@ -327,6 +352,7 @@ def main() -> None:
         raw_text_dim=RAW_TEXT_DIM,
         text_attention_heads=TEXT_ATTENTION_HEADS,
         text_attention_layers=TEXT_ATTENTION_LAYERS,
+        inner_validation_windows=args.inner_validation_windows,
         run_outer_folds=args.training_mode == "nested-folds",
     )
 

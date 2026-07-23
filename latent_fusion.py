@@ -21,10 +21,12 @@ import pyarrow.parquet as pq
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.utils.rnn import pad_sequence
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
     brier_score_loss,
+    roc_curve,
     roc_auc_score,
 )
 from utils import directional_classification_metrics, probability_to_price
@@ -861,6 +863,69 @@ class RawTextResidualFusion(nn.Module):
         ).squeeze(1)                                  # (B,)
 
 
+class CrossStockAttention(nn.Module):
+    """Attend across stocks independently within each forecast date."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        attention_heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        if hidden_dim % attention_heads:
+            raise ValueError(
+                "Cross-stock hidden_dim must be divisible by attention_heads"
+            )
+        self.attention = nn.MultiheadAttention(
+            hidden_dim,
+            attention_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        values: torch.Tensor,
+        stock_group_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        # values: (B, H); stock_group_ids: (B,), equal IDs share one date.
+        if stock_group_ids.ndim != 1 or len(stock_group_ids) != len(values):
+            raise ValueError(
+                "stock_group_ids must have shape (batch_size,)"
+            )
+        unique_groups, counts = torch.unique_consecutive(
+            stock_group_ids, return_counts=True
+        )
+        if len(unique_groups) != int(torch.unique(stock_group_ids).numel()):
+            raise ValueError(
+                "Rows for each stock-attention date must be contiguous"
+            )
+        lengths = counts.tolist()
+        groups = torch.split(values, lengths, dim=0)
+        padded = pad_sequence(groups, batch_first=True)  # (G, S_max, H)
+        positions = torch.arange(
+            padded.shape[1], device=values.device
+        ).unsqueeze(0)                                  # (1, S_max)
+        padding_mask = positions >= counts.unsqueeze(1)  # (G, S_max)
+        attended, _ = self.attention(
+            padded,
+            padded,
+            padded,
+            key_padding_mask=padding_mask,
+            need_weights=False,
+        )                                               # (G, S_max, H)
+        attended = self.norm(
+            padded + self.dropout(attended)
+        )                                               # (G, S_max, H)
+        return torch.cat([
+            attended[index, :length]
+            for index, length in enumerate(lengths)
+        ], dim=0)                                       # (B, H)
+
+
 class RawTextTFTFusion(nn.Module):
     """TFT market encoder with unified end-to-end raw-text attention."""
 
@@ -878,6 +943,8 @@ class RawTextTFTFusion(nn.Module):
         market_attention_heads: int = 4,
         text_attention_heads: int = 4,
         text_attention_layers: int = 1,
+        cross_stock_attention: bool = False,
+        cross_stock_attention_heads: int = 4,
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -908,6 +975,14 @@ class RawTextTFTFusion(nn.Module):
             for _ in range(fusion_depth)
         ])
         self.output_norm = nn.LayerNorm(hidden_dim)
+        self.cross_stock_attention = (
+            CrossStockAttention(
+                hidden_dim,
+                cross_stock_attention_heads,
+                dropout,
+            )
+            if cross_stock_attention else None
+        )
         self.classifier = nn.Linear(hidden_dim, 1)
 
     def forward(
@@ -918,6 +993,7 @@ class RawTextTFTFusion(nn.Module):
         article_masks: dict[str, torch.Tensor],
         temporal: torch.Tensor,
         temporal_padding_mask: torch.Tensor,
+        stock_group_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         market = self.market_encoder(
             price, covariates, temporal, temporal_padding_mask
@@ -930,9 +1006,16 @@ class RawTextTFTFusion(nn.Module):
         )                                             # (B, H)
         for block in self.fusion_blocks:
             fused = block(fused)                      # (B, H)
-        return self.classifier(
-            self.output_norm(fused)
-        ).squeeze(1)                                  # (B,)
+        fused = self.output_norm(fused)                # (B, H)
+        if self.cross_stock_attention is not None:
+            if stock_group_ids is None:
+                raise ValueError(
+                    "Cross-stock attention requires stock_group_ids"
+                )
+            fused = self.cross_stock_attention(
+                fused, stock_group_ids
+            )                                         # (B, H)
+        return self.classifier(fused).squeeze(1)      # (B,)
 
 
 def make_text_supervision(links: pl.DataFrame, targets: pl.DataFrame) -> pl.DataFrame:
@@ -1261,6 +1344,52 @@ def _raw_text_batch(
     return articles, masks
 
 
+def _date_group_ids(index: pl.DataFrame) -> np.ndarray:
+    """Return one integer group per date while preserving row order."""
+    if "date" not in index.columns:
+        raise ValueError("Cross-stock attention requires a date column")
+    if index["date"].null_count():
+        raise ValueError("Cross-stock attention dates cannot be null")
+    return np.ascontiguousarray(
+        index["date"].cast(pl.Int32).to_numpy().astype(np.int64, copy=False)
+    )
+
+
+def _fusion_batches(
+    row_count: int,
+    batch_size: int,
+    rng: np.random.Generator | None = None,
+    group_ids: np.ndarray | None = None,
+):
+    """Yield row batches, keeping every date group intact when requested."""
+    if group_ids is None:
+        order = (
+            rng.permutation(row_count)
+            if rng is not None else np.arange(row_count)
+        )
+        for start in range(0, row_count, batch_size):
+            yield order[start:start + batch_size]
+        return
+    group_ids = np.asarray(group_ids)
+    if group_ids.ndim != 1 or len(group_ids) != row_count:
+        raise ValueError("group_ids must have one value per model row")
+    unique_groups = np.unique(group_ids)
+    if rng is not None:
+        unique_groups = rng.permutation(unique_groups)
+    pending: list[np.ndarray] = []
+    pending_rows = 0
+    for group in unique_groups:
+        rows = np.flatnonzero(group_ids == group)
+        if pending and pending_rows + len(rows) > batch_size:
+            yield np.concatenate(pending)
+            pending = []
+            pending_rows = 0
+        pending.append(rows)
+        pending_rows += len(rows)
+    if pending:
+        yield np.concatenate(pending)
+
+
 @torch.inference_mode()
 def _raw_fusion_validation_metrics(
     model: nn.Module,
@@ -1274,53 +1403,92 @@ def _raw_fusion_validation_metrics(
     market_encoder: str,
     market_sequence: np.ndarray | None,
     sequence_padding_mask: np.ndarray | None,
+    stock_group_ids: np.ndarray | None = None,
 ) -> dict[str, float]:
     """Evaluate one epoch without moving the training model off its device."""
     was_training = model.training
     model.eval()
     loss_sum = 0.0
-    scores = []
-    for start in range(0, len(target), batch_size):
-        stop = min(start + batch_size, len(target))
-        batch_slice = slice(start, stop)
+    positive_loss_sum = 0.0
+    negative_loss_sum = 0.0
+    positive_count = 0
+    negative_count = 0
+    score = np.empty(len(target), dtype=np.float32)
+    for batch_indices in _fusion_batches(
+        len(target),
+        batch_size,
+        group_ids=stock_group_ids,
+    ):
         articles, masks = _raw_text_batch(
-            text_indices, stores, batch_slice, device
+            text_indices, stores, batch_indices, device
         )
-        p = torch.from_numpy(price[batch_slice]).to(device)
-        c = torch.from_numpy(covariates[batch_slice]).to(device)
+        p = torch.from_numpy(price[batch_indices]).to(device)
+        c = torch.from_numpy(covariates[batch_indices]).to(device)
         y = torch.from_numpy(
-            target[batch_slice].astype(np.float32, copy=False)
+            target[batch_indices].astype(np.float32, copy=False)
         ).to(device)
         if market_encoder == "tft":
+            group_tensor = (
+                torch.from_numpy(stock_group_ids[batch_indices]).to(device)
+                if stock_group_ids is not None else None
+            )
             logits = model(
                 p,
                 c,
                 articles,
                 masks,
-                torch.from_numpy(market_sequence[batch_slice]).to(device),
+                torch.from_numpy(market_sequence[batch_indices]).to(device),
                 torch.from_numpy(
-                    sequence_padding_mask[batch_slice]
+                    sequence_padding_mask[batch_indices]
                 ).to(device),
+                group_tensor,
             )
         else:
             logits = model(p, c, articles, masks)
-        loss_sum += float(
-            F.binary_cross_entropy_with_logits(
-                logits, y, reduction="sum"
-            ).cpu()
+        per_example_loss = F.binary_cross_entropy_with_logits(
+            logits, y, reduction="none"
         )
-        scores.append(torch.sigmoid(logits).cpu().numpy())
+        loss_sum += float(per_example_loss.sum().cpu())
+        positive = y > 0.5
+        negative = ~positive
+        positive_loss_sum += float(
+            per_example_loss[positive].sum().cpu()
+        )
+        negative_loss_sum += float(
+            per_example_loss[negative].sum().cpu()
+        )
+        positive_count += int(positive.sum().item())
+        negative_count += int(negative.sum().item())
+        score[batch_indices] = torch.sigmoid(logits).cpu().numpy()
     if was_training:
         model.train()
-    score = np.concatenate(scores).astype(np.float32, copy=False)
     truth = target.astype(np.int8, copy=False)
     prediction = (score >= 0.5).astype(np.int8)
+    if not positive_count or not negative_count:
+        raise ValueError(
+            "Balanced validation BCE requires both target classes"
+        )
+    optimized_threshold = _best_validation_threshold(truth, score)
+    optimized_prediction = (
+        score >= optimized_threshold
+    ).astype(np.int8)
     return {
         "validation_bce": loss_sum / len(target),
+        "validation_balanced_bce": 0.5 * (
+            positive_loss_sum / positive_count
+            + negative_loss_sum / negative_count
+        ),
         "validation_accuracy": float(accuracy_score(truth, prediction)),
         "validation_balanced_accuracy": float(
             balanced_accuracy_score(truth, prediction)
         ),
+        "validation_roc_auc": float(roc_auc_score(truth, score)),
+        "validation_optimized_balanced_accuracy": float(
+            balanced_accuracy_score(truth, optimized_prediction)
+        ),
+        "validation_optimized_threshold": float(optimized_threshold),
+        "validation_mean_probability": float(score.mean()),
+        "validation_positive_rate": float(truth.mean()),
     }
 
 
@@ -1356,6 +1524,16 @@ def _plot_fold_training_diagnostics(
             epoch, part["validation_bce"].to_numpy(),
             color=color, linestyle="--", label=f"Fold {fold} validation",
         )
+        axes[0].plot(
+            epoch, part["train_balanced_bce"].to_numpy(),
+            color=color, linestyle=":", alpha=0.8,
+            label=f"Fold {fold} train balanced",
+        )
+        axes[0].plot(
+            epoch, part["validation_balanced_bce"].to_numpy(),
+            color=color, linestyle="-.", alpha=0.8,
+            label=f"Fold {fold} validation balanced",
+        )
         axes[1].plot(
             epoch, part["validation_accuracy"].to_numpy(),
             color=color, linestyle=":", label=f"Fold {fold} accuracy",
@@ -1365,6 +1543,13 @@ def _plot_fold_training_diagnostics(
             color=color, linestyle="-",
             label=f"Fold {fold} balanced accuracy",
         )
+        axes[1].plot(
+            epoch,
+            part["validation_optimized_balanced_accuracy"].to_numpy(),
+            color=color,
+            linestyle="--",
+            label=f"Fold {fold} optimized balanced accuracy",
+        )
     axes[0].set_title("Training and validation BCE")
     axes[0].set_xlabel("Epoch")
     axes[0].set_ylabel("Binary cross-entropy")
@@ -1373,6 +1558,79 @@ def _plot_fold_training_diagnostics(
     axes[1].set_ylabel("Score")
     axes[1].set_ylim(0.0, 1.0)
     for axis in axes:
+        axis.grid(alpha=0.25)
+        axis.legend(fontsize=8, ncol=2)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_inner_selection_diagnostics(
+    history: pl.DataFrame,
+    output_path: Path,
+) -> None:
+    """Plot the selected trial's curves across rolling inner windows."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+    required = {
+        "inner_window",
+        "epoch",
+        "train_bce",
+        "validation_bce",
+        "train_balanced_bce",
+        "validation_balanced_bce",
+    }
+    if not required <= set(history.columns):
+        raise ValueError(
+            "Inner-selection history is missing diagnostic columns"
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    colors = plt.get_cmap("tab10")
+    windows = history["inner_window"].unique().sort().to_list()
+    for color_index, window in enumerate(windows):
+        part = history.filter(
+            pl.col("inner_window") == window
+        ).sort("epoch")
+        epoch = part["epoch"].to_numpy()
+        color = colors(color_index % 10)
+        axes[0].plot(
+            epoch,
+            part["train_bce"].to_numpy(),
+            color=color,
+            linestyle="-",
+            label=f"Window {int(window)} train",
+        )
+        axes[0].plot(
+            epoch,
+            part["validation_bce"].to_numpy(),
+            color=color,
+            linestyle="--",
+            label=f"Window {int(window)} validation",
+        )
+        axes[1].plot(
+            epoch,
+            part["train_balanced_bce"].to_numpy(),
+            color=color,
+            linestyle="-",
+            label=f"Window {int(window)} train",
+        )
+        axes[1].plot(
+            epoch,
+            part["validation_balanced_bce"].to_numpy(),
+            color=color,
+            linestyle="--",
+            label=f"Window {int(window)} validation",
+        )
+    axes[0].set_title("Selected trial: unweighted BCE")
+    axes[1].set_title("Selected trial: class-balanced BCE")
+    for axis in axes:
+        axis.set_xlabel("Epoch")
+        axis.set_ylabel("Binary cross-entropy")
         axis.grid(alpha=0.25)
         axis.legend(fontsize=8, ncol=2)
     fig.tight_layout()
@@ -1397,6 +1655,7 @@ def fit_raw_fusion_model(
     batch_size: int = 128,
     learning_rate: float = 3e-4,
     weight_decay: float = 1e-4,
+    adapter_learning_rate_multiplier: float = 0.1,
     seed: int = 42,
     market_encoder: str = "mlp",
     market_sequence: np.ndarray | None = None,
@@ -1404,15 +1663,19 @@ def fit_raw_fusion_model(
     market_attention_heads: int = 4,
     text_attention_heads: int = 4,
     text_attention_layers: int = 1,
+    cross_stock_attention: bool = False,
+    cross_stock_attention_heads: int = 4,
+    stock_group_ids: np.ndarray | None = None,
     validation_price: np.ndarray | None = None,
     validation_covariates: np.ndarray | None = None,
     validation_text_indices: dict[str, np.ndarray] | None = None,
     validation_target: np.ndarray | None = None,
     validation_market_sequence: np.ndarray | None = None,
     validation_sequence_padding_mask: np.ndarray | None = None,
+    validation_stock_group_ids: np.ndarray | None = None,
     select_best_checkpoint: bool = True,
-    early_stopping_patience: int = 4,
-    early_stopping_min_delta: float = 1e-4,
+    early_stopping_patience: int = 10,
+    early_stopping_min_delta: float = 1e-5,
 ) -> tuple[nn.Module, list[dict[str, float]]]:
     """Train raw-family adapters and all attention/fusion layers end to end."""
     _require_finite("raw-fusion price latents", price)
@@ -1420,6 +1683,14 @@ def fit_raw_fusion_model(
     _require_finite("raw-fusion targets", target)
     if market_encoder not in {"mlp", "tft"}:
         raise ValueError("market_encoder must be 'mlp' or 'tft'")
+    if not 0.0 < adapter_learning_rate_multiplier <= 1.0:
+        raise ValueError(
+            "adapter_learning_rate_multiplier must be in (0, 1]"
+        )
+    if cross_stock_attention and market_encoder != "tft":
+        raise ValueError("Cross-stock attention currently requires TFT")
+    if cross_stock_attention and stock_group_ids is None:
+        raise ValueError("Cross-stock training requires stock_group_ids")
     if not text_indices:
         raise ValueError("At least one raw embedding family is required")
     field_counts = {values.shape[1] for values in text_indices.values()}
@@ -1434,6 +1705,8 @@ def fit_raw_fusion_model(
         if market_sequence is None or sequence_padding_mask is None:
             raise ValueError("TFT training requires temporal sequences and masks")
         _require_finite("TFT training sequences", market_sequence)
+        if stock_group_ids is not None and len(stock_group_ids) != len(target):
+            raise ValueError("Training stock_group_ids have the wrong length")
     validation_values = (
         validation_price,
         validation_covariates,
@@ -1464,6 +1737,17 @@ def fit_raw_fusion_model(
             _require_finite(
                 "TFT validation sequences", validation_market_sequence
             )
+            if cross_stock_attention and validation_stock_group_ids is None:
+                raise ValueError(
+                    "Cross-stock validation requires stock_group_ids"
+                )
+            if (
+                validation_stock_group_ids is not None
+                and len(validation_stock_group_ids) != len(validation_target)
+            ):
+                raise ValueError(
+                    "Validation stock_group_ids have the wrong length"
+                )
     family_dims = {
         family: stores[family].input_dim for family in text_indices
     }
@@ -1482,6 +1766,8 @@ def fit_raw_fusion_model(
             market_attention_heads=market_attention_heads,
             text_attention_heads=text_attention_heads,
             text_attention_layers=text_attention_layers,
+            cross_stock_attention=cross_stock_attention,
+            cross_stock_attention_heads=cross_stock_attention_heads,
             dropout=dropout,
         ).to(device)
     else:
@@ -1499,22 +1785,49 @@ def fit_raw_fusion_model(
             text_attention_layers=text_attention_layers,
             dropout=dropout,
         ).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    adapter_parameters = list(
+        model.text_attention.adapters.parameters()
     )
+    adapter_parameter_ids = {
+        id(parameter) for parameter in adapter_parameters
+    }
+    remaining_parameters = [
+        parameter for parameter in model.parameters()
+        if id(parameter) not in adapter_parameter_ids
+    ]
+    optimizer = torch.optim.AdamW([
+        {
+            "params": remaining_parameters,
+            "lr": learning_rate,
+        },
+        {
+            "params": adapter_parameters,
+            "lr": learning_rate * adapter_learning_rate_multiplier,
+        },
+    ], weight_decay=weight_decay)
+    positive_count = int((target > 0.5).sum())
+    negative_count = int(len(target) - positive_count)
+    if not positive_count or not negative_count:
+        raise ValueError("Balanced training BCE requires both target classes")
+    positive_weight = len(target) / (2.0 * positive_count)
+    negative_weight = len(target) / (2.0 * negative_count)
     rng = np.random.default_rng(seed)
     history: list[dict[str, float]] = []
-    best_validation_bce = float("inf")
+    best_validation_metric = float("inf")
     best_epoch: int | None = None
     best_state: dict[str, torch.Tensor] | None = None
     epochs_without_improvement = 0
     for epoch in range(1, epochs + 1):
         model.train()
-        train_loss_sum = 0.0
+        train_bce_sum = 0.0
+        train_balanced_bce_sum = 0.0
         train_example_count = 0
-        order = rng.permutation(len(target))
-        for start in range(0, len(target), batch_size):
-            batch_indices = order[start:start + batch_size]
+        for batch_indices in _fusion_batches(
+            len(target),
+            batch_size,
+            rng=rng,
+            group_ids=stock_group_ids if cross_stock_attention else None,
+        ):
             p = torch.from_numpy(price[batch_indices]).to(device)
             c = torch.from_numpy(covariates[batch_indices]).to(device)
             y = torch.from_numpy(
@@ -1531,10 +1844,30 @@ def fit_raw_fusion_model(
                 padding = torch.from_numpy(
                     sequence_padding_mask[batch_indices]
                 ).to(device)
-                logits = model(p, c, articles, masks, temporal, padding)
+                group_tensor = (
+                    torch.from_numpy(stock_group_ids[batch_indices]).to(device)
+                    if cross_stock_attention else None
+                )
+                logits = model(
+                    p,
+                    c,
+                    articles,
+                    masks,
+                    temporal,
+                    padding,
+                    group_tensor,
+                )
             else:
                 logits = model(p, c, articles, masks)
-            loss = F.binary_cross_entropy_with_logits(logits, y)
+            per_example_loss = F.binary_cross_entropy_with_logits(
+                logits, y, reduction="none"
+            )
+            class_weights = torch.where(
+                y > 0.5,
+                torch.full_like(y, positive_weight),
+                torch.full_like(y, negative_weight),
+            )
+            loss = (per_example_loss * class_weights).mean()
             if not torch.isfinite(loss):
                 raise FloatingPointError(
                     f"Raw fusion loss became non-finite in epoch {epoch}"
@@ -1542,13 +1875,23 @@ def fit_raw_fusion_model(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            train_loss_sum += float(loss.detach().cpu()) * len(batch_indices)
+            train_bce_sum += float(
+                per_example_loss.detach().sum().cpu()
+            )
+            train_balanced_bce_sum += (
+                float(loss.detach().cpu()) * len(batch_indices)
+            )
             train_example_count += len(batch_indices)
-        train_bce = train_loss_sum / max(train_example_count, 1)
+        train_bce = train_bce_sum / max(train_example_count, 1)
+        train_balanced_bce = (
+            train_balanced_bce_sum / max(train_example_count, 1)
+        )
         epoch_metrics = {
             "epoch": float(epoch),
             "bce": float(train_bce),
             "train_bce": float(train_bce),
+            "train_balanced_bce": float(train_balanced_bce),
+            "train_positive_rate": float(positive_count / len(target)),
         }
         if has_validation:
             epoch_metrics.update(_raw_fusion_validation_metrics(
@@ -1563,15 +1906,21 @@ def fit_raw_fusion_model(
                 market_encoder,
                 validation_market_sequence,
                 validation_sequence_padding_mask,
+                (
+                    validation_stock_group_ids
+                    if cross_stock_attention else None
+                ),
             ))
         history.append(epoch_metrics)
         if has_validation and select_best_checkpoint:
-            current_validation_bce = epoch_metrics["validation_bce"]
+            current_validation_metric = epoch_metrics[
+                "validation_balanced_bce"
+            ]
             if (
-                current_validation_bce
-                < best_validation_bce - float(early_stopping_min_delta)
+                current_validation_metric
+                < best_validation_metric - float(early_stopping_min_delta)
             ):
-                best_validation_bce = current_validation_bce
+                best_validation_metric = current_validation_metric
                 best_epoch = epoch
                 best_state = {
                     name: value.detach().cpu().clone()
@@ -1606,33 +1955,46 @@ def predict_raw_fusion(
     market_encoder: str = "mlp",
     market_sequence: np.ndarray | None = None,
     sequence_padding_mask: np.ndarray | None = None,
+    cross_stock_attention: bool = False,
+    stock_group_ids: np.ndarray | None = None,
 ) -> np.ndarray:
     _require_finite("raw-fusion inference price", price)
     _require_finite("raw-fusion inference covariates", covariates)
+    if cross_stock_attention and market_encoder != "tft":
+        raise ValueError("Cross-stock attention currently requires TFT")
+    if cross_stock_attention and stock_group_ids is None:
+        raise ValueError("Cross-stock inference requires stock_group_ids")
     model = model.to(device).eval()
-    pieces = []
-    for start in range(0, len(price), batch_size):
-        stop = min(start + batch_size, len(price))
-        batch_slice = slice(start, stop)
+    result = np.empty(len(price), dtype=np.float32)
+    for batch_indices in _fusion_batches(
+        len(price),
+        batch_size,
+        group_ids=stock_group_ids if cross_stock_attention else None,
+    ):
         articles, masks = _raw_text_batch(
-            text_indices, stores, batch_slice, device
+            text_indices, stores, batch_indices, device
         )
-        p = torch.from_numpy(price[batch_slice]).to(device)
-        c = torch.from_numpy(covariates[batch_slice]).to(device)
+        p = torch.from_numpy(price[batch_indices]).to(device)
+        c = torch.from_numpy(covariates[batch_indices]).to(device)
         if market_encoder == "tft":
             logits = model(
                 p,
                 c,
                 articles,
                 masks,
-                torch.from_numpy(market_sequence[batch_slice]).to(device),
-                torch.from_numpy(sequence_padding_mask[batch_slice]).to(device),
+                torch.from_numpy(market_sequence[batch_indices]).to(device),
+                torch.from_numpy(
+                    sequence_padding_mask[batch_indices]
+                ).to(device),
+                (
+                    torch.from_numpy(stock_group_ids[batch_indices]).to(device)
+                    if cross_stock_attention else None
+                ),
             )
         else:
             logits = model(p, c, articles, masks)
-        pieces.append(torch.sigmoid(logits).cpu().numpy())
+        result[batch_indices] = torch.sigmoid(logits).cpu().numpy()
     model.cpu()
-    result = np.concatenate(pieces) if pieces else np.empty(0, dtype=np.float32)
     _require_finite("raw-fusion probabilities", result)
     return result
 
@@ -2428,18 +2790,42 @@ def _best_validation_threshold(
     truth: np.ndarray,
     score: np.ndarray,
 ) -> float:
-    """Select a threshold from one inner-validation period only."""
-    candidates = np.linspace(0.35, 0.65, 31)
-    scored = [
-        (
-            float(balanced_accuracy_score(
-                truth, (score >= threshold).astype(np.int8)
-            )),
-            float(threshold),
-        )
-        for threshold in candidates
-    ]
-    return max(scored, key=lambda item: (item[0], -abs(item[1] - 0.5)))[1]
+    """Find the exact balanced-accuracy threshold, preferring 0.5 on ties."""
+    truth = np.asarray(truth, dtype=np.int8)
+    score = np.asarray(score, dtype=np.float64)
+    if truth.ndim != 1 or score.ndim != 1 or len(truth) != len(score):
+        raise ValueError("Threshold truth and score must be aligned vectors")
+    if len(np.unique(truth)) != 2:
+        raise ValueError("Threshold selection requires both target classes")
+    if not np.isfinite(score).all():
+        raise ValueError("Threshold scores must be finite")
+    false_positive_rate, true_positive_rate, thresholds = roc_curve(
+        truth, score, drop_intermediate=False
+    )
+    finite = np.isfinite(thresholds)
+    thresholds = thresholds[finite]
+    balanced_accuracy = 0.5 * (
+        true_positive_rate[finite] + 1.0 - false_positive_rate[finite]
+    )
+    best = np.flatnonzero(np.isclose(
+        balanced_accuracy,
+        balanced_accuracy.max(),
+        rtol=0.0,
+        atol=1e-12,
+    ))
+    return float(thresholds[
+        best[np.argmin(np.abs(thresholds[best] - 0.5))]
+    ])
+
+
+def _dataframe_fingerprint(
+    frame: pl.DataFrame,
+    columns: Sequence[str] | None = None,
+) -> str:
+    """Hash row contents without making the digest depend on row order."""
+    selected = frame.select(columns) if columns is not None else frame
+    row_hashes = np.sort(selected.hash_rows(seed=0).to_numpy())
+    return hashlib.sha256(row_hashes.tobytes()).hexdigest()[:16]
 
 
 def _purged_inner_positions(
@@ -2486,6 +2872,92 @@ def _purged_inner_positions(
         "inner_validation_start": validation_start_date,
     }
     return train_positions, validation_positions, manifest
+
+
+def _purged_inner_windows(
+    index: pl.DataFrame,
+    purge_dates: int,
+    window_count: int = 3,
+    validation_fraction: float = 0.20,
+    minimum_train_dates: int = 60,
+    minimum_validation_dates: int = 20,
+) -> tuple[list[tuple[np.ndarray, np.ndarray, dict]], dict]:
+    """Create expanding-train, purged rolling validation windows."""
+    if window_count < 1:
+        raise ValueError("Inner validation window_count must be positive")
+    if not 0.0 < validation_fraction < 1.0:
+        raise ValueError("Inner validation fraction must be between zero and one")
+    dates = index["date"].unique().sort().to_list()
+    available_dates = (
+        len(dates) - int(minimum_train_dates) - int(purge_dates)
+    )
+    validation_dates = min(
+        int(np.ceil(len(dates) * validation_fraction)),
+        available_dates // int(window_count),
+    )
+    if validation_dates < minimum_validation_dates:
+        raise ValueError(
+            "Not enough dates for the requested purged inner windows"
+        )
+    first_validation_start = len(dates) - window_count * validation_dates
+    row_dates = index["date"].to_numpy()
+    windows: list[tuple[np.ndarray, np.ndarray, dict]] = []
+    manifests: list[dict] = []
+    for window_index in range(window_count):
+        validation_start_position = (
+            first_validation_start + window_index * validation_dates
+        )
+        validation_end_position = (
+            validation_start_position + validation_dates
+        )
+        train_end_position = validation_start_position - int(purge_dates)
+        if train_end_position < minimum_train_dates:
+            raise ValueError(
+                "Inner training period is too short after purging"
+            )
+        train_end_date = dates[train_end_position - 1]
+        validation_start_date = dates[validation_start_position]
+        validation_end_date = dates[validation_end_position - 1]
+        train_positions = np.flatnonzero(row_dates <= train_end_date)
+        validation_positions = np.flatnonzero(
+            (row_dates >= validation_start_date)
+            & (row_dates <= validation_end_date)
+        )
+        manifest = {
+            "inner_window": int(window_index + 1),
+            "inner_train_rows": int(len(train_positions)),
+            "inner_validation_rows": int(len(validation_positions)),
+            "inner_train_dates": int(train_end_position),
+            "purged_dates": int(purge_dates),
+            "inner_validation_dates": int(validation_dates),
+            "inner_train_end": train_end_date,
+            "inner_validation_start": validation_start_date,
+            "inner_validation_end": validation_end_date,
+        }
+        windows.append((train_positions, validation_positions, manifest))
+        manifests.append(manifest)
+    aggregate_manifest = {
+        "inner_windows": int(window_count),
+        "inner_train_rows": manifests[-1]["inner_train_rows"],
+        "inner_validation_rows": int(sum(
+            manifest["inner_validation_rows"] for manifest in manifests
+        )),
+        "inner_train_dates": manifests[-1]["inner_train_dates"],
+        "purged_dates": int(purge_dates),
+        "inner_validation_dates": int(validation_dates),
+        "inner_train_end": manifests[-1]["inner_train_end"],
+        "inner_validation_start": manifests[0]["inner_validation_start"],
+        "inner_validation_end": manifests[-1]["inner_validation_end"],
+        "windows_json": json.dumps([
+            {
+                key: str(value)
+                if key.endswith(("_end", "_start")) else value
+                for key, value in manifest.items()
+            }
+            for manifest in manifests
+        ], sort_keys=True),
+    }
+    return windows, aggregate_manifest
 
 
 def _slice_raw_fusion_arrays(
@@ -2545,6 +3017,9 @@ def run_walk_forward_fusion(
     raw_text_dim: int = 384,
     text_attention_heads: int = 4,
     text_attention_layers: int = 1,
+    cross_stock_attention: bool = False,
+    cross_stock_attention_heads: int = 4,
+    inner_validation_windows: int = 3,
     run_outer_folds: bool = True,
 ) -> dict[str, pl.DataFrame]:
     """Optionally run nested outer folds, then select and refit on all data."""
@@ -2564,6 +3039,8 @@ def run_walk_forward_fusion(
         raise ValueError("fusion_dropout must be in [0, 1)")
     if tuning_trials < 0:
         raise ValueError("tuning_trials cannot be negative")
+    if inner_validation_windows < 1:
+        raise ValueError("inner_validation_windows must be positive")
     if forecast_horizon_weekdays < 1:
         raise ValueError("forecast_horizon_weekdays must be positive")
     if not submission_years:
@@ -2584,6 +3061,10 @@ def run_walk_forward_fusion(
         raise ValueError("text_attention_layers must be positive")
     if market_encoder not in {"mlp", "tft"}:
         raise ValueError("market_encoder must be 'mlp' or 'tft'")
+    if cross_stock_attention and market_encoder != "tft":
+        raise ValueError("Cross-stock attention currently requires TFT")
+    if cross_stock_attention and cross_stock_attention_heads < 1:
+        raise ValueError("cross_stock_attention_heads must be positive")
     if market_encoder == "tft" and not temporal_covariate_columns:
         raise ValueError("TFT requires temporal_covariate_columns")
     if market_encoder == "tft" and tft_attention_heads < 1:
@@ -2605,8 +3086,17 @@ def run_walk_forward_fusion(
         lookback_candidates = ()
         max_temporal_lookback = int(temporal_lookback)
     hidden_dim_candidates = tuple(
-        hidden_dim for hidden_dim in (128, 256, 384)
-        if market_encoder != "tft" or hidden_dim % tft_attention_heads == 0
+        hidden_dim for hidden_dim in (64, 128, 256)
+        if (
+            market_encoder != "tft"
+            or (
+                hidden_dim % tft_attention_heads == 0
+                and (
+                    not cross_stock_attention
+                    or hidden_dim % cross_stock_attention_heads == 0
+                )
+            )
+        )
     )
     if tune_hyperparameters and tuning_trials and not hidden_dim_candidates:
         raise ValueError(
@@ -2615,16 +3105,25 @@ def run_walk_forward_fusion(
     if (
         market_encoder == "tft"
         and (not tune_hyperparameters or tuning_trials == 0)
-        and fusion_hidden_dim % tft_attention_heads
+        and (
+            fusion_hidden_dim % tft_attention_heads
+            or (
+                cross_stock_attention
+                and fusion_hidden_dim % cross_stock_attention_heads
+            )
+        )
     ):
         raise ValueError(
-            "fusion_hidden_dim must be divisible by tft_attention_heads"
+            "fusion_hidden_dim must be divisible by every TFT attention head count"
         )
-    feature_set = (
-        "timesfm_temporal_tft_unified_raw_text_attention"
-        if market_encoder == "tft"
-        else "timesfm_covariates_unified_raw_text_attention"
-    )
+    if cross_stock_attention:
+        feature_set = (
+            "timesfm_temporal_tft_cross_stock_unified_raw_text_attention"
+        )
+    elif market_encoder == "tft":
+        feature_set = "timesfm_temporal_tft_unified_raw_text_attention"
+    else:
+        feature_set = "timesfm_covariates_unified_raw_text_attention"
     if run_outer_folds:
         if fold_assignments is None:
             raise ValueError(
@@ -2688,7 +3187,14 @@ def run_walk_forward_fusion(
     (output_dir / "training_mode.json").write_text(json.dumps({
         "run_outer_folds": bool(run_outer_folds),
         "mode": "nested-folds" if run_outer_folds else "full-only",
-        "final_selection": "purged_inner_validation",
+        "final_selection": "rolling_purged_inner_validation",
+        "inner_validation_windows": int(inner_validation_windows),
+        "training_loss": "class_balanced_bce",
+        "checkpoint_metric": "validation_balanced_bce",
+        "early_stopping_patience": 10,
+        "early_stopping_min_delta": 1e-5,
+        "threshold_selection": "pooled_exact_balanced_accuracy",
+        "cross_stock_attention": bool(cross_stock_attention),
     }, indent=2))
     if not covariate_columns:
         raise ValueError("covariate_columns cannot be empty")
@@ -2739,7 +3245,48 @@ def run_walk_forward_fusion(
     if len(families) > 1:
         variants["all_families"] = tuple(families)
     tuning_variant = "all_families" if "all_families" in variants else families[0]
+    fingerprint_feature_columns = list(dict.fromkeys([
+        "row_id",
+        "date",
+        "ticker",
+        *covariate_columns,
+        *temporal_covariate_columns,
+    ]))
+    training_data_fingerprints = {
+        "features": _dataframe_fingerprint(
+            train_features, fingerprint_feature_columns
+        ),
+        "price_latents": _dataframe_fingerprint(train_price_latents),
+        "targets": _dataframe_fingerprint(
+            train_targets,
+            [
+                column for column in (
+                    "row_id",
+                    "date",
+                    "ticker",
+                    "target_up",
+                )
+                if column in train_targets.columns
+            ],
+        ),
+        "text_links": _dataframe_fingerprint(
+            train_links,
+            [
+                column for column in (
+                    "row_id",
+                    "text_field",
+                    "text_id",
+                )
+                if column in train_links.columns
+            ],
+        ),
+        "fold_assignments": (
+            _dataframe_fingerprint(fold_assignments)
+            if fold_assignments is not None else None
+        ),
+    }
     study_signature = hashlib.sha256(json.dumps({
+        "selection_protocol_version": 3,
         "market_encoder": market_encoder,
         "families": families,
         "family_dims": {
@@ -2759,12 +3306,25 @@ def run_walk_forward_fusion(
         "temporal_lookback_candidates": list(lookback_candidates),
         "forecast_horizon_weekdays": int(forecast_horizon_weekdays),
         "fusion_epochs": int(fusion_epochs),
+        "fusion_batch_size": int(fusion_batch_size),
         "raw_text_dim": int(raw_text_dim),
         "tft_attention_heads": int(tft_attention_heads),
         "text_attention_heads": int(text_attention_heads),
         "text_attention_layers": int(text_attention_layers),
+        "cross_stock_attention": bool(cross_stock_attention),
+        "cross_stock_attention_heads": int(
+            cross_stock_attention_heads
+        ),
         "seed": int(seed),
         "optuna_pruning": "none",
+        "inner_validation_windows": int(inner_validation_windows),
+        "checkpoint_metric": "validation_balanced_bce",
+        "early_stopping_patience": 10,
+        "early_stopping_min_delta": 1e-5,
+        "training_loss": "class_balanced_bce",
+        "adapter_learning_rate_multiplier": 0.1,
+        "threshold_selection": "pooled_exact_balanced_accuracy",
+        "training_data_fingerprints": training_data_fingerprints,
         "train_target_rows": int(train_targets.height),
         "train_price_latent_rows": int(train_price_latents.height),
     }, sort_keys=True).encode()).hexdigest()[:12]
@@ -2792,8 +3352,8 @@ def run_walk_forward_fusion(
         "expansion": int(residual_expansion),
         "dropout": float(fusion_dropout),
         "epochs": int(fusion_epochs),
-        "learning_rate": 3e-4,
-        "weight_decay": 1e-4,
+        "learning_rate": 1e-4,
+        "weight_decay": 1e-3,
     }
     if market_encoder == "tft":
         default_params["temporal_lookback"] = int(temporal_lookback)
@@ -2809,6 +3369,18 @@ def run_walk_forward_fusion(
             key: value for key, value in params.items()
             if key != "temporal_lookback"
         }
+
+    def stock_groups(index: pl.DataFrame) -> np.ndarray | None:
+        return _date_group_ids(index) if cross_stock_attention else None
+
+    def fusion_model_name(variant: str) -> str:
+        if cross_stock_attention:
+            prefix = "timesfm_tft_cross_stock_unified_raw_text_plus"
+        elif market_encoder == "tft":
+            prefix = "timesfm_tft_unified_raw_text_plus"
+        else:
+            prefix = "timesfm_covariates_unified_raw_text_plus"
+        return f"{prefix}_{variant}"
 
     def select_families(
         arrays: tuple, variant_families: Sequence[str]
@@ -2922,89 +3494,106 @@ def run_walk_forward_fusion(
         )
         return train_view, train_mask, val_view, val_mask, temporal_scaler
 
-    inner_split_cache: dict[str, tuple[np.ndarray, np.ndarray, dict]] = {}
+    inner_split_cache: dict[
+        str,
+        tuple[list[tuple[np.ndarray, np.ndarray, dict]], dict],
+    ] = {}
 
-    def inner_candidate_data(
+    def ensure_inner_windows(
+        scope_name: str,
+        base_arrays: tuple,
+    ) -> tuple[list[tuple[np.ndarray, np.ndarray, dict]], dict]:
+        if scope_name not in inner_split_cache:
+            inner_split_cache[scope_name] = _purged_inner_windows(
+                base_arrays[0],
+                purge_dates=forecast_horizon_weekdays,
+                window_count=inner_validation_windows,
+            )
+        return inner_split_cache[scope_name]
+
+    def inner_candidate_windows(
         scope_name: str,
         base_arrays: tuple,
         raw_covariates: np.ndarray,
         raw_sequence: np.ndarray | None,
         raw_padding: np.ndarray | None,
         lookback: int | None,
-    ) -> tuple:
-        """Prepare one purged inner split using inner-training scalers only."""
-        if scope_name not in inner_split_cache:
-            inner_split_cache[scope_name] = _purged_inner_positions(
-                base_arrays[0],
-                purge_dates=forecast_horizon_weekdays,
+    ) -> tuple[list[tuple], dict]:
+        """Prepare rolling purged windows using training-only scalers."""
+        split_windows, aggregate_manifest = ensure_inner_windows(
+            scope_name, base_arrays
+        )
+        prepared_windows = []
+        for window_index, (
+            train_positions,
+            validation_positions,
+            manifest,
+        ) in enumerate(split_windows, start=1):
+            inner_train = _slice_raw_fusion_arrays(
+                base_arrays, train_positions
             )
-        train_positions, validation_positions, manifest = inner_split_cache[
-            scope_name
-        ]
-        inner_train = _slice_raw_fusion_arrays(
-            base_arrays, train_positions
-        )
-        inner_validation = _slice_raw_fusion_arrays(
-            base_arrays, validation_positions
-        )
-        covariate_scaler = _fit_covariate_scaler(
-            raw_covariates[train_positions]
-        )
-        inner_train_cov = _apply_covariate_scaler(
-            raw_covariates[train_positions], covariate_scaler
-        )
-        inner_validation_cov = _apply_covariate_scaler(
-            raw_covariates[validation_positions], covariate_scaler
-        )
-        train_sequence = train_padding = None
-        validation_sequence = validation_padding = None
-        temporal_scaler = None
-        if market_encoder == "tft":
-            (
+            inner_validation = _slice_raw_fusion_arrays(
+                base_arrays, validation_positions
+            )
+            covariate_scaler = _fit_covariate_scaler(
+                raw_covariates[train_positions]
+            )
+            inner_train_cov = _apply_covariate_scaler(
+                raw_covariates[train_positions], covariate_scaler
+            )
+            inner_validation_cov = _apply_covariate_scaler(
+                raw_covariates[validation_positions], covariate_scaler
+            )
+            train_sequence = train_padding = None
+            validation_sequence = validation_padding = None
+            temporal_scaler = None
+            if market_encoder == "tft":
+                (
+                    train_sequence,
+                    train_padding,
+                    validation_sequence,
+                    validation_padding,
+                    temporal_scaler,
+                ) = scaled_temporal_view(
+                    f"inner_{scope_name}_window_{window_index}",
+                    raw_sequence[train_positions],
+                    raw_padding[train_positions],
+                    raw_sequence[validation_positions],
+                    raw_padding[validation_positions],
+                    int(lookback),
+                )
+            prepared_windows.append((
+                inner_train,
+                inner_validation,
+                inner_train_cov,
+                inner_validation_cov,
                 train_sequence,
                 train_padding,
                 validation_sequence,
                 validation_padding,
+                covariate_scaler,
                 temporal_scaler,
-            ) = scaled_temporal_view(
-                f"inner_{scope_name}",
-                raw_sequence[train_positions],
-                raw_padding[train_positions],
-                raw_sequence[validation_positions],
-                raw_padding[validation_positions],
-                int(lookback),
-            )
-        return (
-            inner_train,
-            inner_validation,
-            inner_train_cov,
-            inner_validation_cov,
-            train_sequence,
-            train_padding,
-            validation_sequence,
-            validation_padding,
-            covariate_scaler,
-            temporal_scaler,
-            manifest,
-        )
+                manifest,
+            ))
+        return prepared_windows, aggregate_manifest
 
     def sampled_hyperparameters(trial) -> dict:
         params = {
             "hidden_dim": trial.suggest_categorical(
                 "hidden_dim", list(hidden_dim_candidates)
             ),
-            "fusion_depth": trial.suggest_int("fusion_depth", 1, 3),
-            "expansion": trial.suggest_categorical("expansion", [1, 2, 4]),
-            "dropout": trial.suggest_float("dropout", 0.05, 0.30),
+            "fusion_depth": trial.suggest_int("fusion_depth", 1, 2),
+            "expansion": trial.suggest_categorical("expansion", [1, 2]),
+            "dropout": trial.suggest_float("dropout", 0.15, 0.50),
             "epochs": int(fusion_epochs),
             "learning_rate": trial.suggest_float(
-                "learning_rate", 1e-4, 1e-3, log=True
+                "learning_rate", 1e-5, 3e-4, log=True
             ),
             "weight_decay": trial.suggest_float(
-                "weight_decay", 1e-6, 1e-3, log=True
+                "weight_decay", 1e-4, 1e-2, log=True
             ),
             "market_depth": (
-                trial.suggest_int("market_depth", 1, 3)
+                trial.suggest_int("market_depth", 1, 2)
                 if market_encoder == "mlp" else 0
             ),
         }
@@ -3024,24 +3613,12 @@ def run_walk_forward_fusion(
         params: dict,
         candidate_seed: int,
     ) -> tuple[nn.Module, list[dict[str, float]], float, float, dict]:
-        """Fit/restore an inner checkpoint and select its probability cutoff."""
+        """Evaluate one configuration over rolling purged inner windows."""
         lookback = (
             int(params["temporal_lookback"])
             if market_encoder == "tft" else None
         )
-        (
-            inner_train,
-            inner_validation,
-            inner_train_cov,
-            inner_validation_cov,
-            train_sequence,
-            train_padding,
-            validation_sequence,
-            validation_padding,
-            _,
-            _,
-            manifest,
-        ) = inner_candidate_data(
+        prepared_windows, manifest = inner_candidate_windows(
             scope_name,
             base_arrays,
             raw_covariates,
@@ -3049,50 +3626,132 @@ def run_walk_forward_fusion(
             raw_padding,
             lookback,
         )
-        model, history = fit_raw_fusion_model(
-            inner_train[1],
-            inner_train_cov,
-            inner_train[2],
-            stores,
-            inner_train[4],
-            device,
-            text_dim=raw_text_dim,
-            batch_size=fusion_batch_size,
-            seed=candidate_seed,
-            market_encoder=market_encoder,
-            market_sequence=train_sequence,
-            sequence_padding_mask=train_padding,
-            market_attention_heads=tft_attention_heads,
-            text_attention_heads=text_attention_heads,
-            text_attention_layers=text_attention_layers,
-            validation_price=inner_validation[1],
-            validation_covariates=inner_validation_cov,
-            validation_text_indices=inner_validation[2],
-            validation_target=inner_validation[4],
-            validation_market_sequence=validation_sequence,
-            validation_sequence_padding_mask=validation_padding,
-            select_best_checkpoint=True,
-            **model_fit_params(params),
+        combined_history: list[dict[str, float]] = []
+        validation_truths: list[np.ndarray] = []
+        validation_scores: list[np.ndarray] = []
+        window_best_epochs: list[int] = []
+        last_model: nn.Module | None = None
+        for window_index, prepared in enumerate(
+            prepared_windows, start=1
+        ):
+            (
+                inner_train,
+                inner_validation,
+                inner_train_cov,
+                inner_validation_cov,
+                train_sequence,
+                train_padding,
+                validation_sequence,
+                validation_padding,
+                _,
+                _,
+                _,
+            ) = prepared
+            model, history = fit_raw_fusion_model(
+                inner_train[1],
+                inner_train_cov,
+                inner_train[2],
+                stores,
+                inner_train[4],
+                device,
+                text_dim=raw_text_dim,
+                batch_size=fusion_batch_size,
+                seed=candidate_seed + 100 * window_index,
+                market_encoder=market_encoder,
+                market_sequence=train_sequence,
+                sequence_padding_mask=train_padding,
+                market_attention_heads=tft_attention_heads,
+                text_attention_heads=text_attention_heads,
+                text_attention_layers=text_attention_layers,
+                cross_stock_attention=cross_stock_attention,
+                cross_stock_attention_heads=cross_stock_attention_heads,
+                stock_group_ids=stock_groups(inner_train[0]),
+                validation_price=inner_validation[1],
+                validation_covariates=inner_validation_cov,
+                validation_text_indices=inner_validation[2],
+                validation_target=inner_validation[4],
+                validation_market_sequence=validation_sequence,
+                validation_sequence_padding_mask=validation_padding,
+                validation_stock_group_ids=stock_groups(
+                    inner_validation[0]
+                ),
+                adapter_learning_rate_multiplier=0.1,
+                select_best_checkpoint=True,
+                **model_fit_params(params),
+            )
+            score = predict_raw_fusion(
+                model,
+                inner_validation[1],
+                inner_validation_cov,
+                inner_validation[2],
+                stores,
+                device,
+                market_encoder=market_encoder,
+                market_sequence=validation_sequence,
+                sequence_padding_mask=validation_padding,
+                cross_stock_attention=cross_stock_attention,
+                stock_group_ids=stock_groups(inner_validation[0]),
+            )
+            window_best_epoch = int(history[0]["best_epoch"])
+            window_best_epochs.append(window_best_epoch)
+            train_positive_rate = float(inner_train[4].mean())
+            validation_positive_rate = float(
+                inner_validation[4].mean()
+            )
+            for row in history:
+                row["inner_window"] = float(window_index)
+                row["window_best_epoch"] = float(window_best_epoch)
+                row["train_positive_rate"] = train_positive_rate
+                row["validation_positive_rate"] = (
+                    validation_positive_rate
+                )
+            combined_history.extend(history)
+            validation_truths.append(
+                inner_validation[4].astype(np.int8)
+            )
+            validation_scores.append(score)
+            if last_model is not None:
+                del last_model
+            last_model = model
+        selected_epoch = max(
+            1,
+            int(np.floor(np.median(window_best_epochs) + 0.5)),
         )
-        score = predict_raw_fusion(
-            model,
-            inner_validation[1],
-            inner_validation_cov,
-            inner_validation[2],
-            stores,
-            device,
-            market_encoder=market_encoder,
-            market_sequence=validation_sequence,
-            sequence_padding_mask=validation_padding,
-        )
+        for row in combined_history:
+            row["selected_epoch"] = float(selected_epoch)
+        pooled_truth = np.concatenate(validation_truths)
+        pooled_score = np.concatenate(validation_scores)
         threshold = _best_validation_threshold(
-            inner_validation[4].astype(np.int8), score
+            pooled_truth, pooled_score
         )
-        balanced_accuracy = float(balanced_accuracy_score(
-            inner_validation[4].astype(np.int8),
-            (score >= threshold).astype(np.int8),
-        ))
-        return model, history, threshold, balanced_accuracy, manifest
+        window_balanced_accuracies = [
+            float(balanced_accuracy_score(
+                truth,
+                (score >= threshold).astype(np.int8),
+            ))
+            for truth, score in zip(
+                validation_truths, validation_scores
+            )
+        ]
+        mean_balanced_accuracy = float(
+            np.mean(window_balanced_accuracies)
+        )
+        manifest = {
+            **manifest,
+            "window_best_epochs": json.dumps(window_best_epochs),
+            "selected_epoch": selected_epoch,
+            "pooled_decision_threshold": float(threshold),
+            "mean_window_balanced_accuracy": mean_balanced_accuracy,
+        }
+        if last_model is None:
+            raise RuntimeError("No inner-validation model was trained")
+        return (
+            last_model,
+            combined_history,
+            threshold,
+            mean_balanced_accuracy,
+            manifest,
+        )
 
     def tune_inner_scope(
         *,
@@ -3105,11 +3764,18 @@ def run_walk_forward_fusion(
         study_seed: int,
     ) -> tuple[dict, float, pl.DataFrame, dict]:
         """Select configuration, checkpoint epoch, and threshold internally."""
-        if scope_name not in inner_split_cache:
-            inner_split_cache[scope_name] = _purged_inner_positions(
-                base_arrays[0],
-                purge_dates=forecast_horizon_weekdays,
-            )
+        split_windows, base_manifest = ensure_inner_windows(
+            scope_name, base_arrays
+        )
+        history_dir = (
+            output_dir / "inner_selection_histories" / scope_name
+        )
+        history_dir.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame([
+            manifest for _, _, manifest in split_windows
+        ], infer_schema_length=None).write_csv(
+            history_dir / "split_windows.csv"
+        )
         if tune_hyperparameters and tuning_trials > 0:
             try:
                 import optuna
@@ -3131,28 +3797,50 @@ def run_walk_forward_fusion(
 
             def objective(trial) -> float:
                 params = sampled_hyperparameters(trial)
-                model, history, threshold, score, _ = fit_inner_candidate(
+                (
+                    model,
+                    history,
+                    threshold,
+                    score,
+                    candidate_manifest,
+                ) = fit_inner_candidate(
                     scope_name=scope_name,
                     base_arrays=base_arrays,
                     raw_covariates=raw_covariates,
                     raw_sequence=raw_sequence,
                     raw_padding=raw_padding,
                     params=params,
-                    candidate_seed=(
-                        study_seed + 1000 * trial.number
-                    ),
+                    # Use common random numbers so Optuna compares model
+                    # configurations rather than different initializations.
+                    candidate_seed=study_seed,
                 )
-                best_epoch = int(history[0]["best_epoch"])
+                best_epoch = int(history[0]["selected_epoch"])
                 trial.set_user_attr("best_epoch", best_epoch)
                 trial.set_user_attr("decision_threshold", float(threshold))
+                trial.set_user_attr(
+                    "window_best_epochs",
+                    candidate_manifest["window_best_epochs"],
+                )
+                pl.DataFrame(history).with_columns(
+                    pl.lit(scope_name).alias("scope"),
+                    pl.lit(trial.number).cast(pl.Int64).alias("trial"),
+                ).write_csv(
+                    history_dir / f"trial_{trial.number}.csv"
+                )
                 del model
                 gc.collect()
                 if device == "mps":
                     torch.mps.empty_cache()
                 return score
 
+            completed_before = sum(
+                trial.state == optuna.trial.TrialState.COMPLETE
+                and "best_epoch" in trial.user_attrs
+                and "decision_threshold" in trial.user_attrs
+                for trial in study.trials
+            )
             remaining_trials = max(
-                0, int(tuning_trials) - len(study.trials)
+                0, int(tuning_trials) - completed_before
             )
             if remaining_trials:
                 study.optimize(
@@ -3192,11 +3880,34 @@ def run_walk_forward_fusion(
                 "decision_threshold": trial.user_attrs.get(
                     "decision_threshold"
                 ),
+                "window_best_epochs": trial.user_attrs.get(
+                    "window_best_epochs"
+                ),
                 "params_json": json.dumps(trial.params, sort_keys=True),
             } for trial in study.trials]
             trials = pl.DataFrame(rows, infer_schema_length=None)
+            manifest = {
+                **base_manifest,
+                "selected_epoch": int(
+                    best_trial.user_attrs["best_epoch"]
+                ),
+                "pooled_decision_threshold": threshold,
+                "window_best_epochs": best_trial.user_attrs.get(
+                    "window_best_epochs", "[]"
+                ),
+            }
+            selected_trial_number = int(best_trial.number)
+            selected_history_path = (
+                history_dir / f"trial_{selected_trial_number}.csv"
+            )
         else:
-            model, history, threshold, score, _ = fit_inner_candidate(
+            (
+                model,
+                history,
+                threshold,
+                score,
+                manifest,
+            ) = fit_inner_candidate(
                 scope_name=scope_name,
                 base_arrays=base_arrays,
                 raw_covariates=raw_covariates,
@@ -3207,19 +3918,55 @@ def run_walk_forward_fusion(
             )
             best_params = {
                 **default_params,
-                "epochs": int(history[0]["best_epoch"]),
+                "epochs": int(history[0]["selected_epoch"]),
             }
+            pl.DataFrame(history).with_columns(
+                pl.lit(scope_name).alias("scope"),
+                pl.lit(0).cast(pl.Int64).alias("trial"),
+            ).write_csv(history_dir / "fixed_default.csv")
             trials = pl.DataFrame([{
                 "scope": scope_name,
                 "trial": 0,
                 "state": "FIXED_DEFAULT",
                 "inner_balanced_accuracy": score,
-                "best_epoch": int(history[0]["best_epoch"]),
+                "best_epoch": int(history[0]["selected_epoch"]),
                 "decision_threshold": threshold,
+                "window_best_epochs": manifest[
+                    "window_best_epochs"
+                ],
                 "params_json": json.dumps(default_params, sort_keys=True),
             }], infer_schema_length=None)
             del model
-        manifest = inner_split_cache[scope_name][2]
+            selected_trial_number = 0
+            selected_history_path = history_dir / "fixed_default.csv"
+        if selected_history_path.exists():
+            selected_history = pl.read_csv(selected_history_path)
+            selected_history.write_csv(
+                history_dir / "selected_learning_curves.csv"
+            )
+            _plot_inner_selection_diagnostics(
+                selected_history,
+                history_dir / "selected_learning_curves.png",
+            )
+        else:
+            print(
+                f"Selected inner history is unavailable for {scope_name}: "
+                f"{selected_history_path}"
+            )
+        (history_dir / "selection.json").write_text(json.dumps({
+            "scope": scope_name,
+            "selected_trial": selected_trial_number,
+            "hyperparameters": best_params,
+            "selected_epoch": int(best_params["epochs"]),
+            "pooled_decision_threshold": float(threshold),
+            "inner_split": {
+                key: (
+                    str(value)
+                    if key.endswith(("_end", "_start")) else value
+                )
+                for key, value in manifest.items()
+            },
+        }, indent=2, sort_keys=True))
         return best_params, threshold, trials, manifest
 
     # True nested selection: each outer fold owns an inner purged split.
@@ -3250,7 +3997,7 @@ def run_walk_forward_fusion(
             raw_padding=tuning_train_padding,
             study_name=(
                 f"timesfm_{market_encoder}_nested_outer_fold_{fold}_"
-                f"{study_signature}_v2"
+                f"{study_signature}_v3"
             ),
             study_seed=seed + 10_000 * fold,
         )
@@ -3276,27 +4023,40 @@ def run_walk_forward_fusion(
             ) = fold_arrays(fold, variant_families)
             variant_params = dict(fold_params)
             threshold = float(tuning_threshold)
+            selection_manifest = split_manifest
 
             # Non-tuning text variants share the selected architecture but get
             # their own inner-selected epoch and probability threshold.
             if variant != tuning_variant:
+                variant_selection_params = {
+                    **variant_params,
+                    "epochs": int(fusion_epochs),
+                }
                 (
                     inner_model,
                     inner_history,
                     threshold,
                     _,
-                    _,
+                    selection_manifest,
                 ) = fit_inner_candidate(
                     scope_name=f"outer_fold_{fold}",
                     base_arrays=train_a,
                     raw_covariates=train_raw,
                     raw_sequence=train_sequence,
                     raw_padding=train_padding,
-                    params=variant_params,
+                    params=variant_selection_params,
                     candidate_seed=seed + 20_000 * fold,
                 )
                 variant_params["epochs"] = int(
-                    inner_history[0]["best_epoch"]
+                    inner_history[0]["selected_epoch"]
+                )
+                pl.DataFrame(inner_history).with_columns(
+                    pl.lit(f"outer_fold_{fold}").alias("scope"),
+                    pl.lit(variant).alias("variant"),
+                ).write_csv(
+                    output_dir / "inner_selection_histories" /
+                    f"outer_fold_{fold}" /
+                    f"variant_{variant}_selection.csv"
                 )
                 del inner_model
 
@@ -3324,11 +4084,7 @@ def run_walk_forward_fusion(
                     selected_temporal_lookback,
                 )
 
-            model_name = (
-                f"timesfm_tft_unified_raw_text_plus_{variant}"
-                if market_encoder == "tft" else
-                f"timesfm_covariates_unified_raw_text_plus_{variant}"
-            )
+            model_name = fusion_model_name(variant)
             config_id = f"{model_name}__nested"
             model_path = (
                 fold_scopes[fold]["dir"] / "fusion_models" /
@@ -3350,12 +4106,16 @@ def run_walk_forward_fusion(
                 market_attention_heads=tft_attention_heads,
                 text_attention_heads=text_attention_heads,
                 text_attention_layers=text_attention_layers,
+                cross_stock_attention=cross_stock_attention,
+                cross_stock_attention_heads=cross_stock_attention_heads,
+                stock_group_ids=stock_groups(train_a[0]),
                 validation_price=val_a[1],
                 validation_covariates=val_cov,
                 validation_text_indices=val_a[2],
                 validation_target=val_a[4],
                 validation_market_sequence=val_sequence,
                 validation_sequence_padding_mask=val_padding,
+                validation_stock_group_ids=stock_groups(val_a[0]),
                 select_best_checkpoint=False,
                 **model_fit_params(variant_params),
             )
@@ -3377,13 +4137,19 @@ def run_walk_forward_fusion(
                 "raw_text_shared_dim": raw_text_dim,
                 "text_attention_heads": text_attention_heads,
                 "text_attention_layers": text_attention_layers,
+                "adapter_learning_rate_multiplier": 0.1,
+                "cross_stock_attention": cross_stock_attention,
+                "cross_stock_attention_heads": (
+                    cross_stock_attention_heads
+                    if cross_stock_attention else None
+                ),
                 "temporal_covariates": list(temporal_covariate_columns),
                 "temporal_lookback": selected_temporal_lookback,
                 "decision_threshold": threshold,
                 "hyperparameters": variant_params,
                 "inner_split": {
                     key: str(value) if key.endswith(("_end", "_start")) else value
-                    for key, value in split_manifest.items()
+                    for key, value in selection_manifest.items()
                 },
             })
             _save_covariate_scaler(
@@ -3422,6 +4188,8 @@ def run_walk_forward_fusion(
                 market_encoder=market_encoder,
                 market_sequence=val_sequence,
                 sequence_padding_mask=val_padding,
+                cross_stock_attention=cross_stock_attention,
+                stock_group_ids=stock_groups(val_a[0]),
             )
             prediction_parts.append(val_a[0].with_columns(
                 pl.lit(feature_set).alias("feature_set"),
@@ -3438,14 +4206,21 @@ def run_walk_forward_fusion(
                 "model": model_name,
                 "best_epoch": int(variant_params["epochs"]),
                 "decision_threshold": threshold,
-                "inner_train_rows": split_manifest["inner_train_rows"],
-                "inner_validation_rows": split_manifest[
+                "inner_windows": selection_manifest["inner_windows"],
+                "window_best_epochs": selection_manifest[
+                    "window_best_epochs"
+                ],
+                "inner_train_rows": selection_manifest["inner_train_rows"],
+                "inner_validation_rows": selection_manifest[
                     "inner_validation_rows"
                 ],
-                "purged_dates": split_manifest["purged_dates"],
-                "inner_train_end": split_manifest["inner_train_end"],
-                "inner_validation_start": split_manifest[
+                "purged_dates": selection_manifest["purged_dates"],
+                "inner_train_end": selection_manifest["inner_train_end"],
+                "inner_validation_start": selection_manifest[
                     "inner_validation_start"
+                ],
+                "inner_validation_end": selection_manifest[
+                    "inner_validation_end"
                 ],
                 "params_json": json.dumps(
                     variant_params, sort_keys=True
@@ -3468,6 +4243,7 @@ def run_walk_forward_fusion(
             "inner_balanced_accuracy": pl.Float64,
             "best_epoch": pl.Int64,
             "decision_threshold": pl.Float64,
+            "window_best_epochs": pl.String,
             "params_json": pl.String,
             "outer_fold": pl.Int8,
         })
@@ -3485,11 +4261,14 @@ def run_walk_forward_fusion(
             "model": pl.String,
             "best_epoch": pl.Int64,
             "decision_threshold": pl.Float64,
+            "inner_windows": pl.Int64,
+            "window_best_epochs": pl.String,
             "inner_train_rows": pl.Int64,
             "inner_validation_rows": pl.Int64,
             "purged_dates": pl.Int64,
             "inner_train_end": pl.Date,
             "inner_validation_start": pl.Date,
+            "inner_validation_end": pl.Date,
             "params_json": pl.String,
         })
     nested_selection.write_csv(
@@ -3524,9 +4303,17 @@ def run_walk_forward_fusion(
             "epoch": pl.Float64,
             "bce": pl.Float64,
             "train_bce": pl.Float64,
+            "train_balanced_bce": pl.Float64,
+            "train_positive_rate": pl.Float64,
             "validation_bce": pl.Float64,
+            "validation_balanced_bce": pl.Float64,
             "validation_accuracy": pl.Float64,
             "validation_balanced_accuracy": pl.Float64,
+            "validation_roc_auc": pl.Float64,
+            "validation_optimized_balanced_accuracy": pl.Float64,
+            "validation_optimized_threshold": pl.Float64,
+            "validation_mean_probability": pl.Float64,
+            "validation_positive_rate": pl.Float64,
             "best_epoch": pl.Float64,
             "is_best_epoch": pl.Float64,
             "stopped_early": pl.Float64,
@@ -3667,7 +4454,7 @@ def run_walk_forward_fusion(
         raw_padding=final_tuning_padding,
         study_name=(
             f"timesfm_{market_encoder}_nested_final_"
-            f"{study_signature}_v2"
+            f"{study_signature}_v3"
         ),
         study_seed=seed + 900_000,
     )
@@ -3684,6 +4471,11 @@ def run_walk_forward_fusion(
     (output_dir / "best_hyperparameters.json").write_text(json.dumps({
         "selection": "nested_inner_validation",
         "optuna_study_signature": study_signature,
+        "cross_stock_attention": bool(cross_stock_attention),
+        "cross_stock_attention_heads": (
+            cross_stock_attention_heads
+            if cross_stock_attention else None
+        ),
         "training_mode": (
             "nested-folds" if run_outer_folds else "full-only"
         ),
@@ -3716,6 +4508,7 @@ def run_walk_forward_fusion(
         test_raw = _covariate_matrix(test_a[0], scoped_test_features, covariate_columns)
         variant_params = dict(final_best_params)
         threshold = float(final_tuning_threshold)
+        variant_selection_manifest = final_split_manifest
         raw_train_sequence = raw_train_padding = None
         if market_encoder == "tft":
             raw_train_sequence, raw_train_padding = _temporal_covariate_matrix(
@@ -3725,23 +4518,35 @@ def run_walk_forward_fusion(
                 max_temporal_lookback,
             )
         if variant != tuning_variant:
+            variant_selection_params = {
+                **variant_params,
+                "epochs": int(fusion_epochs),
+            }
             (
                 inner_model,
                 inner_history,
                 threshold,
                 _,
-                _,
+                variant_selection_manifest,
             ) = fit_inner_candidate(
                 scope_name="final_full_training",
                 base_arrays=train_a,
                 raw_covariates=train_raw,
                 raw_sequence=raw_train_sequence,
                 raw_padding=raw_train_padding,
-                params=variant_params,
+                params=variant_selection_params,
                 candidate_seed=seed + 910_000,
             )
             variant_params["epochs"] = int(
-                inner_history[0]["best_epoch"]
+                inner_history[0]["selected_epoch"]
+            )
+            pl.DataFrame(inner_history).with_columns(
+                pl.lit("final_full_training").alias("scope"),
+                pl.lit(variant).alias("variant"),
+            ).write_csv(
+                output_dir / "inner_selection_histories" /
+                "final_full_training" /
+                f"variant_{variant}_selection.csv"
             )
             del inner_model
         scaler = _fit_covariate_scaler(train_raw)
@@ -3771,11 +4576,7 @@ def run_walk_forward_fusion(
             test_sequence = _apply_temporal_scaler(
                 test_sequence, test_padding, temporal_scaler
             )
-        model_name = (
-            f"timesfm_tft_unified_raw_text_plus_{variant}"
-            if market_encoder == "tft" else
-            f"timesfm_covariates_unified_raw_text_plus_{variant}"
-        )
+        model_name = fusion_model_name(variant)
         model, history = fit_raw_fusion_model(
             train_a[1], train_cov, train_a[2], stores, train_a[4],
             device, text_dim=raw_text_dim,
@@ -3786,6 +4587,9 @@ def run_walk_forward_fusion(
             market_attention_heads=tft_attention_heads,
             text_attention_heads=text_attention_heads,
             text_attention_layers=text_attention_layers,
+            cross_stock_attention=cross_stock_attention,
+            cross_stock_attention_heads=cross_stock_attention_heads,
+            stock_group_ids=stock_groups(train_a[0]),
             **model_fit_params(variant_params),
         )
         save_torch_model(final_dir / "fusion_models" / f"{model_name}.pt", model, {
@@ -3803,7 +4607,15 @@ def run_walk_forward_fusion(
             "raw_text_shared_dim": raw_text_dim,
             "text_attention_heads": text_attention_heads,
             "text_attention_layers": text_attention_layers,
+            "adapter_learning_rate_multiplier": 0.1,
+            "cross_stock_attention": cross_stock_attention,
+            "cross_stock_attention_heads": (
+                cross_stock_attention_heads
+                if cross_stock_attention else None
+            ),
             "architecture": (
+                "tft_plus_raw_text_attention_plus_cross_stock_attention"
+                if cross_stock_attention else
                 "tft_plus_raw_family_adapters_self_and_cross_attention"
                 if market_encoder == "tft" else
                 "market_mlp_plus_raw_family_adapters_self_and_cross_attention"
@@ -3812,6 +4624,13 @@ def run_walk_forward_fusion(
             "temporal_lookback": selected_temporal_lookback,
             "decision_threshold": threshold,
             "hyperparameters": variant_params,
+            "inner_split": {
+                key: (
+                    str(value)
+                    if key.endswith(("_end", "_start")) else value
+                )
+                for key, value in variant_selection_manifest.items()
+            },
         })
         _save_covariate_scaler(
             final_dir / "fusion_models" / f"{model_name}_covariate_scaler.csv",
@@ -3832,6 +4651,8 @@ def run_walk_forward_fusion(
             market_encoder=market_encoder,
             market_sequence=test_sequence,
             sequence_padding_mask=test_padding,
+            cross_stock_attention=cross_stock_attention,
+            stock_group_ids=stock_groups(test_a[0]),
         )
         final_thresholds[model_name] = threshold
         final_prediction_parts.append(test_a[0].with_columns(

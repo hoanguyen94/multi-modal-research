@@ -90,8 +90,8 @@ TEXT_ATTENTION_LAYERS = 1
 RAW_FUSION_BATCH_SIZE = 128
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+def parse_args(description: str | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=description or __doc__)
     parser.add_argument(
         "--families", nargs="+", default=["bert"],
         help="Original text-embedding families to use.",
@@ -108,12 +108,18 @@ def parse_args() -> argparse.Namespace:
         help="Use the default TFT and fusion hyperparameters.",
     )
     parser.add_argument(
+        "--inner-validation-windows",
+        type=int,
+        default=3,
+        help="Number of rolling purged windows used for inner selection.",
+    )
+    parser.add_argument(
         "--training-mode",
         choices=("nested-folds", "full-only"),
         default="nested-folds",
         help=(
             "Run five nested walk-forward folds before the final refit, or "
-            "skip them and tune on one purged inner split of all training data."
+            "skip them and tune on rolling purged windows of all training data."
         ),
     )
     parser.add_argument(
@@ -127,18 +133,35 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def run_tft_pipeline(
+    args: argparse.Namespace,
+    *,
+    output_dir=OUTPUT_DIR,
+    cross_stock_attention: bool = False,
+    cross_stock_attention_heads: int = 4,
+) -> dict[str, pl.DataFrame]:
     if args.no_price_extraction and args.force_price_refresh:
         raise ValueError(
             "--no-price-extraction and --force-price-refresh cannot be combined"
         )
+    if args.inner_validation_windows < 1:
+        raise ValueError("--inner-validation-windows must be positive")
+    if args.optuna_trials < 0:
+        raise ValueError("--optuna-trials cannot be negative")
     args.families = list(dict.fromkeys(args.families))
+    usable_family_count = 0
     for family in args.families:
         path = DATA_DIR / f"{family}_textemb.parquet"
-        if not path.exists():
-            raise FileNotFoundError(f"Requested embedding family is absent: {path}")
-        parquet_embedding_dim(path)
+        try:
+            parquet_embedding_dim(path)
+            usable_family_count += 1
+        except Exception as error:
+            print(
+                f"Warning: skipping unusable embedding family "
+                f"{family!r}: {error}"
+            )
+    if not usable_family_count:
+        raise RuntimeError("No requested text-embedding family is usable")
     if not args.no_tune and importlib.util.find_spec("optuna") is None:
         raise ImportError(
             "Optuna tuning is enabled. Install it with "
@@ -173,8 +196,8 @@ def main() -> None:
     if missing_temporal:
         raise ValueError(f"TFT temporal features are unavailable: {missing_temporal}")
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    (OUTPUT_DIR / "feature_groups.json").write_text(json.dumps({
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "feature_groups.json").write_text(json.dumps({
         "frozen_price_encoder": PRICE_ENCODER_MODEL_ID,
         "timesfm_hidden_input": TIMESFM_INPUT_COLUMN,
         "market_encoder": "temporal_fusion_transformer",
@@ -185,6 +208,18 @@ def main() -> None:
         "raw_text_shared_dim": RAW_TEXT_DIM,
         "text_attention_heads": TEXT_ATTENTION_HEADS,
         "text_attention_layers": TEXT_ATTENTION_LAYERS,
+        "adapter_learning_rate_multiplier": 0.1,
+        "inner_validation_windows": args.inner_validation_windows,
+        "training_loss": "class_balanced_bce",
+        "checkpoint_metric": "validation_balanced_bce",
+        "early_stopping_patience": 10,
+        "early_stopping_min_delta": 1e-5,
+        "threshold_selection": "pooled_exact_balanced_accuracy",
+        "cross_stock_attention": cross_stock_attention,
+        "cross_stock_attention_heads": (
+            cross_stock_attention_heads
+            if cross_stock_attention else None
+        ),
         "training_mode": args.training_mode,
         "current_past_market_covariates": list(past_market_covariates),
         "current_known_future_covariates": list(known_future_covariates),
@@ -240,7 +275,7 @@ def main() -> None:
 
     results = run_walk_forward_fusion(
         data_dir=DATA_DIR,
-        output_dir=OUTPUT_DIR,
+        output_dir=output_dir,
         baseline_dir=BASELINE_DIR,
         train_price_latents=train_price_latents,
         test_price_latents=test_price_latents,
@@ -276,6 +311,9 @@ def main() -> None:
         raw_text_dim=RAW_TEXT_DIM,
         text_attention_heads=TEXT_ATTENTION_HEADS,
         text_attention_layers=TEXT_ATTENTION_LAYERS,
+        cross_stock_attention=cross_stock_attention,
+        cross_stock_attention_heads=cross_stock_attention_heads,
+        inner_validation_windows=args.inner_validation_windows,
         run_outer_folds=args.training_mode == "nested-folds",
     )
 
@@ -293,6 +331,11 @@ def main() -> None:
     for title, key in reports:
         print(f"\n{title}")
         print(results[key])
+    return results
+
+
+def main() -> None:
+    run_tft_pipeline(parse_args())
 
 
 if __name__ == "__main__":
