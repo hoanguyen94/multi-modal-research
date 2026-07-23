@@ -290,6 +290,8 @@ $\Prob(\cdot)$, $\E[\cdot]$, $\R^d$ & Probability, expectation, and the $d$-dime
 \endhead
 $X^P_{i,t-L+1:t}\in\R^{L\times F_P}$ & Ordered price-feature sequence for stock $i$ ending at $t$; rows are dates and the $F_P$ columns are price, return, volatility, volume, market, or related variables. \\
 $x^P_{i,t}\in\R^{F_{\mathrm{tab}}}$ & Fixed-length tabular price vector evaluated at $t$, formed from the engineered price statistics listed in the Price Features subsection. \\
+$x^C_{i,t}\in\R^{F_C}$ & Complete engineered covariate vector available at forecast origin $t$: market and volume features, calendar and Fourier features, and text-availability counts or indicators. In the implemented TimesFM fusion model, $F_C=106$. \\
+$\bar x^C_{i,t}\in\R^{F_C}$ & Fold-standardized covariate vector. Missing entries of $x^C_{i,t}$ are replaced by training-fold medians and each column is centered and scaled using training-fold statistics only. \\
 $F_P$; $F_{\mathrm{tab}}$ & Number of features per sequential time step and number of engineered features in the tabular price vector, respectively. \\
 $r_{i,t}^{(k)}$ & Log return from date $t-k$ to date $t$, $\log(P_{i,t}/P_{i,t-k})$; $r_{i,t}^{(1)}$ is the return from $t-1$ to $t$. \\
 $\bar r_{i,t}^{(k)}$; $\sigma_{i,t}^{(k)}$ & Mean and sample standard deviation of the $k$ one-day returns from $t-k+1$ through $t$. \\
@@ -323,6 +325,7 @@ $m$; $M_{\mathrm{mod}}$ & Model index and number of models or ensemble members. 
 $\theta_m^0$; $\theta_0$ & Frozen pretrained parameters of foundation model $m$, or of the selected backbone when no model index is needed. \\
 $H^{P,m}_{i,t}\in\R^{M_m\times d_m}$ & Hidden price-token matrix from foundation model $m$; $M_m$ and $d_m$ are its token count and hidden width. \\
 $H^P_{i,t}\in\R^{M_P\times d}$; $h^P_{i,t}$ & Price-token matrix in the shared latent space and its pooled vector; $M_P$ is the number of price tokens. \\
+$h^C_{i,t}$ & Joint market representation obtained by passing $[h^P_{i,t};\bar x^C_{i,t}]$ through the residual covariate--price MLP. \\
 $p^{(m)}_{i,t}$; $a^{(m)}_{i,t}$ & Model-$m$ probability of an upward endpoint and its signed point-forecast log-return score. \\
 $S_m$; $\widehat P^{(m,s)}_{i,t+H}$ & Number of forecast samples from model $m$ and its $s$th sampled endpoint price. \\
 $u^{(m)}_{i,t}$; $h^{\mathrm{FM}}_{i,t}$ & Model-$m$ uncertainty summaries and the concatenated foundation-model forecast-feature vector. \\
@@ -804,6 +807,7 @@ p_{i,t}
 g_\psi
 \left(
 h^{P,m}_{i,t},
+\bar x^C_{i,t},
 z^T_{i,t}
 \right)
 \right].
@@ -927,6 +931,113 @@ h^{T,J}_{i,t}
 \R^{J\times d}.
 \end{equation}
 
+\subsection{Residual Covariate--Price Encoder with Text Fusion}
+
+The implemented frozen-TimesFM model does not send the pooled pretrained
+vector directly to the text-fusion head.  It first combines that vector with
+all engineered covariates available at the forecast origin.  Let
+
+\begin{equation}
+h^P_{i,t}
+=
+\operatorname{Pool}\!\left(H^P_{i,t}\right)
+\end{equation}
+
+be the frozen TimesFM representation, and let $\bar x^C_{i,t}$ be the
+engineered covariate vector after training-fold median imputation and
+standardization.  The initial joint market state is
+
+\begin{equation}
+h^{C,(0)}_{i,t}
+=
+\operatorname{Dropout}\!\left(
+\operatorname{GELU}\!\left(
+W_C\operatorname{LayerNorm}\!\left(
+[h^P_{i,t};\bar x^C_{i,t}]
+\right)+b_C
+\right)
+\right).
+\end{equation}
+
+For $\ell=1,\ldots,B_C$, a pre-normalized residual MLP block updates this
+state as
+
+\begin{align}
+v^{C,(\ell)}_{i,t}
+&=
+W^{C,(\ell)}_2
+\operatorname{Dropout}\!\left(
+\operatorname{GELU}\!\left(
+W^{C,(\ell)}_1
+\operatorname{LayerNorm}\!\left(h^{C,(\ell-1)}_{i,t}\right)
++b^{C,(\ell)}_1
+\right)
+\right)
++b^{C,(\ell)}_2,\\
+h^{C,(\ell)}_{i,t}
+&=
+h^{C,(\ell-1)}_{i,t}
++\operatorname{Dropout}\!\left(v^{C,(\ell)}_{i,t}\right).
+\end{align}
+
+The resulting market representation is
+$h^C_{i,t}=\operatorname{LayerNorm}(h^{C,(B_C)}_{i,t})$.  Thus, the residual
+market encoder learns interactions between the frozen TimesFM latent vector
+and the tabular market, volume, calendar, Fourier, and text-availability
+covariates.
+
+For multiple text-embedding families, let $a^T_{i,t}\in\{0,1\}^{J}$ denote
+family availability and set unavailable family vectors to zero.  The text
+branch used by the simple-concatenation implementation is
+
+\begin{equation}
+h^{T,\mathrm{pool}}_{i,t}
+=
+\operatorname{LayerNorm}\!\left(
+\operatorname{GELU}\!\left(
+W_{T,\mathrm{pool}}
+\left[
+\operatorname{vec}\!\left(
+a^T_{i,t}\odot H^T_{i,t}
+\right);
+a^T_{i,t}
+\right]
++b_{T,\mathrm{pool}}
+\right)
+\right).
+\end{equation}
+
+The two branches are concatenated only after the residual market encoding:
+
+\begin{equation}
+u^{(0)}_{i,t}
+=
+\operatorname{Dropout}\!\left(
+\operatorname{GELU}\!\left(
+W_F[h^C_{i,t};h^{T,\mathrm{pool}}_{i,t}]+b_F
+\right)
+\right).
+\label{simple_covariate_concatenation}
+\end{equation}
+
+A second sequence of $B_F$ pre-normalized residual MLP blocks, defined in the
+same form as above with fusion-specific parameters, produces $u^{(B_F)}_{i,t}$.
+The directional probability is
+
+\begin{equation}
+p_{i,t}
+=
+\sigmoid\!\left(
+w_o^\top\operatorname{LayerNorm}\!\left(u^{(B_F)}_{i,t}\right)+b_o
+\right).
+\end{equation}
+
+TimesFM and the cached $h^P_{i,t}$ remain frozen.  Text coders, covariate
+preprocessing, both residual MLP stacks, and the classifier are fitted within
+each expanding training fold.  Hyperparameters and the decision threshold are
+selected from out-of-sample fold predictions only; the selected model is then
+refitted using all labeled training observations.
+
 \subsection{TCN (Temporal Convolution Network) with Text Fusion}
 
 The TCN with text fusion is a supervised, train-from-scratch model rather than
@@ -1021,14 +1132,27 @@ h^P_{i,t}
 \end{cases}
 \end{equation}
 
-After the price history has been encoded, either price encoder can be paired
-with each of the same three text-fusion choices:
+For the implemented frozen-TimesFM concatenation model, the pooled price
+vector is first augmented with the engineered covariates and encoded jointly:
+
+\begin{equation}
+h^{P+C}_{i,t}
+=
+\operatorname{ResidualMLP}_C\!\left(
+[h^P_{i,t};\bar x^C_{i,t}]
+\right).
+\end{equation}
+
+The concatenation variant therefore uses $h^{P+C}_{i,t}$ rather than the
+unaugmented $h^P_{i,t}$.  More generally, after the price history has been
+encoded, either price encoder can be paired with each of the same three
+text-fusion choices:
 
 \begin{equation}
 u_{i,t}
 =
 \begin{cases}
-[h^P_{i,t};h^T_{i,t}],
+[h^{P+C}_{i,t};h^T_{i,t}],
 & \text{concatenation},\\
 [\widetilde h^P_{i,t};\widetilde h^T_{i,t}],
 & \text{elementwise gating},\\
@@ -1833,7 +1957,8 @@ compressed embedding features may remain correlated or high-dimensional.
 \subsection{Stage 4: Transfer Pretrained Representations}
 
 \begin{enumerate}
-    \item frozen TimesFM representation plus classification head;
+    \item frozen TimesFM representation concatenated with engineered
+    covariates, encoded by a residual MLP, and fused with projected text;
     \item frozen representation plus gated text fusion;
     \item frozen representation plus text-to-price cross-attention;
     \item LoRA adaptation, if permitted;
