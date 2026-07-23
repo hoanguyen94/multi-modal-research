@@ -31,7 +31,7 @@ BASELINE_DIR = ARTIFACT_DIR / "baselines"
 OUTPUT_DIR = (
     ARTIFACT_DIR
     / "stage2_pretrained_forecasts"
-    / "timesfm_covariates_unified_raw_text_attention"
+    / "timesfm_covariates_unified_raw_text_attention2"
 )
 PRICE_CACHE_DIR = (
     ARTIFACT_DIR
@@ -52,7 +52,7 @@ HORIZON = 20
 LOOKBACK = 512
 MIN_CONTEXT = 64
 TIMESFM_INPUT_COLUMN = "ret_20"
-DEFAULT_TEXT_FAMILIES = ("bert",)
+DEFAULT_TEXT_FAMILIES = ("linq", "qwen") #"bert"
 RAW_TEXT_DIM = 384
 TEXT_ATTENTION_HEADS = 4
 TEXT_ATTENTION_LAYERS = 1
@@ -61,7 +61,7 @@ MARKET_DEPTH = 2
 FUSION_DEPTH = 2
 RESIDUAL_EXPANSION = 2
 FUSION_DROPOUT = 0.10
-FUSION_EPOCHS = 10
+FUSION_EPOCHS = 100
 PRICE_BATCH_SIZE = 16
 FUSION_BATCH_SIZE = 128
 OPTUNA_TRIALS = 12
