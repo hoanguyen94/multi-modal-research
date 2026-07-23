@@ -98,11 +98,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--optuna-trials", type=int, default=OPTUNA_TRIALS,
-        help="Total persistent Optuna trial budget.",
+        help=(
+            "Persistent Optuna trial budget for each enabled inner-selection "
+            "study."
+        ),
     )
     parser.add_argument(
         "--no-tune", action="store_true",
         help="Use the default TFT and fusion hyperparameters.",
+    )
+    parser.add_argument(
+        "--training-mode",
+        choices=("nested-folds", "full-only"),
+        default="nested-folds",
+        help=(
+            "Run five nested walk-forward folds before the final refit, or "
+            "skip them and tune on one purged inner split of all training data."
+        ),
     )
     parser.add_argument(
         "--no-price-extraction", action="store_true",
@@ -132,16 +144,18 @@ def main() -> None:
             "Optuna tuning is enabled. Install it with "
             "`python -m pip install optuna`, or pass --no-tune."
         )
-    require_paths((
+    required_paths = [
         PREPARED_TRAIN_PATH,
         PREPARED_TEST_PATH,
         TRAIN_TARGET_PATH,
         TEST_TARGET_PATH,
         TRAIN_LINK_PATH,
         TEST_LINK_PATH,
-        FOLD_PATH,
         DATA_DIR / "test.parquet",
-    ))
+    ]
+    if args.training_mode == "nested-folds":
+        required_paths.append(FOLD_PATH)
+    require_paths(required_paths)
 
     device = select_device()
     print(f"Device: {device}")
@@ -171,6 +185,7 @@ def main() -> None:
         "raw_text_shared_dim": RAW_TEXT_DIM,
         "text_attention_heads": TEXT_ATTENTION_HEADS,
         "text_attention_layers": TEXT_ATTENTION_LAYERS,
+        "training_mode": args.training_mode,
         "current_past_market_covariates": list(past_market_covariates),
         "current_known_future_covariates": list(known_future_covariates),
         "current_text_availability_covariates": list(text_availability_covariates),
@@ -185,7 +200,10 @@ def main() -> None:
     ])
     train_links = pl.read_parquet(TRAIN_LINK_PATH)
     test_links = pl.read_parquet(TEST_LINK_PATH)
-    fold_assignments = pl.read_parquet(FOLD_PATH)
+    fold_assignments = (
+        pl.read_parquet(FOLD_PATH)
+        if args.training_mode == "nested-folds" else None
+    )
     train_origins = train_targets.filter(
         pl.col("target_up").is_not_null()
     ).select(ID_COLUMNS)
@@ -258,15 +276,21 @@ def main() -> None:
         raw_text_dim=RAW_TEXT_DIM,
         text_attention_heads=TEXT_ATTENTION_HEADS,
         text_attention_layers=TEXT_ATTENTION_LAYERS,
+        run_outer_folds=args.training_mode == "nested-folds",
     )
 
-    for title, key in (
-        ("Fold metrics", "fold_metrics"),
-        ("Aggregate walk-forward metrics", "aggregate"),
-        ("Comparison with baselines", "comparison_aggregate"),
+    reports = []
+    if args.training_mode == "nested-folds":
+        reports.extend([
+            ("Fold metrics", "fold_metrics"),
+            ("Aggregate walk-forward metrics", "aggregate"),
+            ("Comparison with baselines", "comparison_aggregate"),
+        ])
+    reports.extend([
         ("Test metrics by prediction year", "final_metrics"),
         ("Submission files", "submission_manifest"),
-    ):
+    ])
+    for title, key in reports:
         print(f"\n{title}")
         print(results[key])
 
