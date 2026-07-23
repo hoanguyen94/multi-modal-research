@@ -1,15 +1,16 @@
 """Memory-conscious helpers for frozen-price, covariate, and text fusion.
 
-The notebook owns TimesFM loading and hidden-state extraction.  This module
-trains one small text encoder per original embedding family, projects articles
-in streaming parquet batches, pools articles within each stock-date, and fits a
-residual market MLP followed by the paper draft's simple-concatenation fusion.
+The notebook owns TimesFM loading and hidden-state extraction. This module
+streams raw embedding families through trainable in-model adapters, preserves
+semantic text-field tokens, applies shared text self-attention, and uses the
+market representation as a cross-attention query before fusion.
 """
 
 from __future__ import annotations
 
 import gc
 import json
+import shutil
 from pathlib import Path
 from typing import Sequence
 import numpy as np
@@ -37,6 +38,125 @@ def parquet_embedding_dim(path: Path) -> int:
     return len(columns)
 
 
+class RawEmbeddingStore:
+    """Disk-backed raw embedding matrix and its text-ID row index."""
+
+    def __init__(
+        self,
+        family: str,
+        values_path: Path,
+        index_path: Path,
+        input_dim: int,
+    ):
+        self.family = family
+        self.input_dim = int(input_dim)
+        self.values = np.load(values_path, mmap_mode="r")
+        if self.values.ndim != 2 or self.values.shape[1] != self.input_dim:
+            raise ValueError(f"Invalid raw embedding cache for {family}")
+        self.index = pl.read_parquet(index_path).select([
+            "text_id", pl.col("embedding_row").cast(pl.Int64),
+        ])
+
+    def gather(self, indices: np.ndarray) -> np.ndarray:
+        """Load only one mini-batch of raw vectors; -1 denotes missing text."""
+        safe = np.maximum(indices, 0)
+        values = np.asarray(self.values[safe], dtype=np.float32)
+        values[indices < 0] = 0.0
+        return np.ascontiguousarray(values)
+
+
+def prepare_raw_embedding_store(
+    *,
+    family: str,
+    embedding_path: Path,
+    cache_dir: Path,
+    batch_size: int = 2048,
+) -> RawEmbeddingStore:
+    """Stream a family parquet once into a float32 random-access matrix."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    values_path = cache_dir / f"{family}_raw_embeddings_float32.npy"
+    index_path = cache_dir / f"{family}_text_id_index.parquet"
+    metadata_path = cache_dir / f"{family}_raw_embeddings_metadata.json"
+    input_dim = parquet_embedding_dim(embedding_path)
+    parquet_file = pq.ParquetFile(embedding_path)
+    row_count = parquet_file.metadata.num_rows
+    source_stat = embedding_path.stat()
+    expected = {
+        "family": family,
+        "source": str(embedding_path.resolve()),
+        "source_size": source_stat.st_size,
+        "source_mtime_ns": source_stat.st_mtime_ns,
+        "rows": row_count,
+        "input_dim": input_dim,
+        "dtype": "float32",
+    }
+    valid = False
+    if values_path.exists() and index_path.exists() and metadata_path.exists():
+        try:
+            valid = json.loads(metadata_path.read_text()) == expected
+            if valid:
+                cached = np.load(values_path, mmap_mode="r")
+                valid = cached.shape == (row_count, input_dim)
+                del cached
+        except Exception:
+            valid = False
+    if not valid:
+        required_bytes = row_count * input_dim * np.dtype(np.float32).itemsize
+        free_bytes = shutil.disk_usage(cache_dir).free
+        if free_bytes < int(required_bytes * 1.05):
+            raise OSError(
+                f"Insufficient disk space for the {family} raw embedding cache: "
+                f"need about {required_bytes / 2**30:.2f} GiB plus overhead, "
+                f"but only {free_bytes / 2**30:.2f} GiB is free"
+            )
+        gib = row_count * input_dim * np.dtype(np.float32).itemsize / 2**30
+        print(
+            f"Building raw {family} embedding cache: "
+            f"{row_count:,} x {input_dim:,} float32 ({gib:.2f} GiB)"
+        )
+        temporary_values = cache_dir / f"{family}_raw_embeddings_building.npy"
+        temporary_index = cache_dir / f"{family}_text_id_index_building.parquet"
+        matrix = np.lib.format.open_memmap(
+            temporary_values,
+            mode="w+",
+            dtype=np.float32,
+            shape=(row_count, input_dim),
+        )
+        text_ids: list[str] = []
+        columns = ["text_id"] + [f"emb_{index}" for index in range(input_dim)]
+        start = 0
+        for record_batch in parquet_file.iter_batches(
+            batch_size=batch_size, columns=columns
+        ):
+            stop = start + record_batch.num_rows
+            text_ids.extend(record_batch.column(0).to_pylist())
+            matrix[start:stop] = np.column_stack([
+                record_batch.column(column).to_numpy(zero_copy_only=False)
+                for column in range(1, input_dim + 1)
+            ]).astype(np.float32, copy=False)
+            start = stop
+            if start == row_count or start % (batch_size * 50) == 0:
+                print(
+                    f"  {family}: cached {start:,}/{row_count:,} embeddings"
+                )
+        if start != row_count:
+            raise RuntimeError(
+                f"Raw embedding cache for {family} wrote {start} of {row_count} rows"
+            )
+        matrix.flush()
+        del matrix
+        pl.DataFrame({
+            "text_id": text_ids,
+            "embedding_row": np.arange(row_count, dtype=np.int64),
+        }).write_parquet(temporary_index, compression="zstd")
+        temporary_values.replace(values_path)
+        temporary_index.replace(index_path)
+        metadata_path.write_text(json.dumps(expected, indent=2, sort_keys=True))
+    else:
+        print(f"Using raw {family} embedding cache: {values_path}")
+    return RawEmbeddingStore(family, values_path, index_path, input_dim)
+
+
 def _nonfinite_row_count(frame: pl.DataFrame, columns: Sequence[str]) -> int:
     """Count rows containing NaN or infinity without one large NumPy copy."""
     if not columns:
@@ -61,6 +181,11 @@ def _require_finite(name: str, values: np.ndarray, batch_rows: int = 4096) -> No
             )
 
 
+# Legacy projected-token baseline components are retained for old checkpoint
+# compatibility. The active walk-forward path uses RawText*Fusion below and
+# never trains or invokes TextCoder.
+# Inline shape symbols below: B=batch, T=time, K=text families, V=temporal
+# variables, H=hidden width, and D_*=the named feature/latent dimension.
 class TextCoder(nn.Module):
     """h_T = LayerNorm(GELU(W_T z_T + b_T))."""
 
@@ -73,7 +198,11 @@ class TextCoder(nn.Module):
         self.norm = nn.LayerNorm(latent_dim)
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
-        return self.norm(self.dropout(F.gelu(self.projection(values))))
+        # values:     (B, D_text_in)
+        projected = self.projection(values)       # (B, D_text_latent)
+        activated = F.gelu(projected)             # (B, D_text_latent)
+        dropped = self.dropout(activated)         # (B, D_text_latent)
+        return self.norm(dropped)                 # (B, D_text_latent)
 
 
 class ResidualMLPBlock(nn.Module):
@@ -95,7 +224,91 @@ class ResidualMLPBlock(nn.Module):
         nn.init.zeros_(self.mlp[-2].bias)
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
-        return values + self.mlp(self.norm(values))
+        # values:     (B, H)
+        normalized = self.norm(values)            # (B, H)
+        hidden = self.mlp[0](normalized)           # (B, H * expansion)
+        hidden = self.mlp[1](hidden)               # (B, H * expansion)
+        hidden = self.mlp[2](hidden)               # (B, H * expansion)
+        correction = self.mlp[3](hidden)           # (B, H)
+        correction = self.mlp[4](correction)       # (B, H)
+        return values + correction                 # (B, H)
+
+
+class MarketConditionedArticlePool(nn.Module):
+    """Pool field-preserving article tokens using the current market state."""
+
+    def __init__(
+        self,
+        text_dim: int,
+        market_dim: int,
+        family_count: int,
+        field_count: int,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.family_count = int(family_count)
+        self.field_count = int(field_count)
+        self.text_dim = int(text_dim)
+        self.family_embedding = nn.Parameter(
+            torch.empty(1, family_count, 1, text_dim)
+        )
+        self.field_embedding = nn.Parameter(
+            torch.empty(1, 1, field_count, text_dim)
+        )
+        nn.init.normal_(self.family_embedding, std=0.02)
+        nn.init.normal_(self.field_embedding, std=0.02)
+        self.article_grn = GatedResidualNetwork(
+            text_dim, text_dim, text_dim, dropout=dropout
+        )
+        self.market_query = nn.Linear(market_dim, text_dim)
+        self.output_grn = GatedResidualNetwork(
+            text_dim,
+            text_dim,
+            text_dim,
+            context_dim=market_dim,
+            dropout=dropout,
+        )
+
+    def forward(
+        self,
+        articles: torch.Tensor,
+        article_mask: torch.Tensor,
+        market: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # articles: (B, K, A, D_text); article_mask: (B, K, A)
+        # market: (B, H)
+        identified = (
+            articles + self.family_embedding + self.field_embedding
+        )                                             # (B, K, A, D_text)
+        tokens = self.article_grn(identified)         # (B, K, A, D_text)
+        batch_size = tokens.shape[0]
+        token_count = self.family_count * self.field_count
+        tokens = tokens.reshape(
+            batch_size, token_count, self.text_dim
+        )                                             # (B, K * A, D_text)
+        flat_mask = article_mask.reshape(
+            batch_size, token_count
+        )                                             # (B, K * A)
+        query = self.market_query(market)             # (B, D_text)
+        scores = torch.einsum(
+            "bqd,bd->bq", tokens, query
+        ) / self.text_dim ** 0.5                      # (B, K * A)
+        scores = scores.masked_fill(
+            flat_mask <= 0,
+            torch.finfo(scores.dtype).min,
+        )                                             # (B, K * A)
+        weights = torch.softmax(scores, dim=1)        # (B, K * A)
+        weights = weights * flat_mask                 # (B, K * A)
+        weights = weights / weights.sum(
+            dim=1, keepdim=True
+        ).clamp_min(1e-8)                             # (B, K * A)
+        pooled = torch.einsum(
+            "bq,bqd->bd", weights, tokens
+        )                                             # (B, D_text)
+        pooled = self.output_grn(pooled, market)      # (B, D_text)
+        has_text = flat_mask.any(dim=1, keepdim=True) # (B, 1)
+        pooled = pooled * has_text.to(pooled.dtype)   # (B, D_text)
+        return pooled, weights                        # (B, D_text), (B, K * A)
 
 
 class CovariateResidualFusion(nn.Module):
@@ -103,9 +316,9 @@ class CovariateResidualFusion(nn.Module):
 
     The frozen TimesFM vector is concatenated with fold-standardized engineered
     covariates first.  A residual MLP turns that joint numeric input into the
-    market representation.  Original text-embedding families are encoded and
-    pooled separately, then meet the market representation only at the final
-    simple-concatenation residual head.
+    market representation. Original text-embedding families and semantic text
+    fields remain separate until market-conditioned masked attention pools the
+    available article tokens for the residual fusion head.
     """
 
     def __init__(
@@ -114,6 +327,7 @@ class CovariateResidualFusion(nn.Module):
         covariate_dim: int,
         text_dim: int,
         family_count: int,
+        field_count: int,
         hidden_dim: int,
         market_depth: int = 2,
         fusion_depth: int = 2,
@@ -129,16 +343,11 @@ class CovariateResidualFusion(nn.Module):
         self.covariate_dim = int(covariate_dim)
         self.text_dim = int(text_dim)
         self.family_count = int(family_count)
+        self.field_count = int(field_count)
         self.hidden_dim = int(hidden_dim)
         self.market_depth = int(market_depth)
         self.fusion_depth = int(fusion_depth)
         self.expansion = int(expansion)
-        # Family vectors are kept separate until this learned text pooling map.
-        self.text_pool = nn.Sequential(
-            nn.Linear(family_count * text_dim + family_count, text_dim),
-            nn.GELU(),
-            nn.LayerNorm(text_dim),
-        )
         self.market_input = nn.Sequential(
             nn.LayerNorm(price_dim + covariate_dim),
             nn.Linear(price_dim + covariate_dim, hidden_dim),
@@ -150,6 +359,13 @@ class CovariateResidualFusion(nn.Module):
             for _ in range(market_depth)
         ])
         self.market_norm = nn.LayerNorm(hidden_dim)
+        self.text_pool = MarketConditionedArticlePool(
+            text_dim,
+            hidden_dim,
+            family_count,
+            field_count,
+            dropout,
+        )
         self.fuse_input = nn.Sequential(
             nn.Linear(hidden_dim + text_dim, hidden_dim),
             nn.GELU(),
@@ -169,19 +385,547 @@ class CovariateResidualFusion(nn.Module):
         family_text: torch.Tensor,
         family_mask: torch.Tensor,
     ) -> torch.Tensor:
-        masked_text = family_text * family_mask.unsqueeze(-1)
-        text_input = torch.cat(
-            [masked_text.flatten(start_dim=1), family_mask], dim=1
-        )
-        h_text = self.text_pool(text_input)
-        market = self.market_input(torch.cat([price, covariates], dim=1))
+        # price: (B, D_price); covariates: (B, D_cov)
+        # family_text: (B, K, A, D_text); family_mask: (B, K, A)
+        market_input = torch.cat(
+            [price, covariates], dim=1
+        )                                           # (B, D_price + D_cov)
+        market = self.market_input[0](market_input) # (B, D_price + D_cov)
+        market = self.market_input[1](market)       # (B, H)
+        market = self.market_input[2](market)       # (B, H)
+        market = self.market_input[3](market)       # (B, H)
         for block in self.market_blocks:
-            market = block(market)
-        market = self.market_norm(market)
-        fused = self.fuse_input(torch.cat([market, h_text], dim=1))
+            market = block(market)                  # (B, H)
+        market = self.market_norm(market)           # (B, H)
+        h_text, _ = self.text_pool(
+            family_text, family_mask, market
+        )                                           # (B, D_text)
+        fusion_input = torch.cat(
+            [market, h_text], dim=1
+        )                                           # (B, H + D_text)
+        fused = self.fuse_input[0](fusion_input)    # (B, H)
+        fused = self.fuse_input[1](fused)           # (B, H)
+        fused = self.fuse_input[2](fused)           # (B, H)
         for block in self.residual_blocks:
-            fused = block(fused)
-        return self.classifier(self.output_norm(fused)).squeeze(1)
+            fused = block(fused)                    # (B, H)
+        fused = self.output_norm(fused)             # (B, H)
+        logits = self.classifier(fused)             # (B, 1)
+        return logits.squeeze(1)                    # (B,)
+
+
+class GatedResidualNetwork(nn.Module):
+    """TFT gated residual network with optional static context."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        context_dim: int = 0,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.input_layer = nn.Linear(input_dim, hidden_dim)
+        self.context_layer = (
+            nn.Linear(context_dim, hidden_dim, bias=False) if context_dim else None
+        )
+        self.hidden_layer = nn.Linear(hidden_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.gate = nn.Linear(hidden_dim, output_dim * 2)
+        self.skip = (
+            nn.Identity() if input_dim == output_dim else nn.Linear(input_dim, output_dim)
+        )
+        self.norm = nn.LayerNorm(output_dim)
+
+    def forward(
+        self, values: torch.Tensor, context: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        # values: (..., D_in); context: (..., D_context), if configured
+        hidden = self.input_layer(values)           # (..., H)
+        if self.context_layer is not None:
+            if context is None:
+                raise ValueError("This gated residual network requires context")
+            context_hidden = self.context_layer(context)  # (..., H)
+            hidden = hidden + context_hidden         # (..., H)
+        hidden = F.elu(hidden)                       # (..., H)
+        hidden = self.hidden_layer(hidden)           # (..., H)
+        hidden = self.dropout(hidden)                # (..., H)
+        gate_input = self.gate(hidden)               # (..., 2 * D_out)
+        gated = F.glu(gate_input, dim=-1)            # (..., D_out)
+        residual = self.skip(values)                 # (..., D_out)
+        return self.norm(residual + gated)           # (..., D_out)
+
+
+class UnifiedRawTextAttention(nn.Module):
+    """Joint raw-family adapters, text self-attention, and market cross-attention."""
+
+    def __init__(
+        self,
+        family_dims: dict[str, int],
+        field_count: int,
+        text_dim: int,
+        market_dim: int,
+        attention_heads: int = 4,
+        self_attention_layers: int = 1,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        if text_dim % attention_heads:
+            raise ValueError("text_dim must be divisible by attention_heads")
+        if self_attention_layers < 1:
+            raise ValueError("self_attention_layers must be positive")
+        self.families = tuple(family_dims)
+        self.field_count = int(field_count)
+        self.text_dim = int(text_dim)
+        self.adapters = nn.ModuleDict({
+            family: nn.Sequential(
+                nn.LayerNorm(input_dim),
+                nn.Linear(input_dim, text_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            for family, input_dim in family_dims.items()
+        })
+        self.family_embedding = nn.Parameter(
+            torch.empty(1, len(self.families), 1, text_dim)
+        )
+        self.field_embedding = nn.Parameter(
+            torch.empty(1, 1, field_count, text_dim)
+        )
+        nn.init.normal_(self.family_embedding, std=0.02)
+        nn.init.normal_(self.field_embedding, std=0.02)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=text_dim,
+            nhead=attention_heads,
+            dim_feedforward=text_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.self_attention = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=self_attention_layers,
+            enable_nested_tensor=False,
+        )
+        self.market_query = nn.Linear(market_dim, text_dim)
+        self.cross_attention = nn.MultiheadAttention(
+            text_dim, attention_heads, dropout=dropout, batch_first=True
+        )
+        self.cross_norm = nn.LayerNorm(text_dim)
+        self.output_grn = GatedResidualNetwork(
+            text_dim,
+            text_dim,
+            text_dim,
+            context_dim=market_dim,
+            dropout=dropout,
+        )
+
+    def forward(
+        self,
+        raw_articles: dict[str, torch.Tensor],
+        article_masks: dict[str, torch.Tensor],
+        market: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Each raw family: (B, A, D_family); each mask: (B, A)
+        family_tokens, family_masks = [], []
+        for family_index, family in enumerate(self.families):
+            content = self.adapters[family](
+                raw_articles[family]
+            )                                         # (B, A, D_text)
+            identified = (
+                content
+                + self.family_embedding[:, family_index]
+                + self.field_embedding[:, 0]
+            )                                         # (B, A, D_text)
+            family_tokens.append(identified)
+            family_masks.append(article_masks[family])
+        tokens = torch.stack(family_tokens, dim=1)    # (B, K, A, D_text)
+        available = torch.stack(family_masks, dim=1)  # (B, K, A)
+        batch_size = tokens.shape[0]
+        tokens = tokens.reshape(
+            batch_size, len(self.families) * self.field_count, self.text_dim
+        )                                             # (B, K * A, D_text)
+        available = available.reshape(
+            batch_size, len(self.families) * self.field_count
+        )                                             # (B, K * A)
+        available = available.bool()                 # (B, K * A)
+        if not available.any(dim=1).all():
+            missing_rows = int((~available.any(dim=1)).sum().item())
+            raise ValueError(
+                f"{missing_rows} rows have no available raw text embedding"
+            )
+        contextual = self.self_attention(
+            tokens, src_key_padding_mask=~available
+        )                                             # (B, K * A, D_text)
+        query = self.market_query(market).unsqueeze(1)  # (B, 1, D_text)
+        attended, weights = self.cross_attention(
+            query=query,
+            key=contextual,
+            value=contextual,
+            key_padding_mask=~available,
+            need_weights=True,
+            average_attn_weights=True,
+        )                                             # (B, 1, D_text), (B, 1, K*A)
+        attended = self.cross_norm(query + attended)  # (B, 1, D_text)
+        context = self.output_grn(
+            attended.squeeze(1), market
+        )                                             # (B, D_text)
+        return context, weights.squeeze(1)            # (B, D_text), (B, K*A)
+
+
+class TFTVariableSelection(nn.Module):
+    """Select time-varying numeric variables using TFT-style soft weights."""
+
+    def __init__(
+        self, variable_count: int, hidden_dim: int, dropout: float = 0.1
+    ):
+        super().__init__()
+        self.variable_count = int(variable_count)
+        self.variable_encoders = nn.ModuleList([
+            GatedResidualNetwork(1, hidden_dim, hidden_dim, dropout=dropout)
+            for _ in range(variable_count)
+        ])
+        self.weight_network = GatedResidualNetwork(
+            variable_count,
+            hidden_dim,
+            variable_count,
+            context_dim=hidden_dim,
+            dropout=dropout,
+        )
+
+    def forward(
+        self, values: torch.Tensor, static_context: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if values.ndim != 3 or values.shape[-1] != self.variable_count:
+            raise ValueError(
+                "TFT temporal inputs must have shape "
+                f"(batch, time, {self.variable_count})"
+            )
+        # values: (B, T, V); static_context: (B, H)
+        context = static_context.unsqueeze(1)        # (B, 1, H)
+        context = context.expand(-1, values.shape[1], -1)  # (B, T, H)
+        weight_logits = self.weight_network(
+            values, context
+        )                                             # (B, T, V)
+        weights = torch.softmax(weight_logits, dim=-1)  # (B, T, V)
+        encoded = torch.stack([
+            encoder(values[..., index:index + 1])    # each: (B, T, H)
+            for index, encoder in enumerate(self.variable_encoders)
+        ], dim=-2)                                    # (B, T, V, H)
+        expanded_weights = weights.unsqueeze(-1)     # (B, T, V, 1)
+        weighted = encoded * expanded_weights        # (B, T, V, H)
+        selected = weighted.sum(dim=-2)              # (B, T, H)
+        return selected, weights                     # (B, T, H), (B, T, V)
+
+
+class TFTMarketEncoder(nn.Module):
+    """Encoder-only Temporal Fusion Transformer for historical market windows."""
+
+    def __init__(
+        self,
+        price_dim: int,
+        covariate_dim: int,
+        temporal_dim: int,
+        hidden_dim: int,
+        attention_heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        if hidden_dim % attention_heads:
+            raise ValueError("TFT hidden_dim must be divisible by attention_heads")
+        self.static_context = GatedResidualNetwork(
+            price_dim + covariate_dim, hidden_dim, hidden_dim, dropout=dropout
+        )
+        self.variable_selection = TFTVariableSelection(
+            temporal_dim, hidden_dim, dropout
+        )
+        self.temporal_lstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True)
+        self.lstm_gate = nn.Linear(hidden_dim, hidden_dim * 2)
+        self.lstm_norm = nn.LayerNorm(hidden_dim)
+        self.attention = nn.MultiheadAttention(
+            hidden_dim, attention_heads, dropout=dropout, batch_first=True
+        )
+        self.attention_gate = nn.Linear(hidden_dim, hidden_dim * 2)
+        self.attention_norm = nn.LayerNorm(hidden_dim)
+        self.output_grn = GatedResidualNetwork(
+            hidden_dim,
+            hidden_dim,
+            hidden_dim,
+            context_dim=hidden_dim,
+            dropout=dropout,
+        )
+
+    def forward(
+        self,
+        price: torch.Tensor,
+        covariates: torch.Tensor,
+        temporal: torch.Tensor,
+        padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        # price: (B, D_price); covariates: (B, D_cov)
+        # temporal: (B, T, V); padding_mask: (B, T), True means padding
+        static_input = torch.cat(
+            [price, covariates], dim=-1
+        )                                             # (B, D_price + D_cov)
+        context = self.static_context(static_input)  # (B, H)
+        selected, _ = self.variable_selection(
+            temporal, context
+        )                                             # selected: (B, T, H)
+        recurrent, _ = self.temporal_lstm(selected)  # (B, T, H)
+        lstm_gate_input = self.lstm_gate(recurrent)   # (B, T, 2H)
+        gated_recurrent = F.glu(
+            lstm_gate_input, dim=-1
+        )                                             # (B, T, H)
+        recurrent = self.lstm_norm(
+            selected + gated_recurrent
+        )                                             # (B, T, H)
+        attended, _ = self.attention(
+            recurrent,
+            recurrent,
+            recurrent,
+            key_padding_mask=padding_mask,
+            need_weights=False,
+        )                                             # (B, T, H)
+        attention_gate_input = self.attention_gate(
+            attended
+        )                                             # (B, T, 2H)
+        gated_attention = F.glu(
+            attention_gate_input, dim=-1
+        )                                             # (B, T, H)
+        attended = self.attention_norm(
+            recurrent + gated_attention
+        )                                             # (B, T, H)
+        # Windows are left padded, so the final position is the forecast origin.
+        final_timestep = attended[:, -1]             # (B, H)
+        return self.output_grn(final_timestep, context)  # (B, H)
+
+
+class CovariateTFTFusion(nn.Module):
+    """TFT market encoder followed by the existing residual text-fusion head."""
+
+    def __init__(
+        self,
+        price_dim: int,
+        covariate_dim: int,
+        temporal_dim: int,
+        text_dim: int,
+        family_count: int,
+        field_count: int,
+        hidden_dim: int,
+        fusion_depth: int = 2,
+        expansion: int = 2,
+        attention_heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.market_encoder = TFTMarketEncoder(
+            price_dim,
+            covariate_dim,
+            temporal_dim,
+            hidden_dim,
+            attention_heads,
+            dropout,
+        )
+        self.text_pool = MarketConditionedArticlePool(
+            text_dim,
+            hidden_dim,
+            family_count,
+            field_count,
+            dropout,
+        )
+        self.fuse_input = nn.Sequential(
+            nn.Linear(hidden_dim + text_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.residual_blocks = nn.ModuleList([
+            ResidualMLPBlock(hidden_dim, expansion, dropout)
+            for _ in range(fusion_depth)
+        ])
+        self.output_norm = nn.LayerNorm(hidden_dim)
+        self.classifier = nn.Linear(hidden_dim, 1)
+
+    def forward(
+        self,
+        price: torch.Tensor,
+        covariates: torch.Tensor,
+        family_text: torch.Tensor,
+        family_mask: torch.Tensor,
+        temporal: torch.Tensor,
+        temporal_padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        # price: (B, D_price); covariates: (B, D_cov)
+        # family_text: (B, K, A, D_text); family_mask: (B, K, A)
+        # temporal: (B, T, V); temporal_padding_mask: (B, T)
+        market = self.market_encoder(
+            price, covariates, temporal, temporal_padding_mask
+        )                                             # (B, H)
+        h_text, _ = self.text_pool(
+            family_text, family_mask, market
+        )                                             # (B, D_text)
+        fusion_input = torch.cat(
+            [market, h_text], dim=1
+        )                                             # (B, H + D_text)
+        fused = self.fuse_input[0](fusion_input)      # (B, H)
+        fused = self.fuse_input[1](fused)             # (B, H)
+        fused = self.fuse_input[2](fused)             # (B, H)
+        for block in self.residual_blocks:
+            fused = block(fused)                      # (B, H)
+        fused = self.output_norm(fused)               # (B, H)
+        logits = self.classifier(fused)               # (B, 1)
+        return logits.squeeze(1)                      # (B,)
+
+
+class RawTextResidualFusion(nn.Module):
+    """Residual market encoder with unified end-to-end raw-text attention."""
+
+    def __init__(
+        self,
+        price_dim: int,
+        covariate_dim: int,
+        family_dims: dict[str, int],
+        field_count: int,
+        text_dim: int,
+        hidden_dim: int,
+        market_depth: int = 2,
+        fusion_depth: int = 2,
+        expansion: int = 2,
+        text_attention_heads: int = 4,
+        text_attention_layers: int = 1,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.market_input = nn.Sequential(
+            nn.LayerNorm(price_dim + covariate_dim),
+            nn.Linear(price_dim + covariate_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.market_blocks = nn.ModuleList([
+            ResidualMLPBlock(hidden_dim, expansion, dropout)
+            for _ in range(market_depth)
+        ])
+        self.market_norm = nn.LayerNorm(hidden_dim)
+        self.text_attention = UnifiedRawTextAttention(
+            family_dims,
+            field_count,
+            text_dim,
+            hidden_dim,
+            text_attention_heads,
+            text_attention_layers,
+            dropout,
+        )
+        self.fuse_input = nn.Sequential(
+            nn.Linear(hidden_dim + text_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.fusion_blocks = nn.ModuleList([
+            ResidualMLPBlock(hidden_dim, expansion, dropout)
+            for _ in range(fusion_depth)
+        ])
+        self.output_norm = nn.LayerNorm(hidden_dim)
+        self.classifier = nn.Linear(hidden_dim, 1)
+
+    def forward(
+        self,
+        price: torch.Tensor,
+        covariates: torch.Tensor,
+        raw_articles: dict[str, torch.Tensor],
+        article_masks: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        market = self.market_input(
+            torch.cat([price, covariates], dim=1)
+        )                                             # (B, H)
+        for block in self.market_blocks:
+            market = block(market)                    # (B, H)
+        market = self.market_norm(market)             # (B, H)
+        text, _ = self.text_attention(
+            raw_articles, article_masks, market
+        )                                             # (B, D_text)
+        fused = self.fuse_input(
+            torch.cat([market, text], dim=1)
+        )                                             # (B, H)
+        for block in self.fusion_blocks:
+            fused = block(fused)                      # (B, H)
+        return self.classifier(
+            self.output_norm(fused)
+        ).squeeze(1)                                  # (B,)
+
+
+class RawTextTFTFusion(nn.Module):
+    """TFT market encoder with unified end-to-end raw-text attention."""
+
+    def __init__(
+        self,
+        price_dim: int,
+        covariate_dim: int,
+        temporal_dim: int,
+        family_dims: dict[str, int],
+        field_count: int,
+        text_dim: int,
+        hidden_dim: int,
+        fusion_depth: int = 2,
+        expansion: int = 2,
+        market_attention_heads: int = 4,
+        text_attention_heads: int = 4,
+        text_attention_layers: int = 1,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.market_encoder = TFTMarketEncoder(
+            price_dim,
+            covariate_dim,
+            temporal_dim,
+            hidden_dim,
+            market_attention_heads,
+            dropout,
+        )
+        self.text_attention = UnifiedRawTextAttention(
+            family_dims,
+            field_count,
+            text_dim,
+            hidden_dim,
+            text_attention_heads,
+            text_attention_layers,
+            dropout,
+        )
+        self.fuse_input = nn.Sequential(
+            nn.Linear(hidden_dim + text_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.fusion_blocks = nn.ModuleList([
+            ResidualMLPBlock(hidden_dim, expansion, dropout)
+            for _ in range(fusion_depth)
+        ])
+        self.output_norm = nn.LayerNorm(hidden_dim)
+        self.classifier = nn.Linear(hidden_dim, 1)
+
+    def forward(
+        self,
+        price: torch.Tensor,
+        covariates: torch.Tensor,
+        raw_articles: dict[str, torch.Tensor],
+        article_masks: dict[str, torch.Tensor],
+        temporal: torch.Tensor,
+        temporal_padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        market = self.market_encoder(
+            price, covariates, temporal, temporal_padding_mask
+        )                                             # (B, H)
+        text, _ = self.text_attention(
+            raw_articles, article_masks, market
+        )                                             # (B, D_text)
+        fused = self.fuse_input(
+            torch.cat([market, text], dim=1)
+        )                                             # (B, H)
+        for block in self.fusion_blocks:
+            fused = block(fused)                      # (B, H)
+        return self.classifier(
+            self.output_norm(fused)
+        ).squeeze(1)                                  # (B,)
 
 
 def make_text_supervision(links: pl.DataFrame, targets: pl.DataFrame) -> pl.DataFrame:
@@ -323,19 +1067,24 @@ def pool_projected_articles(
     family: str,
     output_path: Path,
 ) -> pl.DataFrame:
-    """Mean-pool articles within a row and within one embedding family only."""
+    """Preserve one token per row/text field for learned attention pooling.
+
+    Duplicate articles assigned to the same text field are averaged, but the
+    distinct semantic fields remain separate.  The fusion network subsequently
+    learns fold-local, market-conditioned weights over these field tokens.
+    """
     latent_columns = [
         name for name in pq.ParquetFile(projected_path).schema_arrow.names
         if name.startswith("latent_")
     ]
     pooled = (
-        links.lazy().select(["row_id", "text_id"]).unique()
+        links.lazy().select(["row_id", "text_field", "text_id"]).unique()
         .join(pl.scan_parquet(projected_path), on="text_id", how="inner")
-        .group_by("row_id")
+        .group_by(["row_id", "text_field"])
         .agg([pl.col(name).mean().cast(pl.Float32) for name in latent_columns])
         .rename({name: f"{family}_{name}" for name in latent_columns})
         .collect(engine="streaming")
-        .sort("row_id")
+        .sort(["row_id", "text_field"])
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     pooled.write_parquet(output_path, compression="zstd")
@@ -359,19 +1108,45 @@ def fit_fusion_model(
     learning_rate: float = 3e-4,
     weight_decay: float = 1e-4,
     seed: int = 42,
-) -> tuple[CovariateResidualFusion, list[dict[str, float]]]:
+    market_encoder: str = "mlp",
+    market_sequence: np.ndarray | None = None,
+    sequence_padding_mask: np.ndarray | None = None,
+    attention_heads: int = 4,
+) -> tuple[nn.Module, list[dict[str, float]]]:
     """Fit the fusion map and classifier; pretrained/text encoders stay frozen."""
     _require_finite("fusion-training price latents", price)
     _require_finite("fusion-training covariates", covariates)
     _require_finite("fusion-training text latents", family_text)
     _require_finite("fusion-training family mask", family_mask)
     _require_finite("fusion-training targets", target)
+    if family_text.ndim != 4 or family_mask.shape != family_text.shape[:3]:
+        raise ValueError(
+            "Article tokens/mask must have shapes (N, K, A, D) and (N, K, A)"
+        )
+    if market_encoder not in {"mlp", "tft"}:
+        raise ValueError("market_encoder must be 'mlp' or 'tft'")
+    if market_encoder == "tft":
+        if market_sequence is None or sequence_padding_mask is None:
+            raise ValueError("TFT training requires temporal sequences and masks")
+        _require_finite("TFT training sequences", market_sequence)
+        if market_sequence.ndim != 3 or sequence_padding_mask.shape != market_sequence.shape[:2]:
+            raise ValueError("TFT sequence/mask shapes are inconsistent")
     torch.manual_seed(seed)
-    model = CovariateResidualFusion(
-        price.shape[1], covariates.shape[1], family_text.shape[2],
-        family_text.shape[1], hidden_dim, market_depth=market_depth,
-        fusion_depth=fusion_depth, expansion=expansion, dropout=dropout,
-    ).to(device)
+    if market_encoder == "tft":
+        model = CovariateTFTFusion(
+            price.shape[1], covariates.shape[1], market_sequence.shape[2],
+            family_text.shape[3], family_text.shape[1], family_text.shape[2],
+            hidden_dim,
+            fusion_depth=fusion_depth, expansion=expansion,
+            attention_heads=attention_heads, dropout=dropout,
+        ).to(device)
+    else:
+        model = CovariateResidualFusion(
+            price.shape[1], covariates.shape[1], family_text.shape[3],
+            family_text.shape[1], family_text.shape[2], hidden_dim,
+            market_depth=market_depth,
+            fusion_depth=fusion_depth, expansion=expansion, dropout=dropout,
+        ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
@@ -384,11 +1159,19 @@ def fit_fusion_model(
             indices = order[start:start + batch_size]
             p = torch.from_numpy(price[indices]).to(device)
             c = torch.from_numpy(covariates[indices]).to(device)
-            t = torch.from_numpy(family_text[indices]).to(device)
+            t = torch.from_numpy(family_text[indices]).to(
+                device=device, dtype=torch.float32
+            )
             m = torch.from_numpy(family_mask[indices]).to(device)
             y = torch.from_numpy(target[indices].astype(np.float32, copy=False)).to(device)
             optimizer.zero_grad(set_to_none=True)
-            loss = F.binary_cross_entropy_with_logits(model(p, c, t, m), y)
+            if market_encoder == "tft":
+                sequence = torch.from_numpy(market_sequence[indices]).to(device)
+                padding = torch.from_numpy(sequence_padding_mask[indices]).to(device)
+                logits = model(p, c, t, m, sequence, padding)
+            else:
+                logits = model(p, c, t, m)
+            loss = F.binary_cross_entropy_with_logits(logits, y)
             if not torch.isfinite(loss):
                 raise FloatingPointError(
                     f"Fusion loss became non-finite in epoch {epoch}; "
@@ -404,32 +1187,236 @@ def fit_fusion_model(
 
 @torch.inference_mode()
 def predict_fusion(
-    model: CovariateResidualFusion,
+    model: nn.Module,
     price: np.ndarray,
     covariates: np.ndarray,
     family_text: np.ndarray,
     family_mask: np.ndarray,
     device: str,
     batch_size: int = 1024,
+    market_encoder: str = "mlp",
+    market_sequence: np.ndarray | None = None,
+    sequence_padding_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     _require_finite("fusion-inference price latents", price)
     _require_finite("fusion-inference covariates", covariates)
     _require_finite("fusion-inference text latents", family_text)
     _require_finite("fusion-inference family mask", family_mask)
+    if family_text.ndim != 4 or family_mask.shape != family_text.shape[:3]:
+        raise ValueError(
+            "Article tokens/mask must have shapes (N, K, A, D) and (N, K, A)"
+        )
+    if market_encoder == "tft":
+        if market_sequence is None or sequence_padding_mask is None:
+            raise ValueError("TFT inference requires temporal sequences and masks")
+        _require_finite("TFT inference sequences", market_sequence)
     model = model.to(device).eval()
     pieces = []
     for start in range(0, len(price), batch_size):
         stop = start + batch_size
-        logits = model(
+        inputs = (
             torch.from_numpy(price[start:stop]).to(device),
             torch.from_numpy(covariates[start:stop]).to(device),
-            torch.from_numpy(family_text[start:stop]).to(device),
+            torch.from_numpy(family_text[start:stop]).to(
+                device=device, dtype=torch.float32
+            ),
             torch.from_numpy(family_mask[start:stop]).to(device),
         )
+        if market_encoder == "tft":
+            logits = model(
+                *inputs,
+                torch.from_numpy(market_sequence[start:stop]).to(device),
+                torch.from_numpy(sequence_padding_mask[start:stop]).to(device),
+            )
+        else:
+            logits = model(*inputs)
         pieces.append(torch.sigmoid(logits).cpu().numpy())
     model.cpu()
     result = np.concatenate(pieces) if pieces else np.empty(0, dtype=np.float32)
     _require_finite("fusion probabilities", result)
+    return result
+
+
+def _raw_text_batch(
+    text_indices: dict[str, np.ndarray],
+    stores: dict[str, RawEmbeddingStore],
+    indices: np.ndarray | slice,
+    device: str,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    articles, masks = {}, {}
+    for family, token_index in text_indices.items():
+        selected = token_index[indices]
+        values = stores[family].gather(selected)
+        articles[family] = torch.from_numpy(values).to(
+            device=device, dtype=torch.float32
+        )
+        masks[family] = torch.from_numpy(selected >= 0).to(device)
+    return articles, masks
+
+
+def fit_raw_fusion_model(
+    price: np.ndarray,
+    covariates: np.ndarray,
+    text_indices: dict[str, np.ndarray],
+    stores: dict[str, RawEmbeddingStore],
+    target: np.ndarray,
+    device: str,
+    text_dim: int = 384,
+    hidden_dim: int = 256,
+    market_depth: int = 2,
+    fusion_depth: int = 2,
+    expansion: int = 2,
+    dropout: float = 0.1,
+    epochs: int = 10,
+    batch_size: int = 128,
+    learning_rate: float = 3e-4,
+    weight_decay: float = 1e-4,
+    seed: int = 42,
+    market_encoder: str = "mlp",
+    market_sequence: np.ndarray | None = None,
+    sequence_padding_mask: np.ndarray | None = None,
+    market_attention_heads: int = 4,
+    text_attention_heads: int = 4,
+    text_attention_layers: int = 1,
+) -> tuple[nn.Module, list[dict[str, float]]]:
+    """Train raw-family adapters and all attention/fusion layers end to end."""
+    _require_finite("raw-fusion price latents", price)
+    _require_finite("raw-fusion covariates", covariates)
+    _require_finite("raw-fusion targets", target)
+    if market_encoder not in {"mlp", "tft"}:
+        raise ValueError("market_encoder must be 'mlp' or 'tft'")
+    if not text_indices:
+        raise ValueError("At least one raw embedding family is required")
+    field_counts = {values.shape[1] for values in text_indices.values()}
+    if len(field_counts) != 1:
+        raise ValueError("Raw text families have inconsistent field counts")
+    for family, values in text_indices.items():
+        if values.ndim != 2 or len(values) != len(target):
+            raise ValueError(f"Invalid raw text index shape for {family}")
+        if family not in stores:
+            raise ValueError(f"Missing raw embedding store for {family}")
+    if market_encoder == "tft":
+        if market_sequence is None or sequence_padding_mask is None:
+            raise ValueError("TFT training requires temporal sequences and masks")
+        _require_finite("TFT training sequences", market_sequence)
+    family_dims = {
+        family: stores[family].input_dim for family in text_indices
+    }
+    torch.manual_seed(seed)
+    if market_encoder == "tft":
+        model = RawTextTFTFusion(
+            price.shape[1],
+            covariates.shape[1],
+            market_sequence.shape[2],
+            family_dims,
+            field_counts.pop(),
+            text_dim,
+            hidden_dim,
+            fusion_depth=fusion_depth,
+            expansion=expansion,
+            market_attention_heads=market_attention_heads,
+            text_attention_heads=text_attention_heads,
+            text_attention_layers=text_attention_layers,
+            dropout=dropout,
+        ).to(device)
+    else:
+        model = RawTextResidualFusion(
+            price.shape[1],
+            covariates.shape[1],
+            family_dims,
+            field_counts.pop(),
+            text_dim,
+            hidden_dim,
+            market_depth=market_depth,
+            fusion_depth=fusion_depth,
+            expansion=expansion,
+            text_attention_heads=text_attention_heads,
+            text_attention_layers=text_attention_layers,
+            dropout=dropout,
+        ).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
+    rng = np.random.default_rng(seed)
+    history: list[dict[str, float]] = []
+    for epoch in range(1, epochs + 1):
+        model.train()
+        losses = []
+        order = rng.permutation(len(target))
+        for start in range(0, len(target), batch_size):
+            batch_indices = order[start:start + batch_size]
+            p = torch.from_numpy(price[batch_indices]).to(device)
+            c = torch.from_numpy(covariates[batch_indices]).to(device)
+            y = torch.from_numpy(
+                target[batch_indices].astype(np.float32, copy=False)
+            ).to(device)
+            articles, masks = _raw_text_batch(
+                text_indices, stores, batch_indices, device
+            )
+            optimizer.zero_grad(set_to_none=True)
+            if market_encoder == "tft":
+                temporal = torch.from_numpy(
+                    market_sequence[batch_indices]
+                ).to(device)
+                padding = torch.from_numpy(
+                    sequence_padding_mask[batch_indices]
+                ).to(device)
+                logits = model(p, c, articles, masks, temporal, padding)
+            else:
+                logits = model(p, c, articles, masks)
+            loss = F.binary_cross_entropy_with_logits(logits, y)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    f"Raw fusion loss became non-finite in epoch {epoch}"
+                )
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            losses.append(float(loss.detach().cpu()))
+        history.append({"epoch": float(epoch), "bce": float(np.mean(losses))})
+    return model.cpu().eval(), history
+
+
+@torch.inference_mode()
+def predict_raw_fusion(
+    model: nn.Module,
+    price: np.ndarray,
+    covariates: np.ndarray,
+    text_indices: dict[str, np.ndarray],
+    stores: dict[str, RawEmbeddingStore],
+    device: str,
+    batch_size: int = 256,
+    market_encoder: str = "mlp",
+    market_sequence: np.ndarray | None = None,
+    sequence_padding_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    _require_finite("raw-fusion inference price", price)
+    _require_finite("raw-fusion inference covariates", covariates)
+    model = model.to(device).eval()
+    pieces = []
+    for start in range(0, len(price), batch_size):
+        stop = min(start + batch_size, len(price))
+        batch_slice = slice(start, stop)
+        articles, masks = _raw_text_batch(
+            text_indices, stores, batch_slice, device
+        )
+        p = torch.from_numpy(price[batch_slice]).to(device)
+        c = torch.from_numpy(covariates[batch_slice]).to(device)
+        if market_encoder == "tft":
+            logits = model(
+                p,
+                c,
+                articles,
+                masks,
+                torch.from_numpy(market_sequence[batch_slice]).to(device),
+                torch.from_numpy(sequence_padding_mask[batch_slice]).to(device),
+            )
+        else:
+            logits = model(p, c, articles, masks)
+        pieces.append(torch.sigmoid(logits).cpu().numpy())
+    model.cpu()
+    result = np.concatenate(pieces) if pieces else np.empty(0, dtype=np.float32)
+    _require_finite("raw-fusion probabilities", result)
     return result
 
 
@@ -718,7 +1705,9 @@ def _scope_text_latents(
                     "input_dim": input_dim,
                     "latent_dim": latent_dim,
                     "fit_row_count": fit_targets.height,
-                    "article_aggregation": "mean_after_coder",
+                    "article_aggregation": (
+                        "preserve_text_fields_then_fold_local_market_attention"
+                    ),
                 },
             )
             history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -736,7 +1725,11 @@ def _scope_text_latents(
                 device,
                 batch_size,
             )
-        row_path = scope_dir / "row_text_latents" / f"{family}_article_mean_latent.parquet"
+        # Versioned name prevents reuse of the former irreversible row mean.
+        row_path = (
+            scope_dir / "row_text_latents" /
+            f"{family}_field_article_tokens_v2.parquet"
+        )
         if not row_path.exists() or force_refresh:
             pool_projected_articles(combined_links, projected_path, family, row_path)
         row_paths[family] = row_path
@@ -753,6 +1746,7 @@ def _assemble_fusion_arrays(
     targets: pl.DataFrame,
     row_text_paths: dict[str, Path],
     families: Sequence[str],
+    text_fields: Sequence[str],
     require_target: bool = True,
 ) -> tuple[pl.DataFrame, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Align price, text, and labels for one fusion-model partition.
@@ -769,11 +1763,14 @@ def _assemble_fusion_arrays(
         Direction labels keyed by ``row_id``. A null label is allowed for test
         rows when ``require_target=False``.
     row_text_paths:
-        One parquet path per embedding family. Each table contains a pooled
-        stock-date representation named ``<family>_latent_*``.
+        One parquet path per embedding family. Each table contains one token
+        per stock-date/text-field pair named ``<family>_latent_*``.
     families:
         Ordered families included in this model variant. Their order becomes
         the family axis of the returned text tensor.
+    text_fields:
+        Stable ordered text-field catalog. Its order becomes the article/field
+        axis of the returned text tensor.
     require_target:
         If true, discard rows without ``target_up``. This is enabled for fold
         training/validation and disabled when producing final test scores.
@@ -786,12 +1783,12 @@ def _assemble_fusion_arrays(
     price:
         Contiguous float32 TimesFM matrix with shape ``(N, D_price)``.
     text:
-        Contiguous float32 tensor with shape ``(N, K, D_text)``, where ``K``
-        is the number of requested embedding families.
+        Contiguous float16 storage tensor with shape ``(N, K, A, D_text)``,
+        where ``K`` is the embedding-family count and ``A`` is the number of
+        distinct text fields. Mini-batches are promoted to float32 on device.
     mask:
-        Float32 availability mask with shape ``(N, K)``. A value of one means
-        that family supplied text for the row; zero means the corresponding
-        text vector was filled with zeros.
+        Float32 availability mask with shape ``(N, K, A)``. A value of one
+        means the family supplied that text field for the row.
     target:
         Float32 direction-label vector with shape ``(N,)``. It may contain
         NaN values only when ``require_target=False``.
@@ -799,8 +1796,8 @@ def _assemble_fusion_arrays(
     Notes
     -----
     The join with ``price_latents`` is inner because a fusion example cannot
-    be constructed without a price representation. Text joins are left joins:
-    missing news must not remove an otherwise valid market row.
+    be constructed without a price representation. Missing text fields retain
+    the row and become zero tokens with a zero availability mask.
     """
     # Use one integer type everywhere. This is especially important during the
     # final refit, where test row IDs are temporarily offset from training IDs.
@@ -816,41 +1813,69 @@ def _assemble_fusion_arrays(
         .join(scoped_targets, on="row_id", how="left")
     )
     price_columns = sorted(c for c in frame.columns if c.startswith("price_latent_"))
-    text_groups, availability = [], []
-    for family in families:
-        family_frame = pl.read_parquet(row_text_paths[family]).with_columns(
-            pl.col("row_id").cast(pl.UInt64)
-        )
-        family_columns = sorted(
-            c for c in family_frame.columns if c.startswith(f"{family}_latent_")
-        )
-        if not family_columns:
-            raise ValueError(f"No latent columns found for {family}")
-        flag = f"has_{family}_latent"
-        # Preserve rows without this family's news. Their family vector becomes
-        # zero, while the separate flag tells the network that it is missing.
-        frame = frame.join(
-            family_frame.with_columns(pl.lit(1.0).cast(pl.Float32).alias(flag)),
-            on="row_id",
-            how="left",
-        ).with_columns(
-            pl.col(flag).fill_null(0.0),
-            pl.col(family_columns).fill_null(0.0),
-        )
-        text_groups.append(family_columns)
-        availability.append(flag)
     if require_target:
         frame = frame.filter(pl.col("target_up").is_not_null())
     # Stable chronological ordering makes saved predictions easy to audit.
     frame = frame.sort(["date", "ticker"])
 
-    # Convert each modality to the layout expected by
-    # CovariateResidualFusion.forward().
+    if not text_fields:
+        raise ValueError("text_fields cannot be empty")
+    family_tables: list[tuple[pl.DataFrame, list[str]]] = []
+    text_dim: int | None = None
+    for family in families:
+        family_frame = pl.read_parquet(row_text_paths[family]).with_columns(
+            pl.col("row_id").cast(pl.UInt64)
+        )
+        if "text_field" not in family_frame.columns:
+            raise ValueError(
+                f"{row_text_paths[family]} is an obsolete mean-pooled cache; "
+                "regenerate field article tokens"
+            )
+        family_columns = sorted(
+            c for c in family_frame.columns if c.startswith(f"{family}_latent_")
+        )
+        if not family_columns:
+            raise ValueError(f"No latent columns found for {family}")
+        if text_dim is None:
+            text_dim = len(family_columns)
+        elif len(family_columns) != text_dim:
+            raise ValueError("Text families have inconsistent latent dimensions")
+        family_tables.append((family_frame, family_columns))
+
+    # Float16 halves host memory for the at-most-21 field tokens per row. Each
+    # training/inference mini-batch is explicitly promoted to float32.
+    text = np.zeros(
+        (frame.height, len(families), len(text_fields), int(text_dim)),
+        dtype=np.float16,
+    )
+    mask = np.zeros(
+        (frame.height, len(families), len(text_fields)), dtype=np.float32
+    )
+    row_lookup = frame.select("row_id").with_row_index("_row_index")
+    field_lookup = pl.DataFrame({
+        "text_field": list(text_fields),
+        "_field_index": np.arange(len(text_fields), dtype=np.int32),
+    })
+    for family_index, (family_frame, family_columns) in enumerate(family_tables):
+        aligned = (
+            family_frame.select(["row_id", "text_field", *family_columns])
+            .join(row_lookup, on="row_id", how="inner", validate="m:1")
+            .join(field_lookup, on="text_field", how="inner", validate="m:1")
+        )
+        if not aligned.height:
+            continue
+        row_index = aligned["_row_index"].to_numpy()
+        field_index = aligned["_field_index"].to_numpy()
+        values = aligned.select(family_columns).to_numpy().astype(
+            np.float16, copy=False
+        )
+        text[row_index, family_index, field_index] = values
+        mask[row_index, family_index, field_index] = 1.0
+
+    # Convert the remaining modalities to the layouts expected by the models.
     price = np.ascontiguousarray(frame.select(price_columns).to_numpy().astype(np.float32))
-    text = np.ascontiguousarray(np.stack([
-        frame.select(columns).to_numpy().astype(np.float32) for columns in text_groups
-    ], axis=1))
-    mask = np.ascontiguousarray(frame.select(availability).to_numpy().astype(np.float32))
+    text = np.ascontiguousarray(text)
+    mask = np.ascontiguousarray(mask)
     target = frame["target_up"].to_numpy().astype(np.float32)
     _require_finite("TimesFM price latents", price)
     _require_finite("text-coder latents", text)
@@ -858,6 +1883,90 @@ def _assemble_fusion_arrays(
     if require_target:
         _require_finite("training targets", target)
     return frame.select(["row_id", "date", "ticker", "target_up"]), price, text, mask, target
+
+
+def _assemble_raw_fusion_arrays(
+    row_ids: pl.DataFrame,
+    price_latents: pl.DataFrame,
+    targets: pl.DataFrame,
+    links: pl.DataFrame,
+    stores: dict[str, RawEmbeddingStore],
+    families: Sequence[str],
+    text_fields: Sequence[str],
+    require_target: bool = True,
+) -> tuple[
+    pl.DataFrame,
+    np.ndarray,
+    dict[str, np.ndarray],
+    None,
+    np.ndarray,
+]:
+    """Align rows to raw embedding-matrix indices without loading raw vectors."""
+    scoped_ids = row_ids.select(pl.col("row_id").cast(pl.UInt64)).unique()
+    scoped_price = price_latents.with_columns(pl.col("row_id").cast(pl.UInt64))
+    scoped_targets = targets.select([
+        pl.col("row_id").cast(pl.UInt64), "target_up",
+    ])
+    frame = (
+        scoped_ids.join(scoped_price, on="row_id", how="inner")
+        .join(scoped_targets, on="row_id", how="left")
+    )
+    if require_target:
+        frame = frame.filter(pl.col("target_up").is_not_null())
+    frame = frame.sort(["date", "ticker"])
+    price_columns = sorted(
+        column for column in frame.columns if column.startswith("price_latent_")
+    )
+    row_lookup = frame.select("row_id").with_row_index("_row_index")
+    field_lookup = pl.DataFrame({
+        "text_field": list(text_fields),
+        "_field_index": np.arange(len(text_fields), dtype=np.int32),
+    })
+    scoped_links = (
+        links.select([
+            pl.col("row_id").cast(pl.UInt64), "text_field", "text_id",
+        ])
+        .unique()
+        .join(row_lookup, on="row_id", how="inner", validate="m:1")
+        .join(field_lookup, on="text_field", how="inner", validate="m:1")
+    )
+    text_indices: dict[str, np.ndarray] = {}
+    for family in families:
+        indices = np.full(
+            (frame.height, len(text_fields)), -1, dtype=np.int64
+        )
+        aligned = scoped_links.join(
+            stores[family].index,
+            on="text_id",
+            how="inner",
+            validate="m:1",
+        )
+        if aligned.height:
+            rows = aligned["_row_index"].to_numpy()
+            fields = aligned["_field_index"].to_numpy()
+            has_duplicate_slot = aligned.select(
+                pl.struct(["_row_index", "_field_index"]).is_duplicated().any()
+            ).item()
+            if has_duplicate_slot:
+                raise ValueError(
+                    f"Multiple {family} articles occupy one row/text-field slot"
+                )
+            indices[rows, fields] = aligned["embedding_row"].to_numpy()
+        text_indices[family] = np.ascontiguousarray(indices)
+    price = np.ascontiguousarray(
+        frame.select(price_columns).to_numpy().astype(np.float32)
+    )
+    target = frame["target_up"].to_numpy().astype(np.float32)
+    _require_finite("TimesFM price latents", price)
+    if require_target:
+        _require_finite("training targets", target)
+    return (
+        frame.select(["row_id", "date", "ticker", "target_up"]),
+        price,
+        text_indices,
+        None,
+        target,
+    )
 
 
 def _metric_row(
@@ -940,6 +2049,70 @@ def _covariate_matrix(
     )
 
 
+def _temporal_covariate_matrix(
+    index: pl.DataFrame,
+    features: pl.DataFrame,
+    columns: Sequence[str],
+    lookback: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build right-aligned per-ticker histories ending at each forecast row."""
+    if lookback < 2:
+        raise ValueError("TFT lookback must be at least two time steps")
+    missing = sorted(set(columns) - set(features.columns))
+    if missing:
+        raise ValueError(f"Missing TFT temporal covariates: {missing}")
+    histories: dict[str, np.ndarray] = {}
+    positions: dict[int, tuple[str, int]] = {}
+    selected = ["row_id", "ticker", "date", *columns]
+    for key, frame in features.select(selected).sort(
+        ["ticker", "date"]
+    ).partition_by("ticker", as_dict=True).items():
+        ticker = key[0] if isinstance(key, tuple) else key
+        values = frame.select([
+            pl.col(column).cast(pl.Float64).fill_null(float("nan"))
+            for column in columns
+        ]).to_numpy().astype(np.float32, copy=False)
+        histories[ticker] = values
+        for position, row_id in enumerate(frame["row_id"].to_list()):
+            positions[int(row_id)] = (ticker, position)
+
+    sequences = np.zeros(
+        (index.height, lookback, len(columns)), dtype=np.float32
+    )
+    padding_mask = np.ones((index.height, lookback), dtype=np.bool_)
+    for output_row, row_id in enumerate(index["row_id"].to_list()):
+        location = positions.get(int(row_id))
+        if location is None:
+            raise ValueError(f"No prepared feature history for row_id={row_id}")
+        ticker, position = location
+        start = max(0, position + 1 - lookback)
+        window = histories[ticker][start:position + 1]
+        sequences[output_row, -len(window):] = window
+        padding_mask[output_row, -len(window):] = False
+    return np.ascontiguousarray(sequences), np.ascontiguousarray(padding_mask)
+
+
+def _fit_temporal_scaler(
+    values: np.ndarray, padding_mask: np.ndarray
+) -> dict[str, np.ndarray]:
+    """Fit temporal imputation/scaling on valid training timesteps only."""
+    valid = values[~padding_mask]
+    if not len(valid):
+        raise ValueError("Cannot fit a TFT scaler without valid timesteps")
+    return _fit_covariate_scaler(valid)
+
+
+def _apply_temporal_scaler(
+    values: np.ndarray,
+    padding_mask: np.ndarray,
+    scaler: dict[str, np.ndarray],
+) -> np.ndarray:
+    flat = values.reshape(-1, values.shape[-1])
+    scaled = _apply_covariate_scaler(flat, scaler).reshape(values.shape)
+    scaled[padding_mask] = 0.0
+    return np.ascontiguousarray(scaled)
+
+
 def _fit_covariate_scaler(values: np.ndarray) -> dict[str, np.ndarray]:
     """Fit median imputation and standardization on training rows only."""
     clean = values.astype(np.float64, copy=True)
@@ -1013,10 +2186,7 @@ def run_walk_forward_fusion(
     requested_families: Sequence[str],
     covariate_columns: Sequence[str],
     device: str,
-    latent_dim: int = 128,
-    text_epochs: int = 3,
     fusion_epochs: int = 10,
-    text_batch_size: int = 1024,
     fusion_batch_size: int = 512,
     fusion_hidden_dim: int = 256,
     market_depth: int = 2,
@@ -1030,16 +2200,42 @@ def run_walk_forward_fusion(
     expected_submission_rows: int = 52_000,
     raw_test_path: Path | None = None,
     seed: int = 42,
-    run_training: bool = True,
-    force_refresh: bool = False,
+    market_encoder: str = "mlp",
+    temporal_covariate_columns: Sequence[str] = (),
+    temporal_lookback: int = 32,
+    tft_attention_heads: int = 4,
+    raw_text_dim: int = 384,
+    text_attention_heads: int = 4,
+    text_attention_layers: int = 1,
 ) -> dict[str, pl.DataFrame]:
     """Tune on walk-forward folds, refit on train, evaluate test, and submit."""
     output_dir.mkdir(parents=True, exist_ok=True)
     raw_test_path = Path(raw_test_path or data_dir / "test.parquet")
-    feature_set = "timesfm_covariates_original_text_residual_fusion"
+    if market_encoder not in {"mlp", "tft"}:
+        raise ValueError("market_encoder must be 'mlp' or 'tft'")
+    if market_encoder == "tft" and not temporal_covariate_columns:
+        raise ValueError("TFT requires temporal_covariate_columns")
+    feature_set = (
+        "timesfm_temporal_tft_unified_raw_text_attention"
+        if market_encoder == "tft"
+        else "timesfm_covariates_unified_raw_text_attention"
+    )
     fold_numbers = fold_assignments["fold"].unique().sort().to_list()
     if not covariate_columns:
         raise ValueError("covariate_columns cannot be empty")
+    if "text_field" not in train_links.columns or "text_field" not in test_links.columns:
+        raise ValueError("Text links must include text_field for article attention")
+    text_fields = sorted(set(
+        train_links["text_field"].drop_nulls().to_list()
+    ) | set(
+        test_links["text_field"].drop_nulls().to_list()
+    ))
+    if not text_fields:
+        raise ValueError("No text fields are available for article attention")
+    pl.DataFrame({
+        "field_index": np.arange(len(text_fields), dtype=np.int16),
+        "text_field": text_fields,
+    }).write_csv(output_dir / "text_field_catalog.csv")
 
     catalog_rows, families = [], []
     for family in requested_families:
@@ -1061,13 +2257,22 @@ def run_walk_forward_fusion(
     pl.DataFrame(catalog_rows, infer_schema_length=None).write_csv(
         output_dir / "text_family_catalog.csv"
     )
+    raw_cache_dir = output_dir.parent / "raw_embedding_memmaps"
+    stores = {
+        family: prepare_raw_embedding_store(
+            family=family,
+            embedding_path=data_dir / f"{family}_textemb.parquet",
+            cache_dir=raw_cache_dir,
+        )
+        for family in families
+    }
     variants = {family: (family,) for family in families}
     if len(families) > 1:
         variants["all_families"] = tuple(families)
     tuning_variant = "all_families" if "all_families" in variants else families[0]
 
-    # Train text coders once per fold. Hyperparameter trials only retrain the
-    # relatively small market/fusion network, not the expensive article coder.
+    # Raw embedding adapters, text self-attention, cross-attention, and fusion
+    # are all trained jointly inside each fold.
     fold_scopes: dict[int, dict] = {}
     for fold in fold_numbers:
         fold_dir = output_dir / "fold_results" / f"fold_{fold}"
@@ -1077,16 +2282,9 @@ def run_walk_forward_fusion(
         validation_ids = fold_assignments.filter(
             (pl.col("fold") == fold) & (pl.col("split") == "validation")
         ).select("row_id")
-        fit_targets = train_targets.join(train_ids, on="row_id", how="semi")
-        validation_links = train_links.join(validation_ids, on="row_id", how="semi")
-        row_paths = _scope_text_latents(
-            f"fold_{fold}", fold_dir, data_dir, train_links, validation_links,
-            fit_targets, families, latent_dim, device, text_epochs,
-            text_batch_size, force_refresh, run_training,
-        )
         fold_scopes[int(fold)] = {
             "dir": fold_dir, "train_ids": train_ids,
-            "validation_ids": validation_ids, "row_paths": row_paths,
+            "validation_ids": validation_ids,
         }
 
     default_params = {
@@ -1100,24 +2298,86 @@ def run_walk_forward_fusion(
         "weight_decay": 1e-4,
     }
 
+    fold_array_cache: dict[int, tuple] = {}
+
+    def select_families(
+        arrays: tuple, variant_families: Sequence[str]
+    ) -> tuple:
+        index, price, all_text_indices, placeholder, target = arrays
+        selected_indices = {
+            family: all_text_indices[family] for family in variant_families
+        }
+        return index, price, selected_indices, placeholder, target
+
     def fold_arrays(fold: int, variant_families: Sequence[str]):
-        scope = fold_scopes[int(fold)]
-        train_arrays = _assemble_fusion_arrays(
-            scope["train_ids"], train_price_latents, train_targets,
-            scope["row_paths"], variant_families,
-        )
-        val_arrays = _assemble_fusion_arrays(
-            scope["validation_ids"], train_price_latents, train_targets,
-            scope["row_paths"], variant_families,
-        )
-        train_index, val_index = train_arrays[0], val_arrays[0]
-        train_raw = _covariate_matrix(train_index, train_features, covariate_columns)
-        val_raw = _covariate_matrix(val_index, train_features, covariate_columns)
-        scaler = _fit_covariate_scaler(train_raw)
+        fold = int(fold)
+        if fold not in fold_array_cache:
+            print(f"Preparing and caching fold {fold} arrays")
+            scope = fold_scopes[fold]
+            train_arrays = _assemble_raw_fusion_arrays(
+                scope["train_ids"], train_price_latents, train_targets,
+                train_links, stores, families, text_fields,
+            )
+            val_arrays = _assemble_raw_fusion_arrays(
+                scope["validation_ids"], train_price_latents, train_targets,
+                train_links, stores, families, text_fields,
+            )
+            train_index, val_index = train_arrays[0], val_arrays[0]
+            train_raw = _covariate_matrix(
+                train_index, train_features, covariate_columns
+            )
+            val_raw = _covariate_matrix(
+                val_index, train_features, covariate_columns
+            )
+            scaler = _fit_covariate_scaler(train_raw)
+            train_sequence = train_padding = val_sequence = val_padding = None
+            temporal_scaler = None
+            if market_encoder == "tft":
+                train_sequence, train_padding = _temporal_covariate_matrix(
+                    train_index, train_features, temporal_covariate_columns,
+                    temporal_lookback,
+                )
+                val_sequence, val_padding = _temporal_covariate_matrix(
+                    val_index, train_features, temporal_covariate_columns,
+                    temporal_lookback,
+                )
+                temporal_scaler = _fit_temporal_scaler(
+                    train_sequence, train_padding
+                )
+                train_sequence = _apply_temporal_scaler(
+                    train_sequence, train_padding, temporal_scaler
+                )
+                val_sequence = _apply_temporal_scaler(
+                    val_sequence, val_padding, temporal_scaler
+                )
+            fold_array_cache[fold] = (
+                train_arrays,
+                val_arrays,
+                _apply_covariate_scaler(train_raw, scaler),
+                _apply_covariate_scaler(val_raw, scaler),
+                scaler,
+                train_sequence,
+                train_padding,
+                val_sequence,
+                val_padding,
+                temporal_scaler,
+            )
+        (
+            train_arrays, val_arrays, train_cov, val_cov, scaler,
+            train_sequence, train_padding, val_sequence, val_padding,
+            temporal_scaler,
+        ) = fold_array_cache[fold]
         return (
-            train_arrays, val_arrays,
-            _apply_covariate_scaler(train_raw, scaler),
-            _apply_covariate_scaler(val_raw, scaler), scaler,
+            select_families(train_arrays, variant_families),
+            select_families(val_arrays, variant_families),
+            train_cov,
+            val_cov,
+            scaler,
+            train_sequence,
+            train_padding,
+            val_sequence,
+            val_padding,
+            temporal_scaler,
         )
 
     tuning_trials_table = pl.DataFrame()
@@ -1131,7 +2391,7 @@ def run_walk_forward_fusion(
             ) from error
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         study = optuna.create_study(
-            study_name="timesfm_covariate_residual_fusion",
+            study_name=f"timesfm_{market_encoder}_unified_raw_text_v3",
             storage=f"sqlite:///{(output_dir / 'optuna_study.db').resolve()}",
             load_if_exists=True,
             direction="maximize",
@@ -1142,7 +2402,6 @@ def run_walk_forward_fusion(
         def objective(trial) -> float:
             params = {
                 "hidden_dim": trial.suggest_categorical("hidden_dim", [128, 256, 384]),
-                "market_depth": trial.suggest_int("market_depth", 1, 3),
                 "fusion_depth": trial.suggest_int("fusion_depth", 1, 3),
                 "expansion": trial.suggest_categorical("expansion", [1, 2, 4]),
                 "dropout": trial.suggest_float("dropout", 0.05, 0.30),
@@ -1154,18 +2413,34 @@ def run_walk_forward_fusion(
                     "weight_decay", 1e-6, 1e-3, log=True
                 ),
             }
+            params["market_depth"] = (
+                trial.suggest_int("market_depth", 1, 3)
+                if market_encoder == "mlp" else 0
+            )
             scores = []
             for step, fold in enumerate(fold_numbers):
-                train_a, val_a, train_cov, val_cov, _ = fold_arrays(
-                    int(fold), variants[tuning_variant]
+                (
+                    train_a, val_a, train_cov, val_cov, _,
+                    train_sequence, train_padding, val_sequence, val_padding, _,
+                ) = fold_arrays(int(fold), variants[tuning_variant])
+                model, _ = fit_raw_fusion_model(
+                    train_a[1], train_cov, train_a[2], stores, train_a[4],
+                    device, text_dim=raw_text_dim,
+                    batch_size=fusion_batch_size,
+                    seed=seed + 1000 * trial.number + int(fold),
+                    market_encoder=market_encoder,
+                    market_sequence=train_sequence,
+                    sequence_padding_mask=train_padding,
+                    market_attention_heads=tft_attention_heads,
+                    text_attention_heads=text_attention_heads,
+                    text_attention_layers=text_attention_layers,
+                    **params,
                 )
-                model, _ = fit_fusion_model(
-                    train_a[1], train_cov, train_a[2], train_a[3], train_a[4],
-                    device, batch_size=fusion_batch_size,
-                    seed=seed + 1000 * trial.number + int(fold), **params,
-                )
-                score = predict_fusion(
-                    model, val_a[1], val_cov, val_a[2], val_a[3], device
+                score = predict_raw_fusion(
+                    model, val_a[1], val_cov, val_a[2], stores, device,
+                    market_encoder=market_encoder,
+                    market_sequence=val_sequence,
+                    sequence_padding_mask=val_padding,
                 )
                 scores.append(balanced_accuracy_score(
                     val_a[4].astype(np.int8), (score >= 0.5).astype(np.int8)
@@ -1210,24 +2485,52 @@ def run_walk_forward_fusion(
     for fold in fold_numbers:
         fold = int(fold)
         for variant, variant_families in variants.items():
-            train_a, val_a, train_cov, val_cov, scaler = fold_arrays(
-                fold, variant_families
+            (
+                train_a, val_a, train_cov, val_cov, scaler,
+                train_sequence, train_padding, val_sequence, val_padding,
+                temporal_scaler,
+            ) = fold_arrays(fold, variant_families)
+            model_name = (
+                f"timesfm_tft_unified_raw_text_plus_{variant}"
+                if market_encoder == "tft" else
+                f"timesfm_covariates_unified_raw_text_plus_{variant}"
             )
-            model_name = f"timesfm_covariates_plus_{variant}"
             config_id = f"{model_name}__optuna_best"
             model_path = fold_scopes[fold]["dir"] / "fusion_models" / f"{model_name}.pt"
-            model, history = fit_fusion_model(
-                train_a[1], train_cov, train_a[2], train_a[3], train_a[4],
-                device, batch_size=fusion_batch_size, seed=seed + fold,
+            model, history = fit_raw_fusion_model(
+                train_a[1], train_cov, train_a[2], stores, train_a[4],
+                device, text_dim=raw_text_dim,
+                batch_size=fusion_batch_size, seed=seed + fold,
+                market_encoder=market_encoder,
+                market_sequence=train_sequence,
+                sequence_padding_mask=train_padding,
+                market_attention_heads=tft_attention_heads,
+                text_attention_heads=text_attention_heads,
+                text_attention_layers=text_attention_layers,
                 **best_params,
             )
             save_torch_model(model_path, model, {
                 "scope": f"fold_{fold}", "model": model_name,
                 "price_encoder": "timesfm", "price_encoder_frozen": True,
+                "market_encoder": market_encoder,
                 "covariates": list(covariate_columns),
                 "covariate_preprocessing": "training_median_then_zscore",
                 "text_families": list(variant_families),
-                "architecture": "residual_market_mlp_then_simple_text_concatenation",
+                "text_fields": text_fields,
+                "raw_embedding_dims": {
+                    family: stores[family].input_dim
+                    for family in variant_families
+                },
+                "raw_text_shared_dim": raw_text_dim,
+                "text_attention_heads": text_attention_heads,
+                "text_attention_layers": text_attention_layers,
+                "architecture": (
+                    "tft_plus_raw_family_adapters_self_and_cross_attention"
+                    if market_encoder == "tft" else
+                    "market_mlp_plus_raw_family_adapters_self_and_cross_attention"
+                ),
+                "temporal_covariates": list(temporal_covariate_columns),
+                "temporal_lookback": temporal_lookback if market_encoder == "tft" else None,
                 "hyperparameters": best_params,
             })
             _save_covariate_scaler(
@@ -1235,12 +2538,22 @@ def run_walk_forward_fusion(
                 f"{model_name}_covariate_scaler.csv",
                 covariate_columns, scaler,
             )
+            if temporal_scaler is not None:
+                _save_covariate_scaler(
+                    fold_scopes[fold]["dir"] / "fusion_models" /
+                    f"{model_name}_temporal_scaler.csv",
+                    temporal_covariate_columns,
+                    temporal_scaler,
+                )
             pl.DataFrame(history).write_csv(
                 fold_scopes[fold]["dir"] / "fusion_models" /
                 f"{model_name}_training_history.csv"
             )
-            score = predict_fusion(
-                model, val_a[1], val_cov, val_a[2], val_a[3], device
+            score = predict_raw_fusion(
+                model, val_a[1], val_cov, val_a[2], stores, device,
+                market_encoder=market_encoder,
+                market_sequence=val_sequence,
+                sequence_padding_mask=val_padding,
             )
             prediction_parts.append(val_a[0].with_columns(
                 pl.lit(feature_set).alias("feature_set"),
@@ -1298,7 +2611,7 @@ def run_walk_forward_fusion(
         compression="zstd",
     )
 
-    # Fit fresh coders, scaler, and networks on every labeled training row.
+    # Fit fresh raw-family adapters, scalers, and networks on all labeled rows.
     final_dir = output_dir / "final_refit"
     final_targets = train_targets.filter(pl.col("target_up").is_not_null())
     test_row_offset = int(train_targets["row_id"].max()) + 1
@@ -1315,51 +2628,104 @@ def run_walk_forward_fusion(
     scoped_test_features = test_features.with_columns(
         (pl.col("row_id").cast(pl.UInt64) + offset).alias("row_id")
     )
-    final_row_paths = _scope_text_latents(
-        "final", final_dir, data_dir, train_links, scoped_test_links,
-        final_targets, families, latent_dim, device, text_epochs,
-        text_batch_size, force_refresh, run_training,
-    )
     all_train_ids = final_targets.select("row_id")
     all_test_ids = scoped_test_price.select("row_id")
     final_prediction_parts = []
     for variant, variant_families in variants.items():
-        train_a = _assemble_fusion_arrays(
+        train_a = _assemble_raw_fusion_arrays(
             all_train_ids, train_price_latents, train_targets,
-            final_row_paths, variant_families,
+            train_links, stores, variant_families, text_fields,
         )
-        test_a = _assemble_fusion_arrays(
+        test_a = _assemble_raw_fusion_arrays(
             all_test_ids, scoped_test_price, scoped_test_targets,
-            final_row_paths, variant_families, require_target=False,
+            scoped_test_links, stores, variant_families, text_fields,
+            require_target=False,
         )
         train_raw = _covariate_matrix(train_a[0], train_features, covariate_columns)
         test_raw = _covariate_matrix(test_a[0], scoped_test_features, covariate_columns)
         scaler = _fit_covariate_scaler(train_raw)
         train_cov = _apply_covariate_scaler(train_raw, scaler)
         test_cov = _apply_covariate_scaler(test_raw, scaler)
-        model_name = f"timesfm_covariates_plus_{variant}"
-        model, history = fit_fusion_model(
-            train_a[1], train_cov, train_a[2], train_a[3], train_a[4],
-            device, batch_size=fusion_batch_size, seed=seed, **best_params,
+        train_sequence = train_padding = test_sequence = test_padding = None
+        temporal_scaler = None
+        if market_encoder == "tft":
+            train_sequence, train_padding = _temporal_covariate_matrix(
+                train_a[0], train_features, temporal_covariate_columns,
+                temporal_lookback,
+            )
+            test_sequence, test_padding = _temporal_covariate_matrix(
+                test_a[0], scoped_test_features, temporal_covariate_columns,
+                temporal_lookback,
+            )
+            temporal_scaler = _fit_temporal_scaler(
+                train_sequence, train_padding
+            )
+            train_sequence = _apply_temporal_scaler(
+                train_sequence, train_padding, temporal_scaler
+            )
+            test_sequence = _apply_temporal_scaler(
+                test_sequence, test_padding, temporal_scaler
+            )
+        model_name = (
+            f"timesfm_tft_unified_raw_text_plus_{variant}"
+            if market_encoder == "tft" else
+            f"timesfm_covariates_unified_raw_text_plus_{variant}"
+        )
+        model, history = fit_raw_fusion_model(
+            train_a[1], train_cov, train_a[2], stores, train_a[4],
+            device, text_dim=raw_text_dim,
+            batch_size=fusion_batch_size, seed=seed,
+            market_encoder=market_encoder,
+            market_sequence=train_sequence,
+            sequence_padding_mask=train_padding,
+            market_attention_heads=tft_attention_heads,
+            text_attention_heads=text_attention_heads,
+            text_attention_layers=text_attention_layers,
+            **best_params,
         )
         save_torch_model(final_dir / "fusion_models" / f"{model_name}.pt", model, {
             "scope": "final", "model": model_name,
             "price_encoder": "timesfm", "price_encoder_frozen": True,
+            "market_encoder": market_encoder,
             "covariates": list(covariate_columns),
             "covariate_preprocessing": "all-training median then zscore",
             "text_families": list(variant_families),
-            "architecture": "residual_market_mlp_then_simple_text_concatenation",
+            "text_fields": text_fields,
+            "raw_embedding_dims": {
+                family: stores[family].input_dim
+                for family in variant_families
+            },
+            "raw_text_shared_dim": raw_text_dim,
+            "text_attention_heads": text_attention_heads,
+            "text_attention_layers": text_attention_layers,
+            "architecture": (
+                "tft_plus_raw_family_adapters_self_and_cross_attention"
+                if market_encoder == "tft" else
+                "market_mlp_plus_raw_family_adapters_self_and_cross_attention"
+            ),
+            "temporal_covariates": list(temporal_covariate_columns),
+            "temporal_lookback": temporal_lookback if market_encoder == "tft" else None,
             "hyperparameters": best_params,
         })
         _save_covariate_scaler(
             final_dir / "fusion_models" / f"{model_name}_covariate_scaler.csv",
             covariate_columns, scaler,
         )
+        if temporal_scaler is not None:
+            _save_covariate_scaler(
+                final_dir / "fusion_models" /
+                f"{model_name}_temporal_scaler.csv",
+                temporal_covariate_columns,
+                temporal_scaler,
+            )
         pl.DataFrame(history).write_csv(
             final_dir / "fusion_models" / f"{model_name}_training_history.csv"
         )
-        score = predict_fusion(
-            model, test_a[1], test_cov, test_a[2], test_a[3], device
+        score = predict_raw_fusion(
+            model, test_a[1], test_cov, test_a[2], stores, device,
+            market_encoder=market_encoder,
+            market_sequence=test_sequence,
+            sequence_padding_mask=test_padding,
         )
         threshold = thresholds[model_name]
         final_prediction_parts.append(test_a[0].with_columns(

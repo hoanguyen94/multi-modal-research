@@ -1,10 +1,10 @@
-"""Run Stage 2 frozen-TimesFM covariate and text fusion outside Jupyter.
+"""Run Stage 2 with a Temporal Fusion Transformer market encoder.
 
-This is the script equivalent of ``stage2_pretrained_forecasts.ipynb``.  It
-loads the prepared Polars artifacts, reuses or extracts frozen TimesFM hidden
-states, jointly adapts raw text-embedding families inside each fold, performs
-Optuna model selection, refits on all labeled training rows, evaluates 2022
-and 2023 separately, and writes one 52,000-row submission CSV per fitted model.
+This variant preserves the frozen TimesFM price representation and replaces
+the row-level residual market MLP with an encoder-only TFT over historical
+market feature windows. Raw embedding families are adapted jointly inside the
+model, combined with field/family identities, contextualized by text
+self-attention, and queried by the TFT state through cross-attention.
 """
 
 from __future__ import annotations
@@ -12,165 +12,106 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-from pathlib import Path
-from typing import Sequence
 
 import polars as pl
-import torch
 
 from latent_fusion import (
     generate_timesfm_price_latents,
     parquet_embedding_dim,
     run_walk_forward_fusion,
 )
+from stage2_pretrained_forecasts import (
+    ARTIFACT_DIR,
+    BASELINE_DIR,
+    DATA_DIR,
+    EXPECTED_SUBMISSION_ROWS,
+    FOLD_PATH,
+    FUSION_DEPTH,
+    FUSION_DROPOUT,
+    FUSION_EPOCHS,
+    FUSION_HIDDEN_DIM,
+    HORIZON,
+    ID_COLUMNS,
+    LOOKBACK,
+    MARKET_DEPTH,
+    MIN_CONTEXT,
+    OPTUNA_TRIALS,
+    PREPARED_TEST_PATH,
+    PREPARED_TRAIN_PATH,
+    PRICE_BATCH_SIZE,
+    PRICE_CACHE_DIR,
+    PRICE_ENCODER_MODEL_ID,
+    RANDOM_STATE,
+    RESIDUAL_EXPANSION,
+    SUBMISSION_YEARS,
+    TEST_LINK_PATH,
+    TEST_TARGET_PATH,
+    TIMESFM_INPUT_COLUMN,
+    TRAIN_LINK_PATH,
+    TRAIN_TARGET_PATH,
+    classify_covariates,
+    require_paths,
+    select_device,
+)
 
 
-DATA_DIR = Path("data")
-ARTIFACT_DIR = DATA_DIR / "model_artifacts" / "pca_embeddings"
-BASELINE_DIR = ARTIFACT_DIR / "baselines"
 OUTPUT_DIR = (
     ARTIFACT_DIR
     / "stage2_pretrained_forecasts"
-    / "timesfm_covariates_unified_raw_text_attention"
+    / "timesfm_temporal_tft_unified_raw_text_attention"
 )
-PRICE_CACHE_DIR = (
-    ARTIFACT_DIR
-    / "stage2_pretrained_forecasts"
-    / "timesfm_simple_concatenation"
-    / "price_latents"
-)
-PREPARED_TRAIN_PATH = ARTIFACT_DIR / "train_features_without_embeddings.parquet"
-PREPARED_TEST_PATH = ARTIFACT_DIR / "test_features_without_embeddings.parquet"
-TRAIN_TARGET_PATH = ARTIFACT_DIR / "train_target.parquet"
-TEST_TARGET_PATH = ARTIFACT_DIR / "test_target.parquet"
-TRAIN_LINK_PATH = ARTIFACT_DIR / "train_text_links.parquet"
-TEST_LINK_PATH = ARTIFACT_DIR / "test_text_links.parquet"
-FOLD_PATH = ARTIFACT_DIR / "walk_forward_assignments.parquet"
 
-PRICE_ENCODER_MODEL_ID = "google/timesfm-2.5-200m-pytorch"
-HORIZON = 20
-LOOKBACK = 512
-MIN_CONTEXT = 64
-TIMESFM_INPUT_COLUMN = "ret_20"
-DEFAULT_TEXT_FAMILIES = ("bert",)
+# Keep the temporal tensor focused on genuinely historical price/market inputs.
+# The full current-origin covariate vector still enters the TFT as static context.
+TFT_TEMPORAL_COLUMNS = (
+    "ret_1",
+    "log_hl_range",
+    "log_close_open",
+    "ret_5",
+    "ret_20",
+    "ret_60",
+    "ret_std_5",
+    "ret_std_20",
+    "ret_std_60",
+    "drawdown_20",
+    "momentum_accel_5",
+    "log_volume",
+    "volume_change_1",
+    "volume_z_20",
+    "ret_1_market_relative",
+    "ret_20_market_relative",
+)
+TFT_LOOKBACK = 32
+TFT_ATTENTION_HEADS = 4
 RAW_TEXT_DIM = 384
 TEXT_ATTENTION_HEADS = 4
 TEXT_ATTENTION_LAYERS = 1
-FUSION_HIDDEN_DIM = 256
-MARKET_DEPTH = 2
-FUSION_DEPTH = 2
-RESIDUAL_EXPANSION = 2
-FUSION_DROPOUT = 0.10
-FUSION_EPOCHS = 10
-PRICE_BATCH_SIZE = 16
-FUSION_BATCH_SIZE = 128
-OPTUNA_TRIALS = 12
-SUBMISSION_YEARS = (2022, 2023)
-EXPECTED_SUBMISSION_ROWS = 52_000
-RANDOM_STATE = 42
-
-ID_COLUMNS = ("row_id", "date", "ticker")
-TEXT_AVAILABILITY_PREFIXES = (
-    "macro_",
-    "sector_category_",
-    "target_company_",
-    "related_company_",
-    "filing_",
-)
-KNOWN_FUTURE_PREFIXES = (
-    "calendar_",
-    "trading_day_",
-    "trading_days_",
-    "days_since_start",
-    "is_month_",
-    "is_first_",
-    "is_last_",
-    "is_quarter_end",
-    "trading_week_fourier_",
-    "month_of_year_fourier_",
-    "trading_month_fourier_",
-)
+RAW_FUSION_BATCH_SIZE = 128
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--families",
-        nargs="+",
-        default=list(DEFAULT_TEXT_FAMILIES),
+        "--families", nargs="+", default=["bert"],
         help="Original text-embedding families to use.",
     )
     parser.add_argument(
-        "--optuna-trials",
-        type=int,
-        default=OPTUNA_TRIALS,
+        "--optuna-trials", type=int, default=OPTUNA_TRIALS,
         help="Total persistent Optuna trial budget.",
     )
     parser.add_argument(
-        "--no-tune",
-        action="store_true",
-        help="Use the default residual-network hyperparameters.",
+        "--no-tune", action="store_true",
+        help="Use the default TFT and fusion hyperparameters.",
     )
     parser.add_argument(
-        "--no-price-extraction",
-        action="store_true",
+        "--no-price-extraction", action="store_true",
         help="Require existing TimesFM latent caches.",
     )
     parser.add_argument(
-        "--force-price-refresh",
-        action="store_true",
+        "--force-price-refresh", action="store_true",
         help="Regenerate the frozen TimesFM latent caches.",
     )
     return parser.parse_args()
-
-
-def select_device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-
-def require_paths(paths: Sequence[Path]) -> None:
-    missing = [path for path in paths if not path.exists()]
-    if missing:
-        formatted = "\n".join(f"- {path}" for path in missing)
-        raise FileNotFoundError(f"Required Stage 2 artifacts are absent:\n{formatted}")
-
-
-def classify_covariates(
-    train_features: pl.DataFrame,
-) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    """Derive feature groups from the prepared train schema."""
-    text_availability = tuple(
-        column
-        for column in train_features.columns
-        if column.startswith(TEXT_AVAILABILITY_PREFIXES)
-        or column.startswith("has_")
-        or column in ("text_count_total", "unique_text_id_count")
-    )
-    known_future = tuple(
-        column
-        for column in train_features.columns
-        if column.startswith(KNOWN_FUTURE_PREFIXES)
-    )
-    past_market = tuple(
-        column
-        for column, dtype in train_features.schema.items()
-        if dtype.is_numeric()
-        and column not in ID_COLUMNS
-        and column not in known_future
-        and column not in text_availability
-    )
-    if TIMESFM_INPUT_COLUMN not in past_market:
-        raise ValueError(
-            f"{TIMESFM_INPUT_COLUMN} is absent from historical market features"
-        )
-    model_covariates = (*past_market, *known_future, *text_availability)
-    if len(model_covariates) != len(set(model_covariates)):
-        raise ValueError("Engineered covariate groups overlap")
-    return past_market, known_future, text_availability, model_covariates
 
 
 def main() -> None:
@@ -187,7 +128,7 @@ def main() -> None:
         parquet_embedding_dim(path)
     if not args.no_tune and importlib.util.find_spec("optuna") is None:
         raise ImportError(
-            "Optuna tuning is enabled. Install it in this environment with "
+            "Optuna tuning is enabled. Install it with "
             "`python -m pip install optuna`, or pass --no-tune."
         )
     require_paths((
@@ -213,19 +154,25 @@ def main() -> None:
         text_availability_covariates,
         model_covariates,
     ) = classify_covariates(train_features)
+    missing_temporal = sorted(set(TFT_TEMPORAL_COLUMNS) - set(past_market_covariates))
+    if missing_temporal:
+        raise ValueError(f"TFT temporal features are unavailable: {missing_temporal}")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     (OUTPUT_DIR / "feature_groups.json").write_text(json.dumps({
+        "frozen_price_encoder": PRICE_ENCODER_MODEL_ID,
         "timesfm_hidden_input": TIMESFM_INPUT_COLUMN,
-        "past_market_covariates": list(past_market_covariates),
-        "known_future_covariates": list(known_future_covariates),
-        "past_text_availability_covariates": list(text_availability_covariates),
-        "model_covariate_count": len(model_covariates),
-        "timesfm_hidden_covariate_support": "univariate_target_only",
-        "text_input": "raw_embedding_families",
+        "market_encoder": "temporal_fusion_transformer",
+        "tft_temporal_covariates": list(TFT_TEMPORAL_COLUMNS),
+        "tft_lookback": TFT_LOOKBACK,
+        "tft_attention_heads": TFT_ATTENTION_HEADS,
         "raw_text_shared_dim": RAW_TEXT_DIM,
         "text_attention_heads": TEXT_ATTENTION_HEADS,
         "text_attention_layers": TEXT_ATTENTION_LAYERS,
+        "current_past_market_covariates": list(past_market_covariates),
+        "current_known_future_covariates": list(known_future_covariates),
+        "current_text_availability_covariates": list(text_availability_covariates),
+        "current_covariate_count": len(model_covariates),
     }, indent=2))
 
     train_targets = pl.read_parquet(TRAIN_TARGET_PATH).select([
@@ -241,10 +188,6 @@ def main() -> None:
         pl.col("target_up").is_not_null()
     ).select(ID_COLUMNS)
     test_origins = test_features.select(ID_COLUMNS)
-    print(
-        f"Prepared features: train={train_features.shape}, test={test_features.shape}; "
-        f"covariates={len(model_covariates)}"
-    )
 
     train_price_latents = generate_timesfm_price_latents(
         split="train",
@@ -274,10 +217,6 @@ def main() -> None:
         run_extraction=not args.no_price_extraction,
         force_refresh=args.force_price_refresh,
     )
-    print(
-        f"Price latent caches: train={train_price_latents.shape}, "
-        f"test={test_price_latents.shape}"
-    )
 
     results = run_walk_forward_fusion(
         data_dir=DATA_DIR,
@@ -296,7 +235,7 @@ def main() -> None:
         covariate_columns=model_covariates,
         device=device,
         fusion_epochs=FUSION_EPOCHS,
-        fusion_batch_size=FUSION_BATCH_SIZE,
+        fusion_batch_size=RAW_FUSION_BATCH_SIZE,
         fusion_hidden_dim=FUSION_HIDDEN_DIM,
         market_depth=MARKET_DEPTH,
         fusion_depth=FUSION_DEPTH,
@@ -309,21 +248,24 @@ def main() -> None:
         expected_submission_rows=EXPECTED_SUBMISSION_ROWS,
         raw_test_path=DATA_DIR / "test.parquet",
         seed=RANDOM_STATE,
+        market_encoder="tft",
+        temporal_covariate_columns=TFT_TEMPORAL_COLUMNS,
+        temporal_lookback=TFT_LOOKBACK,
+        tft_attention_heads=TFT_ATTENTION_HEADS,
         raw_text_dim=RAW_TEXT_DIM,
         text_attention_heads=TEXT_ATTENTION_HEADS,
         text_attention_layers=TEXT_ATTENTION_LAYERS,
     )
 
-    print("\nFold metrics")
-    print(results["fold_metrics"])
-    print("\nAggregate walk-forward metrics")
-    print(results["aggregate"])
-    print("\nComparison with baselines")
-    print(results["comparison_aggregate"])
-    print("\nTest metrics by prediction year")
-    print(results["final_metrics"])
-    print("\nSubmission files")
-    print(results["submission_manifest"])
+    for title, key in (
+        ("Fold metrics", "fold_metrics"),
+        ("Aggregate walk-forward metrics", "aggregate"),
+        ("Comparison with baselines", "comparison_aggregate"),
+        ("Test metrics by prediction year", "final_metrics"),
+        ("Submission files", "submission_manifest"),
+    ):
+        print(f"\n{title}")
+        print(results[key])
 
 
 if __name__ == "__main__":
