@@ -936,19 +936,70 @@ s_{i,\tau}
 \operatorname{GRN}_{v}(X^M_{i,\tau,v}).
 \end{align}
 
-The selected sequence is passed through an LSTM, a gated residual connection,
-and multi-head temporal self-attention. Left padding is masked, and the final
-time step is refined with the static context:
+The selected sequence is passed through an LSTM while retaining the hidden
+state at every time step:
+
+\begin{equation}
+L_{i,t}
+=
+\operatorname{LSTM}(s_{i,t-31:t})
+\in\R^{T\times d_C}.
+\end{equation}
+
+The complete LSTM output is transformed by a gated linear unit (GLU) and
+combined with the selected-variable sequence through a normalized residual
+connection:
+
+\begin{equation}
+R_{i,t}
+=
+\operatorname{LayerNorm}
+\left(
+s_{i,t-31:t}
++
+\operatorname{GLU}(W_L L_{i,t}+b_L)
+\right)
+\in\R^{T\times d_C}.
+\end{equation}
+
+Multi-head self-attention then processes the complete recurrent sequence.
+Left-padded positions are excluded from the attention keys and values by the
+padding mask:
+
+\begin{align}
+Z_{i,t}
+&=
+\operatorname{MHA}
+\left(
+Q=R_{i,t},
+K=R_{i,t},
+V=R_{i,t};
+m^M_{i,t}
+\right),\\
+A_{i,t}
+&=
+\operatorname{LayerNorm}
+\left(
+R_{i,t}
++
+\operatorname{GLU}(W_A Z_{i,t}+b_A)
+\right)
+\in\R^{T\times d_C}.
+\end{align}
+
+Because the windows are left padded and end at the forecast origin, the code
+selects the final \emph{post-attention} state $A_{i,t,-1}$, rather than the raw
+final LSTM state. The static context then conditions the output GRN:
 
 \begin{equation}
 h^C_{i,t}
 =
 \operatorname{GRN}_{\mathrm{out}}
 \left(
-\operatorname{TemporalAttention}
-\left(\operatorname{LSTM}(s_{i,t-31:t})\right)_{-1},
+A_{i,t,-1},
 c_{i,t}
-\right).
+\right)
+\in\R^{d_C}.
 \end{equation}
 
 Thus the TFT is the trainable market encoder, while TimesFM supplies a frozen

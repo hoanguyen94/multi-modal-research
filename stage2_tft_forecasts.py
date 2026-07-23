@@ -82,6 +82,7 @@ TFT_TEMPORAL_COLUMNS = (
     "ret_20_market_relative",
 )
 TFT_LOOKBACK = 32
+TFT_LOOKBACK_CANDIDATES = (16, 20, 32)
 TFT_ATTENTION_HEADS = 4
 RAW_TEXT_DIM = 384
 TEXT_ATTENTION_HEADS = 4
@@ -165,6 +166,7 @@ def main() -> None:
         "market_encoder": "temporal_fusion_transformer",
         "tft_temporal_covariates": list(TFT_TEMPORAL_COLUMNS),
         "tft_lookback": TFT_LOOKBACK,
+        "tft_lookback_candidates": list(TFT_LOOKBACK_CANDIDATES),
         "tft_attention_heads": TFT_ATTENTION_HEADS,
         "raw_text_shared_dim": RAW_TEXT_DIM,
         "text_attention_heads": TEXT_ATTENTION_HEADS,
@@ -251,6 +253,7 @@ def main() -> None:
         market_encoder="tft",
         temporal_covariate_columns=TFT_TEMPORAL_COLUMNS,
         temporal_lookback=TFT_LOOKBACK,
+        temporal_lookback_candidates=TFT_LOOKBACK_CANDIDATES,
         tft_attention_heads=TFT_ATTENTION_HEADS,
         raw_text_dim=RAW_TEXT_DIM,
         text_attention_heads=TEXT_ATTENTION_HEADS,

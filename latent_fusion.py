@@ -1254,6 +1254,125 @@ def _raw_text_batch(
     return articles, masks
 
 
+@torch.inference_mode()
+def _raw_fusion_validation_metrics(
+    model: nn.Module,
+    price: np.ndarray,
+    covariates: np.ndarray,
+    text_indices: dict[str, np.ndarray],
+    stores: dict[str, RawEmbeddingStore],
+    target: np.ndarray,
+    device: str,
+    batch_size: int,
+    market_encoder: str,
+    market_sequence: np.ndarray | None,
+    sequence_padding_mask: np.ndarray | None,
+) -> dict[str, float]:
+    """Evaluate one epoch without moving the training model off its device."""
+    was_training = model.training
+    model.eval()
+    loss_sum = 0.0
+    scores = []
+    for start in range(0, len(target), batch_size):
+        stop = min(start + batch_size, len(target))
+        batch_slice = slice(start, stop)
+        articles, masks = _raw_text_batch(
+            text_indices, stores, batch_slice, device
+        )
+        p = torch.from_numpy(price[batch_slice]).to(device)
+        c = torch.from_numpy(covariates[batch_slice]).to(device)
+        y = torch.from_numpy(
+            target[batch_slice].astype(np.float32, copy=False)
+        ).to(device)
+        if market_encoder == "tft":
+            logits = model(
+                p,
+                c,
+                articles,
+                masks,
+                torch.from_numpy(market_sequence[batch_slice]).to(device),
+                torch.from_numpy(
+                    sequence_padding_mask[batch_slice]
+                ).to(device),
+            )
+        else:
+            logits = model(p, c, articles, masks)
+        loss_sum += float(
+            F.binary_cross_entropy_with_logits(
+                logits, y, reduction="sum"
+            ).cpu()
+        )
+        scores.append(torch.sigmoid(logits).cpu().numpy())
+    if was_training:
+        model.train()
+    score = np.concatenate(scores).astype(np.float32, copy=False)
+    truth = target.astype(np.int8, copy=False)
+    prediction = (score >= 0.5).astype(np.int8)
+    return {
+        "validation_bce": loss_sum / len(target),
+        "validation_accuracy": float(accuracy_score(truth, prediction)),
+        "validation_balanced_accuracy": float(
+            balanced_accuracy_score(truth, prediction)
+        ),
+    }
+
+
+def _plot_fold_training_diagnostics(
+    history: pl.DataFrame,
+    output_path: Path,
+) -> None:
+    """Plot selected-model learning curves for all walk-forward folds."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print(
+            "matplotlib is unavailable; saved training-history CSV but "
+            "skipped the learning-curve plot"
+        )
+        return
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    colors = plt.get_cmap("tab10")
+    fold_numbers = history["fold"].unique().sort().to_list()
+    for color_index, fold in enumerate(fold_numbers):
+        part = history.filter(pl.col("fold") == fold).sort("epoch")
+        epoch = part["epoch"].to_numpy()
+        color = colors(color_index % 10)
+        axes[0].plot(
+            epoch, part["train_bce"].to_numpy(),
+            color=color, linestyle="-", label=f"Fold {fold} train",
+        )
+        axes[0].plot(
+            epoch, part["validation_bce"].to_numpy(),
+            color=color, linestyle="--", label=f"Fold {fold} validation",
+        )
+        axes[1].plot(
+            epoch, part["validation_accuracy"].to_numpy(),
+            color=color, linestyle=":", label=f"Fold {fold} accuracy",
+        )
+        axes[1].plot(
+            epoch, part["validation_balanced_accuracy"].to_numpy(),
+            color=color, linestyle="-",
+            label=f"Fold {fold} balanced accuracy",
+        )
+    axes[0].set_title("Training and validation BCE")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Binary cross-entropy")
+    axes[1].set_title("Validation directional metrics")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Score")
+    axes[1].set_ylim(0.0, 1.0)
+    for axis in axes:
+        axis.grid(alpha=0.25)
+        axis.legend(fontsize=8, ncol=2)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
 def fit_raw_fusion_model(
     price: np.ndarray,
     covariates: np.ndarray,
@@ -1278,6 +1397,12 @@ def fit_raw_fusion_model(
     market_attention_heads: int = 4,
     text_attention_heads: int = 4,
     text_attention_layers: int = 1,
+    validation_price: np.ndarray | None = None,
+    validation_covariates: np.ndarray | None = None,
+    validation_text_indices: dict[str, np.ndarray] | None = None,
+    validation_target: np.ndarray | None = None,
+    validation_market_sequence: np.ndarray | None = None,
+    validation_sequence_padding_mask: np.ndarray | None = None,
 ) -> tuple[nn.Module, list[dict[str, float]]]:
     """Train raw-family adapters and all attention/fusion layers end to end."""
     _require_finite("raw-fusion price latents", price)
@@ -1299,6 +1424,36 @@ def fit_raw_fusion_model(
         if market_sequence is None or sequence_padding_mask is None:
             raise ValueError("TFT training requires temporal sequences and masks")
         _require_finite("TFT training sequences", market_sequence)
+    validation_values = (
+        validation_price,
+        validation_covariates,
+        validation_text_indices,
+        validation_target,
+    )
+    has_validation = any(value is not None for value in validation_values)
+    if has_validation and not all(value is not None for value in validation_values):
+        raise ValueError("Validation arrays must be supplied together")
+    if has_validation:
+        _require_finite("raw-fusion validation price", validation_price)
+        _require_finite(
+            "raw-fusion validation covariates", validation_covariates
+        )
+        _require_finite("raw-fusion validation targets", validation_target)
+        if set(validation_text_indices) != set(text_indices):
+            raise ValueError(
+                "Training and validation text families must be identical"
+            )
+        if market_encoder == "tft":
+            if (
+                validation_market_sequence is None
+                or validation_sequence_padding_mask is None
+            ):
+                raise ValueError(
+                    "TFT validation requires temporal sequences and masks"
+                )
+            _require_finite(
+                "TFT validation sequences", validation_market_sequence
+            )
     family_dims = {
         family: stores[family].input_dim for family in text_indices
     }
@@ -1341,7 +1496,8 @@ def fit_raw_fusion_model(
     history: list[dict[str, float]] = []
     for epoch in range(1, epochs + 1):
         model.train()
-        losses = []
+        train_loss_sum = 0.0
+        train_example_count = 0
         order = rng.permutation(len(target))
         for start in range(0, len(target), batch_size):
             batch_indices = order[start:start + batch_size]
@@ -1372,8 +1528,29 @@ def fit_raw_fusion_model(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            losses.append(float(loss.detach().cpu()))
-        history.append({"epoch": float(epoch), "bce": float(np.mean(losses))})
+            train_loss_sum += float(loss.detach().cpu()) * len(batch_indices)
+            train_example_count += len(batch_indices)
+        train_bce = train_loss_sum / max(train_example_count, 1)
+        epoch_metrics = {
+            "epoch": float(epoch),
+            "bce": float(train_bce),
+            "train_bce": float(train_bce),
+        }
+        if has_validation:
+            epoch_metrics.update(_raw_fusion_validation_metrics(
+                model,
+                validation_price,
+                validation_covariates,
+                validation_text_indices,
+                stores,
+                validation_target,
+                device,
+                batch_size,
+                market_encoder,
+                validation_market_sequence,
+                validation_sequence_padding_mask,
+            ))
+        history.append(epoch_metrics)
     return model.cpu().eval(), history
 
 
@@ -1476,81 +1653,134 @@ def _pooled_timesfm_hidden(
     lookback: int,
     device: str,
 ) -> np.ndarray:
+    # Import TimesFM's reversible normalization and online patch-statistics
+    # utilities. They operate on torch tensors without training any parameters.
     from timesfm.torch.util import revin, update_running_stats
 
-    module = wrapper.model
-    patch_length = module.p
+    module = wrapper.model  # Frozen TimesFM torch module.
+    patch_length = module.p  # P: number of scalar observations per TimesFM patch.
+
+    # Truncate each row to its most recent lookback values and store it as a
+    # one-dimensional float32 array with shape (T_i,), where T_i <= lookback.
     series_by_row = [
         np.asarray(record["target"][-lookback:], dtype=np.float32)
         for record in records
     ]
+
+    # Map each required patch count M_i=ceil(T_i/P) to the original row
+    # positions having that count. Equal-length patch grids can share a batch.
     groups: dict[int, list[int]] = {}
     for row, series in enumerate(series_by_row):
+        # An empty series cannot produce even one partially observed patch.
         if not len(series):
             raise ValueError("Cannot extract a TimesFM latent from an empty context")
-        patch_count = int(np.ceil(len(series) / patch_length))
-        groups.setdefault(patch_count, []).append(row)
+        patch_count = int(np.ceil(len(series) / patch_length))  # Scalar M_i.
+        groups.setdefault(patch_count, []).append(row)  # Append original row index.
 
     # A shared LOOKBACK-width tensor creates fully padded prefix patches for
     # short histories. Those tokens can contaminate later valid transformer
     # states with NaNs. Grouping by actual patch count retains batching while
     # ensuring that every patch contains at least one observation.
-    pooled_by_row: list[np.ndarray | None] = [None] * len(records)
+    pooled_by_row: list[np.ndarray | None] = [None] * len(records)  # N output slots.
     for patch_count, row_indices in groups.items():
-        context_width = patch_count * patch_length
+        # B_g: rows in this group; M: patch_count; P: patch_length.
+        # The padded scalar width is exactly M*P, so only the first patch can
+        # be partially padded and no patch is fully padded.
+        context_width = patch_count * patch_length  # Scalar M*P.
+
+        # Right-aligned scalar contexts. `True` in masks denotes padding.
         values = np.zeros((len(row_indices), context_width), dtype=np.float32)
         masks = np.ones((len(row_indices), context_width), dtype=bool)
         for group_row, original_row in enumerate(row_indices):
-            series = series_by_row[original_row]
-            values[group_row, -len(series):] = series
-            masks[group_row, -len(series):] = False
+            series = series_by_row[original_row]  # (T_i,).
+            values[group_row, -len(series):] = series  # Fill observed suffix.
+            masks[group_row, -len(series):] = False  # Mark observed suffix valid.
 
-        inputs = torch.from_numpy(values).to(device)
-        input_masks = torch.from_numpy(masks).to(device)
-        valid = (~input_masks).to(inputs.dtype)
-        count = valid.sum(1, keepdim=True).clamp_min(1.0)
-        mean = (inputs * valid).sum(1, keepdim=True) / count
+        inputs = torch.from_numpy(values).to(device)  # (B_g, M*P), float32.
+        input_masks = torch.from_numpy(masks).to(device)  # (B_g, M*P), bool.
+        valid = (~input_masks).to(inputs.dtype)  # (B_g, M*P), 1=observed.
+        count = valid.sum(1, keepdim=True).clamp_min(1.0)  # (B_g, 1).
+        mean = (inputs * valid).sum(1, keepdim=True) / count  # (B_g, 1).
         variance = (((inputs - mean) ** 2) * valid).sum(1, keepdim=True) / count
-        inputs = revin(inputs, mean, variance.sqrt(), reverse=False)
-        inputs = torch.where(input_masks, 0.0, inputs)
-        patched_inputs = inputs.reshape(len(row_indices), patch_count, patch_length)
-        patched_masks = input_masks.reshape(len(row_indices), patch_count, patch_length)
+        # variance and its square root have shape (B_g, 1).
+        inputs = revin(
+            inputs, mean, variance.sqrt(), reverse=False
+        )  # Globally normalized scalar context: (B_g, M*P).
+        inputs = torch.where(
+            input_masks, 0.0, inputs
+        )  # Keep padded scalar positions exactly zero: (B_g, M*P).
 
-        n = torch.zeros(len(row_indices), device=inputs.device)
-        mu = torch.zeros_like(n)
-        sigma = torch.zeros_like(n)
-        patch_mu, patch_sigma = [], []
+        # Split the scalar axis into TimesFM's patch grid.
+        patched_inputs = inputs.reshape(len(row_indices), patch_count, patch_length)
+        # patched_inputs: (B_g, M, P).
+        patched_masks = input_masks.reshape(len(row_indices), patch_count, patch_length)
+        # patched_masks: (B_g, M, P), True=padding.
+
+        # Initialize per-row online statistics accumulated from patch 0 through
+        # the current patch. Each state tensor has shape (B_g,).
+        n = torch.zeros(len(row_indices), device=inputs.device)  # Valid count.
+        mu = torch.zeros_like(n)  # Running mean.
+        sigma = torch.zeros_like(n)  # Running scale/standard deviation.
+        patch_mu, patch_sigma = [], []  # M snapshots, each shaped (B_g,).
         for patch in range(patch_count):
+            # Update each row's running statistics using patch `patch`, while
+            # ignoring scalar positions whose patch mask is True.
             (n, mu, sigma), _ = update_running_stats(
                 n, mu, sigma, patched_inputs[:, patch], patched_masks[:, patch]
             )
-            patch_mu.append(mu)
-            patch_sigma.append(sigma)
+            patch_mu.append(mu)  # Running mean after this patch: (B_g,).
+            patch_sigma.append(sigma)  # Running scale after this patch: (B_g,).
+
+        # Stack the per-patch running statistics along the patch axis and apply
+        # TimesFM's causal patch-wise normalization.
         normalized = revin(
-            patched_inputs,
-            torch.stack(patch_mu, 1),
-            torch.stack(patch_sigma, 1),
+            patched_inputs,  # (B_g, M, P).
+            torch.stack(patch_mu, 1),  # (B_g, M).
+            torch.stack(patch_sigma, 1),  # (B_g, M).
             reverse=False,
-        )
-        normalized = torch.where(patched_masks, 0.0, normalized)
-        (_, hidden_tokens, _, _), _ = module(normalized, patched_masks)  # B, M, D
-        valid_tokens = (~patched_masks).any(-1)  # B, M
+        )  # Normalized patches: (B_g, M, P).
+        normalized = torch.where(
+            patched_masks, 0.0, normalized
+        )  # Zero padded scalar positions again: (B_g, M, P).
+
+        # Run the frozen TimesFM backbone. Only hidden_tokens is retained;
+        # D_price is the model's hidden width.
+        (_, hidden_tokens, _, _), _ = module(
+            normalized, patched_masks
+        )  # hidden_tokens: (B_g, M, D_price).
+
+        # A token is valid when its patch contains at least one observed scalar.
+        valid_tokens = (~patched_masks).any(-1)  # (B_g, M), bool.
+
+        # Replace invalid token vectors with zeros before summation, preventing
+        # padded hidden states from contributing to the pooled representation.
         masked_hidden = torch.where(
             valid_tokens.unsqueeze(-1), hidden_tokens, torch.zeros_like(hidden_tokens)
-        )
+        )  # (B_g, M, D_price).
+
+        # Fail immediately if TimesFM produced NaN or infinity in any retained
+        # or zero-masked hidden position.
         if not torch.isfinite(masked_hidden).all():
             raise ValueError(
                 "TimesFM produced a non-finite hidden state after removing "
                 "fully padded patches"
             )
-        pooled = masked_hidden.sum(1)
-        pooled = pooled / valid_tokens.sum(1, keepdim=True).clamp_min(1).to(pooled.dtype)
-        pooled_numpy = pooled.float().cpu().numpy()
-        for group_row, original_row in enumerate(row_indices):
-            pooled_by_row[original_row] = pooled_numpy[group_row]
 
+        pooled = masked_hidden.sum(1)  # Sum valid tokens: (B_g, D_price).
+        pooled = pooled / valid_tokens.sum(
+            1, keepdim=True
+        ).clamp_min(1).to(pooled.dtype)  # Mean valid tokens: (B_g, D_price).
+        pooled_numpy = pooled.float().cpu().numpy()  # Host float32 (B_g, D_price).
+
+        # Restore each group result to its position in the original records.
+        for group_row, original_row in enumerate(row_indices):
+            pooled_by_row[original_row] = pooled_numpy[group_row]  # (D_price,).
+
+    # Every input record must have received exactly one pooled group result.
     if any(value is None for value in pooled_by_row):
         raise RuntimeError("TimesFM pooling did not return every requested row")
+
+    # Stack row vectors into the cache-ready latent matrix (N, D_price).
     return np.stack(pooled_by_row).astype(np.float32, copy=False)
 
 
@@ -2203,6 +2433,7 @@ def run_walk_forward_fusion(
     market_encoder: str = "mlp",
     temporal_covariate_columns: Sequence[str] = (),
     temporal_lookback: int = 32,
+    temporal_lookback_candidates: Sequence[int] = (),
     tft_attention_heads: int = 4,
     raw_text_dim: int = 384,
     text_attention_heads: int = 4,
@@ -2215,6 +2446,22 @@ def run_walk_forward_fusion(
         raise ValueError("market_encoder must be 'mlp' or 'tft'")
     if market_encoder == "tft" and not temporal_covariate_columns:
         raise ValueError("TFT requires temporal_covariate_columns")
+    if market_encoder == "tft":
+        lookback_candidates = tuple(sorted(set(
+            int(value) for value in (
+                temporal_lookback_candidates or (temporal_lookback,)
+            )
+        )))
+        if not lookback_candidates or any(value < 2 for value in lookback_candidates):
+            raise ValueError("Every TFT lookback candidate must be at least two")
+        if int(temporal_lookback) not in lookback_candidates:
+            raise ValueError(
+                "The default TFT lookback must be included in its candidates"
+            )
+        max_temporal_lookback = max(lookback_candidates)
+    else:
+        lookback_candidates = ()
+        max_temporal_lookback = int(temporal_lookback)
     feature_set = (
         "timesfm_temporal_tft_unified_raw_text_attention"
         if market_encoder == "tft"
@@ -2297,8 +2544,18 @@ def run_walk_forward_fusion(
         "learning_rate": 3e-4,
         "weight_decay": 1e-4,
     }
+    if market_encoder == "tft":
+        default_params["temporal_lookback"] = int(temporal_lookback)
 
     fold_array_cache: dict[int, tuple] = {}
+    temporal_scaler_cache: dict[tuple[int, int], dict[str, np.ndarray]] = {}
+
+    def model_fit_params(params: dict) -> dict:
+        """Remove preprocessing-only hyperparameters before model creation."""
+        return {
+            key: value for key, value in params.items()
+            if key != "temporal_lookback"
+        }
 
     def select_families(
         arrays: tuple, variant_families: Sequence[str]
@@ -2335,20 +2592,11 @@ def run_walk_forward_fusion(
             if market_encoder == "tft":
                 train_sequence, train_padding = _temporal_covariate_matrix(
                     train_index, train_features, temporal_covariate_columns,
-                    temporal_lookback,
+                    max_temporal_lookback,
                 )
                 val_sequence, val_padding = _temporal_covariate_matrix(
                     val_index, train_features, temporal_covariate_columns,
-                    temporal_lookback,
-                )
-                temporal_scaler = _fit_temporal_scaler(
-                    train_sequence, train_padding
-                )
-                train_sequence = _apply_temporal_scaler(
-                    train_sequence, train_padding, temporal_scaler
-                )
-                val_sequence = _apply_temporal_scaler(
-                    val_sequence, val_padding, temporal_scaler
+                    max_temporal_lookback,
                 )
             fold_array_cache[fold] = (
                 train_arrays,
@@ -2380,6 +2628,47 @@ def run_walk_forward_fusion(
             temporal_scaler,
         )
 
+    def temporal_fold_view(
+        fold: int,
+        train_sequence: np.ndarray | None,
+        train_padding: np.ndarray | None,
+        val_sequence: np.ndarray | None,
+        val_padding: np.ndarray | None,
+        lookback: int,
+    ) -> tuple:
+        """Slice and fold-scale cached maximum-length TFT histories."""
+        if market_encoder != "tft":
+            return (
+                train_sequence, train_padding, val_sequence, val_padding, None
+            )
+        lookback = int(lookback)
+        if lookback not in lookback_candidates:
+            raise ValueError(f"Unsupported TFT lookback: {lookback}")
+        train_view = np.ascontiguousarray(
+            train_sequence[:, -lookback:, :]
+        )
+        train_mask = np.ascontiguousarray(
+            train_padding[:, -lookback:]
+        )
+        val_view = np.ascontiguousarray(
+            val_sequence[:, -lookback:, :]
+        )
+        val_mask = np.ascontiguousarray(
+            val_padding[:, -lookback:]
+        )
+        cache_key = (int(fold), lookback)
+        if cache_key not in temporal_scaler_cache:
+            temporal_scaler = _fit_temporal_scaler(train_view, train_mask)
+            temporal_scaler_cache[cache_key] = temporal_scaler
+        temporal_scaler = temporal_scaler_cache[cache_key]
+        train_view = _apply_temporal_scaler(
+            train_view, train_mask, temporal_scaler
+        )
+        val_view = _apply_temporal_scaler(
+            val_view, val_mask, temporal_scaler
+        )
+        return train_view, train_mask, val_view, val_mask, temporal_scaler
+
     tuning_trials_table = pl.DataFrame()
     if tune_hyperparameters and tuning_trials > 0:
         try:
@@ -2391,7 +2680,11 @@ def run_walk_forward_fusion(
             ) from error
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         study = optuna.create_study(
-            study_name=f"timesfm_{market_encoder}_unified_raw_text_v3",
+            study_name=(
+                "timesfm_tft_unified_raw_text_v4"
+                if market_encoder == "tft" else
+                "timesfm_mlp_unified_raw_text_v3"
+            ),
             storage=f"sqlite:///{(output_dir / 'optuna_study.db').resolve()}",
             load_if_exists=True,
             direction="maximize",
@@ -2417,12 +2710,26 @@ def run_walk_forward_fusion(
                 trial.suggest_int("market_depth", 1, 3)
                 if market_encoder == "mlp" else 0
             )
+            if market_encoder == "tft":
+                params["temporal_lookback"] = trial.suggest_categorical(
+                    "temporal_lookback", list(lookback_candidates)
+                )
             scores = []
             for step, fold in enumerate(fold_numbers):
                 (
                     train_a, val_a, train_cov, val_cov, _,
                     train_sequence, train_padding, val_sequence, val_padding, _,
                 ) = fold_arrays(int(fold), variants[tuning_variant])
+                if market_encoder == "tft":
+                    (
+                        train_sequence, train_padding,
+                        val_sequence, val_padding, _,
+                    ) = temporal_fold_view(
+                        int(fold),
+                        train_sequence, train_padding,
+                        val_sequence, val_padding,
+                        params["temporal_lookback"],
+                    )
                 model, _ = fit_raw_fusion_model(
                     train_a[1], train_cov, train_a[2], stores, train_a[4],
                     device, text_dim=raw_text_dim,
@@ -2434,7 +2741,7 @@ def run_walk_forward_fusion(
                     market_attention_heads=tft_attention_heads,
                     text_attention_heads=text_attention_heads,
                     text_attention_layers=text_attention_layers,
-                    **params,
+                    **model_fit_params(params),
                 )
                 score = predict_raw_fusion(
                     model, val_a[1], val_cov, val_a[2], stores, device,
@@ -2481,6 +2788,7 @@ def run_walk_forward_fusion(
 
     # Refit the selected architecture within every fold and save true OOS scores.
     prediction_parts = []
+    diagnostic_histories: dict[str, list[pl.DataFrame]] = {}
     params_json = json.dumps(best_params, sort_keys=True)
     for fold in fold_numbers:
         fold = int(fold)
@@ -2490,6 +2798,20 @@ def run_walk_forward_fusion(
                 train_sequence, train_padding, val_sequence, val_padding,
                 temporal_scaler,
             ) = fold_arrays(fold, variant_families)
+            selected_temporal_lookback = (
+                int(best_params["temporal_lookback"])
+                if market_encoder == "tft" else None
+            )
+            if market_encoder == "tft":
+                (
+                    train_sequence, train_padding,
+                    val_sequence, val_padding, temporal_scaler,
+                ) = temporal_fold_view(
+                    fold,
+                    train_sequence, train_padding,
+                    val_sequence, val_padding,
+                    selected_temporal_lookback,
+                )
             model_name = (
                 f"timesfm_tft_unified_raw_text_plus_{variant}"
                 if market_encoder == "tft" else
@@ -2507,7 +2829,13 @@ def run_walk_forward_fusion(
                 market_attention_heads=tft_attention_heads,
                 text_attention_heads=text_attention_heads,
                 text_attention_layers=text_attention_layers,
-                **best_params,
+                validation_price=val_a[1],
+                validation_covariates=val_cov,
+                validation_text_indices=val_a[2],
+                validation_target=val_a[4],
+                validation_market_sequence=val_sequence,
+                validation_sequence_padding_mask=val_padding,
+                **model_fit_params(best_params),
             )
             save_torch_model(model_path, model, {
                 "scope": f"fold_{fold}", "model": model_name,
@@ -2530,7 +2858,7 @@ def run_walk_forward_fusion(
                     "market_mlp_plus_raw_family_adapters_self_and_cross_attention"
                 ),
                 "temporal_covariates": list(temporal_covariate_columns),
-                "temporal_lookback": temporal_lookback if market_encoder == "tft" else None,
+                "temporal_lookback": selected_temporal_lookback,
                 "hyperparameters": best_params,
             })
             _save_covariate_scaler(
@@ -2545,9 +2873,17 @@ def run_walk_forward_fusion(
                     temporal_covariate_columns,
                     temporal_scaler,
                 )
-            pl.DataFrame(history).write_csv(
+            history_frame = pl.DataFrame(history).with_columns(
+                pl.lit(fold).cast(pl.Int8).alias("fold"),
+                pl.lit(model_name).alias("model"),
+                pl.lit(variant).alias("variant"),
+            )
+            history_frame.write_csv(
                 fold_scopes[fold]["dir"] / "fusion_models" /
                 f"{model_name}_training_history.csv"
+            )
+            diagnostic_histories.setdefault(model_name, []).append(
+                history_frame
             )
             score = predict_raw_fusion(
                 model, val_a[1], val_cov, val_a[2], stores, device,
@@ -2567,6 +2903,26 @@ def run_walk_forward_fusion(
             gc.collect()
             if device == "mps":
                 torch.mps.empty_cache()
+
+    diagnostic_dir = output_dir / "training_diagnostics"
+    diagnostic_dir.mkdir(parents=True, exist_ok=True)
+    combined_diagnostics = []
+    for model_name, history_parts in diagnostic_histories.items():
+        model_history = pl.concat(history_parts).sort(["fold", "epoch"])
+        model_history.write_csv(
+            diagnostic_dir / f"{model_name}_fold_learning_curves.csv"
+        )
+        _plot_fold_training_diagnostics(
+            model_history,
+            diagnostic_dir / f"{model_name}_fold_learning_curves.png",
+        )
+        combined_diagnostics.append(model_history)
+    training_diagnostics = pl.concat(combined_diagnostics).sort(
+        ["model", "fold", "epoch"]
+    )
+    training_diagnostics.write_csv(
+        diagnostic_dir / "all_fold_learning_curves.csv"
+    )
 
     raw_oof = pl.concat(prediction_parts)
     thresholds = {
@@ -2648,14 +3004,18 @@ def run_walk_forward_fusion(
         test_cov = _apply_covariate_scaler(test_raw, scaler)
         train_sequence = train_padding = test_sequence = test_padding = None
         temporal_scaler = None
+        selected_temporal_lookback = (
+            int(best_params["temporal_lookback"])
+            if market_encoder == "tft" else None
+        )
         if market_encoder == "tft":
             train_sequence, train_padding = _temporal_covariate_matrix(
                 train_a[0], train_features, temporal_covariate_columns,
-                temporal_lookback,
+                selected_temporal_lookback,
             )
             test_sequence, test_padding = _temporal_covariate_matrix(
                 test_a[0], scoped_test_features, temporal_covariate_columns,
-                temporal_lookback,
+                selected_temporal_lookback,
             )
             temporal_scaler = _fit_temporal_scaler(
                 train_sequence, train_padding
@@ -2681,7 +3041,7 @@ def run_walk_forward_fusion(
             market_attention_heads=tft_attention_heads,
             text_attention_heads=text_attention_heads,
             text_attention_layers=text_attention_layers,
-            **best_params,
+            **model_fit_params(best_params),
         )
         save_torch_model(final_dir / "fusion_models" / f"{model_name}.pt", model, {
             "scope": "final", "model": model_name,
@@ -2704,7 +3064,7 @@ def run_walk_forward_fusion(
                 "market_mlp_plus_raw_family_adapters_self_and_cross_attention"
             ),
             "temporal_covariates": list(temporal_covariate_columns),
-            "temporal_lookback": temporal_lookback if market_encoder == "tft" else None,
+            "temporal_lookback": selected_temporal_lookback,
             "hyperparameters": best_params,
         })
         _save_covariate_scaler(
@@ -2861,6 +3221,7 @@ def run_walk_forward_fusion(
     comparison_aggregate.write_csv(output_dir / "comparison_with_baselines_aggregate.csv")
     return {
         "tuning_trials": tuning_trials_table,
+        "training_diagnostics": training_diagnostics,
         "fold_metrics": fold_metrics, "aggregate": aggregate,
         "oof_predictions": oof_predictions,
         "final_predictions": final_predictions, "final_metrics": final_metrics,
