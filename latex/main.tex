@@ -67,10 +67,13 @@ The proposed framework transfers information from competition-permitted
 pretrained time-series foundation models, including Chronos, Moirai, and
 TimesFM, through three progressively more adaptive mechanisms: forecast
 stacking, frozen latent-representation extraction, and parameter-efficient
-fine-tuning. Price representations are combined with the supplied text
-embedding vectors using gated fusion or cross-attention. A cross-sectional
-Transformer can additionally model dependencies among stocks at each
-prediction date.
+fine-tuning. The implemented architecture combines a frozen TimesFM price
+representation with a Temporal Fusion Transformer (TFT) over historical
+market covariates. Original, uncompressed text embeddings are mapped to a
+shared width by family-specific adapters, contextualized jointly by
+self-attention, and selected by market-conditioned cross-attention. A
+cross-sectional Transformer can additionally model dependencies among stocks
+at each prediction date.
 
 The empirical study will compare simple tabular classifiers, neural
 time-series models trained from scratch, zero-shot foundation-model forecasts,
@@ -290,8 +293,9 @@ $\Prob(\cdot)$, $\E[\cdot]$, $\R^d$ & Probability, expectation, and the $d$-dime
 \endhead
 $X^P_{i,t-L+1:t}\in\R^{L\times F_P}$ & Ordered price-feature sequence for stock $i$ ending at $t$; rows are dates and the $F_P$ columns are price, return, volatility, volume, market, or related variables. \\
 $x^P_{i,t}\in\R^{F_{\mathrm{tab}}}$ & Fixed-length tabular price vector evaluated at $t$, formed from the engineered price statistics listed in the Price Features subsection. \\
-$x^C_{i,t}\in\R^{F_C}$ & Complete engineered covariate vector available at forecast origin $t$: market and volume features, calendar and Fourier features, and text-availability counts or indicators. In the implemented TimesFM fusion model, $F_C=106$. \\
+$x^C_{i,t}\in\R^{F_C}$ & Complete engineered covariate vector available at forecast origin $t$: market and volume features, calendar and Fourier features, and text-availability counts or indicators. It enters the implemented TFT as static context together with the frozen TimesFM representation. \\
 $\bar x^C_{i,t}\in\R^{F_C}$ & Fold-standardized covariate vector. Missing entries of $x^C_{i,t}$ are replaced by training-fold medians and each column is centered and scaled using training-fold statistics only. \\
+$X^M_{i,t-T+1:t}\in\R^{T\times V}$ & Fold-standardized historical market window supplied to the encoder-only TFT. The implementation uses $T=32$ and $V=16$ genuinely historical price, return, volatility, volume, and market-relative variables. \\
 $F_P$; $F_{\mathrm{tab}}$ & Number of features per sequential time step and number of engineered features in the tabular price vector, respectively. \\
 $r_{i,t}^{(k)}$ & Log return from date $t-k$ to date $t$, $\log(P_{i,t}/P_{i,t-k})$; $r_{i,t}^{(1)}$ is the return from $t-1$ to $t$. \\
 $\bar r_{i,t}^{(k)}$; $\sigma_{i,t}^{(k)}$ & Mean and sample standard deviation of the $k$ one-day returns from $t-k+1$ through $t$. \\
@@ -304,8 +308,8 @@ $K_T$ & Number of supplied text-embedding families used by the model. \\
 $z^T_{i,t}\in\R^{D_T}$ & Uncompressed supplied or aggregated text-feature vector available for stock $i$ by date $t$; $D_T$ is its dimension. \\
 $s^T_{i,t}\in\R^{F_T}$ & Optional text-summary vector containing features such as item count, embedding norm, temporal averages, or similarity statistics. \\
 $\widetilde z^T_{i,t}\in\R^{\widetilde D_T}$ & Tabular text vector obtained by concatenating the article-averaged vector from every embedding family and $s^T_{i,t}$; a missing family vector is zero. \\
-$h^{T,k}_{i,t,j}$; $h^T_{i,t}$; $H^T_{i,t}$ & Projected representation of item $j$ from family $k$, a single pooled text vector, and a sequence of $J$ text tokens, respectively. \\
-$J$; $d$ & Number of text tokens and shared latent width used by the multimodal model. \\
+$h^{T,k,a}_{i,t}$; $h^T_{i,t}$; $H^T_{i,t}$ & Adapted token for embedding family $k$ and text field $a$, market-conditioned pooled text vector, and the sequence of all available family--field tokens, respectively. \\
+$A_T$; $J$; $d_T$ & Number of text fields, maximum family--field tokens $J=K_TA_T$, and shared text width. The implementation uses $d_T=384$. \\
 \bottomrule
 \end{longtable}
 
@@ -325,7 +329,7 @@ $m$; $M_{\mathrm{mod}}$ & Model index and number of models or ensemble members. 
 $\theta_m^0$; $\theta_0$ & Frozen pretrained parameters of foundation model $m$, or of the selected backbone when no model index is needed. \\
 $H^{P,m}_{i,t}\in\R^{M_m\times d_m}$ & Hidden price-token matrix from foundation model $m$; $M_m$ and $d_m$ are its token count and hidden width. \\
 $H^P_{i,t}\in\R^{M_P\times d}$; $h^P_{i,t}$ & Price-token matrix in the shared latent space and its pooled vector; $M_P$ is the number of price tokens. \\
-$h^C_{i,t}$ & Joint market representation obtained by passing $[h^P_{i,t};\bar x^C_{i,t}]$ through the residual covariate--price MLP. \\
+$h^C_{i,t}$ & Joint market state produced by the encoder-only TFT from the frozen TimesFM vector, static origin covariates, and the historical market window. \\
 $p^{(m)}_{i,t}$; $a^{(m)}_{i,t}$ & Model-$m$ probability of an upward endpoint and its signed point-forecast log-return score. \\
 $S_m$; $\widehat P^{(m,s)}_{i,t+H}$ & Number of forecast samples from model $m$ and its $s$th sampled endpoint price. \\
 $u^{(m)}_{i,t}$; $h^{\mathrm{FM}}_{i,t}$ & Model-$m$ uncertainty summaries and the concatenated foundation-model forecast-feature vector. \\
@@ -333,8 +337,8 @@ $W_0$, $W$, $\Delta W$ & Original pretrained weight matrix, adapted weight matri
 $A_{\mathrm{LoRA}}$, $B_{\mathrm{LoRA}}$, $r$ & LoRA down-projection, up-projection, and rank, with $r\ll\min(d_{\mathrm{in}},d_{\mathrm{out}})$. \\
 $d_{\mathrm{in}}$; $d_{\mathrm{out}}$ & Input and output widths of the adapted weight matrix. \\
 $\phi$; $\phi_{\mathrm{LoRA}}$ & Optional adapter parameters and the collection of all trainable LoRA parameters. \\
-$W_T,b_T,\phi_T$ & Text-projection matrix, bias, and nonlinear projection mapping. \\
-$Q^T,K^P,V^P$ & Text queries and price keys/values used in text-to-price cross-attention. \\
+$W_T,b_T,\phi_T$ & Family-specific raw-text adapter parameters and nonlinear projection mapping. \\
+$q^C,K^T,V^T$ & Single market-state query and contextual text keys/values used in the implemented market-to-text cross-attention. \\
 $W_Q,W_K,W_V$; $d_{\mathrm{att}}$ & Learned attention projections and per-head query/key width. \\
 $\widetilde H^T_{i,t}$; $\widetilde H^P_{i,t}$ & Cross-attended text-token and price-token matrices. \\
 $g^P_{i,t},g^T_{i,t}$ & Elementwise price and text gates in $[0,1]^d$. \\
@@ -898,145 +902,157 @@ where:
 When internal representation extraction is unavailable, a train-from-scratch
 TCN or PatchTST encoder will be used instead.
 
-\subsection{Text Encoder}
+\subsection{TFT Market Encoder}
 
-The supplied embedding vectors are projected into a shared latent dimension:
-
-\begin{equation}
-h^T_{i,t}
-=
-\operatorname{LayerNorm}
-\left[
-\phi_T
-\left(
-W_T z^T_{i,t}+b_T
-\right)
-\right]
-\in
-\R^d.
-\end{equation}
-
-If several embedding families or several temporal text aggregates are used,
-the text representation is retained as multiple tokens:
+The implemented model pools a frozen TimesFM hidden representation
+$h^P_{i,t}$ extracted from the historical \texttt{ret\_20} series. TimesFM
+uses up to 512 observations and requires at least 64 valid observations; the
+result is cached and is not updated during classifier training. The pooled
+state and all current-origin covariates form a static context:
 
 \begin{equation}
-H^T_{i,t}
+c_{i,t}
 =
-\left[
-h^{T,1}_{i,t},
-\ldots,
-h^{T,J}_{i,t}
-\right]
-\in
-\R^{J\times d}.
+\operatorname{GRN}_{\mathrm{static}}
+\left([h^P_{i,t};\bar x^C_{i,t}]\right).
 \end{equation}
 
-\subsection{Residual Covariate--Price Encoder with Text Fusion}
-
-The implemented frozen-TimesFM model does not send the pooled pretrained
-vector directly to the text-fusion head.  It first combines that vector with
-all engineered covariates available at the forecast origin.  Let
-
-\begin{equation}
-h^P_{i,t}
-=
-\operatorname{Pool}\!\left(H^P_{i,t}\right)
-\end{equation}
-
-be the frozen TimesFM representation, and let $\bar x^C_{i,t}$ be the
-engineered covariate vector after training-fold median imputation and
-standardization.  The initial joint market state is
-
-\begin{equation}
-h^{C,(0)}_{i,t}
-=
-\operatorname{Dropout}\!\left(
-\operatorname{GELU}\!\left(
-W_C\operatorname{LayerNorm}\!\left(
-[h^P_{i,t};\bar x^C_{i,t}]
-\right)+b_C
-\right)
-\right).
-\end{equation}
-
-For $\ell=1,\ldots,B_C$, a pre-normalized residual MLP block updates this
-state as
+In parallel, the TFT consumes the preceding 32 dates of 16 historical market
+variables, $X^M_{i,t-31:t}$. Each scalar variable is encoded by its own gated
+residual network (GRN). A context-conditioned variable-selection network
+produces weights $\alpha_{i,\tau,v}$:
 
 \begin{align}
-v^{C,(\ell)}_{i,t}
+\alpha_{i,\tau}
 &=
-W^{C,(\ell)}_2
-\operatorname{Dropout}\!\left(
-\operatorname{GELU}\!\left(
-W^{C,(\ell)}_1
-\operatorname{LayerNorm}\!\left(h^{C,(\ell-1)}_{i,t}\right)
-+b^{C,(\ell)}_1
-\right)
-\right)
-+b^{C,(\ell)}_2,\\
-h^{C,(\ell)}_{i,t}
+\softmax\!\left(
+\operatorname{GRN}_{\mathrm{weight}}
+(X^M_{i,\tau},c_{i,t})
+\right),\\
+s_{i,\tau}
 &=
-h^{C,(\ell-1)}_{i,t}
-+\operatorname{Dropout}\!\left(v^{C,(\ell)}_{i,t}\right).
+\sum_{v=1}^{V}
+\alpha_{i,\tau,v}
+\operatorname{GRN}_{v}(X^M_{i,\tau,v}).
 \end{align}
 
-The resulting market representation is
-$h^C_{i,t}=\operatorname{LayerNorm}(h^{C,(B_C)}_{i,t})$.  Thus, the residual
-market encoder learns interactions between the frozen TimesFM latent vector
-and the tabular market, volume, calendar, Fourier, and text-availability
-covariates.
-
-For multiple text-embedding families, let $a^T_{i,t}\in\{0,1\}^{J}$ denote
-family availability and set unavailable family vectors to zero.  The text
-branch used by the simple-concatenation implementation is
+The selected sequence is passed through an LSTM, a gated residual connection,
+and multi-head temporal self-attention. Left padding is masked, and the final
+time step is refined with the static context:
 
 \begin{equation}
-h^{T,\mathrm{pool}}_{i,t}
+h^C_{i,t}
 =
-\operatorname{LayerNorm}\!\left(
-\operatorname{GELU}\!\left(
-W_{T,\mathrm{pool}}
-\left[
-\operatorname{vec}\!\left(
-a^T_{i,t}\odot H^T_{i,t}
-\right);
-a^T_{i,t}
-\right]
-+b_{T,\mathrm{pool}}
-\right)
+\operatorname{GRN}_{\mathrm{out}}
+\left(
+\operatorname{TemporalAttention}
+\left(\operatorname{LSTM}(s_{i,t-31:t})\right)_{-1},
+c_{i,t}
 \right).
 \end{equation}
 
-The two branches are concatenated only after the residual market encoding:
+Thus the TFT is the trainable market encoder, while TimesFM supplies a frozen
+price prior within its static context. No unavailable future market variable
+is passed to the TFT.
+
+\subsection{Unified Raw-Embedding Text Encoder}
+
+The text branch consumes the original supplied embeddings directly. It does
+not use PCA, mean-pool all articles into one vector, or train a separate
+target-supervised TextCoder. For family $k$ and text field $a$, the raw vector
+$e^{(k)}_{i,t,a}\in\R^{D_k}$ is mapped to the common width $d_T=384$:
 
 \begin{equation}
-u^{(0)}_{i,t}
+h^{T,k,a}_{i,t}
 =
 \operatorname{Dropout}\!\left(
 \operatorname{GELU}\!\left(
-W_F[h^C_{i,t};h^{T,\mathrm{pool}}_{i,t}]+b_F
+W_k\operatorname{LayerNorm}(e^{(k)}_{i,t,a})+b_k
 \right)
-\right).
-\label{simple_covariate_concatenation}
+\right)
++\rho_k+\eta_a,
 \end{equation}
 
-A second sequence of $B_F$ pre-normalized residual MLP blocks, defined in the
-same form as above with fusion-specific parameters, produces $u^{(B_F)}_{i,t}$.
-The directional probability is
+where $\rho_k$ and $\eta_a$ are learned family and field identity embeddings.
+The family-specific adapters allow heterogeneous original dimensions while
+preserving one token for every available family--field pair. The tokens are
+concatenated along the sequence dimension and contextualized jointly:
 
 \begin{equation}
-p_{i,t}
+\widehat H^T_{i,t}
 =
-\sigmoid\!\left(
-w_o^\top\operatorname{LayerNorm}\!\left(u^{(B_F)}_{i,t}\right)+b_o
-\right).
+\operatorname{TransformerEncoder}
+\left(
+[h^{T,k,a}_{i,t}]_{k,a};
+m^T_{i,t}
+\right)
+\in\R^{J\times d_T},
 \end{equation}
 
-TimesFM and the cached $h^P_{i,t}$ remain frozen.  Text coders, covariate
-preprocessing, both residual MLP stacks, and the classifier are fitted within
-each expanding training fold.  Hyperparameters and the decision threshold are
-selected from out-of-sample fold predictions only; the selected model is then
-refitted using all labeled training observations.
+where $m^T_{i,t}$ masks unavailable pairs and $J=K_TA_T$. The implementation
+uses one text self-attention layer with four heads by default.
+
+\subsection{Market-Conditioned Cross-Attention and Fusion}
+
+The TFT market state supplies one query, while the contextualized raw-text
+tokens supply keys and values:
+
+\begin{align}
+q^C_{i,t}
+&=
+W_Qh^C_{i,t}\in\R^{1\times d_T},\\
+\widehat h^T_{i,t}
+&=
+\operatorname{MHA}
+\left(
+Q=q^C_{i,t},
+K=\widehat H^T_{i,t},
+V=\widehat H^T_{i,t};
+m^T_{i,t}
+\right)
+\in\R^{1\times d_T},\\
+h^T_{i,t}
+&=
+\operatorname{GRN}_{T}
+\left(
+\operatorname{LayerNorm}
+(q^C_{i,t}+\widehat h^T_{i,t}),
+h^C_{i,t}
+\right).
+\end{align}
+
+The attention weights therefore answer which embedding families and text
+fields are relevant under the current market state. Masked tokens receive no
+weight. The active implementation requires at least one available text token
+for every modeled row and does not insert a learned null token.
+
+The market and selected text states are concatenated, projected with GELU and
+dropout, and processed by residual MLP blocks:
+
+\begin{align}
+u^{(0)}_{i,t}
+&=
+\operatorname{Dropout}\!\left(
+\operatorname{GELU}\!\left(
+W_F[h^C_{i,t};h^T_{i,t}]+b_F
+\right)
+\right),\\
+u^{(\ell)}_{i,t}
+&=
+\operatorname{ResidualMLP}_{\ell}(u^{(\ell-1)}_{i,t}),\\
+p_{i,t}
+&=
+\sigmoid\!\left(
+w_o^\top\operatorname{LayerNorm}(u^{(B_F)}_{i,t})+b_o
+\right).
+\end{align}
+
+TimesFM remains frozen. The TFT, family adapters, identity embeddings, text
+self-attention, cross-attention, fusion blocks, and classifier are optimized
+jointly within each expanding training fold. Imputation and scaling parameters
+are also fitted within the fold. Hyperparameters and the decision threshold
+are selected from out-of-fold predictions before the chosen architecture is
+refitted on all labeled training observations.
 
 \subsection{TCN (Temporal Convolution Network) with Text Fusion}
 
@@ -1116,63 +1132,41 @@ text representation.
 
 \subsection{Encoder--Fusion Summary}
 
-The two principal price-encoder choices are summarized by
+The active Stage~2 architecture is the following hybrid:
 
 \begin{equation}
+\begin{aligned}
 h^P_{i,t}
-=
-\begin{cases}
-\operatorname{TCN}\left(X^P_{i,t-L+1:t}\right),
-& \text{trained from scratch},\\[2mm]
+&=
 \operatorname{Pool}\!\left(
 \operatorname{TimesFM}_{\theta_0}
-\left(X^P_{i,t-L+1:t}\right)
-\right),
-& \text{pretrained and frozen}.
-\end{cases}
-\end{equation}
-
-For the implemented frozen-TimesFM concatenation model, the pooled price
-vector is first augmented with the engineered covariates and encoded jointly:
-
-\begin{equation}
-h^{P+C}_{i,t}
-=
-\operatorname{ResidualMLP}_C\!\left(
-[h^P_{i,t};\bar x^C_{i,t}]
-\right).
-\end{equation}
-
-The concatenation variant therefore uses $h^{P+C}_{i,t}$ rather than the
-unaugmented $h^P_{i,t}$.  More generally, after the price history has been
-encoded, either price encoder can be paired with each of the same three
-text-fusion choices:
-
-\begin{equation}
+(X^{\mathrm{ret20}}_{i,t-L+1:t})
+\right),\\
+h^C_{i,t}
+&=
+\operatorname{TFT}
+\left([h^P_{i,t};\bar x^C_{i,t}],X^M_{i,t-31:t}\right),\\
+\widehat H^T_{i,t}
+&=
+\operatorname{TextSelfAttention}
+\left([\operatorname{Adapter}_k(e^{(k)}_{i,t,a})
++\rho_k+\eta_a]_{k,a}\right),\\
+h^T_{i,t}
+&=
+\operatorname{CrossAttention}
+\left(Q=W_Qh^C_{i,t},K=\widehat H^T_{i,t},
+V=\widehat H^T_{i,t}\right),\\
 u_{i,t}
-=
-\begin{cases}
-[h^{P+C}_{i,t};h^T_{i,t}],
-& \text{concatenation},\\
-[\widetilde h^P_{i,t};\widetilde h^T_{i,t}],
-& \text{elementwise gating},\\
-\operatorname{CrossAttention}\left(H^T_{i,t},H^P_{i,t}\right),
-& \text{cross-attention}.
-\end{cases}
+&=
+\operatorname{ResidualFusion}([h^C_{i,t};h^T_{i,t}]).
+\end{aligned}
 \end{equation}
 
-Consequently, the TCN and frozen-TimesFM paths each produce three distinct
-model variants rather than one generic ``model with text.''  When permitted,
-the same three fusion variants can also be evaluated with a LoRA-adapted
-TimesFM encoder in place of the frozen encoder.
-
-A Temporal Fusion Transformer (TFT) may additionally be trained from scratch
-using only competition-provided price variables and text embeddings.  This
-does not introduce another pretrained model: all TFT variable-selection,
-gating, recurrent, attention, and classification parameters are initialized
-and learned on the competition training data.  Any known-future inputs used by
-the TFT must likewise be supplied or deterministically available at forecast
-time; unavailable future market or text information cannot be used.
+TimesFM is pretrained and frozen. The TFT is not a replacement for TimesFM:
+it learns from the 32-step historical market window while using the frozen
+price state and current-origin covariates as context. The TFT, raw-embedding
+adapters, text self-attention, market-to-text cross-attention, residual fusion
+blocks, and classifier are trained jointly on competition data.
 
 \subsection{Why Cross-Attention is Appropriate}
 
@@ -1182,60 +1176,28 @@ Simple concatenation,
 [h^P_{i,t};h^T_{i,t}],
 \end{equation}
 
-allows an MLP to learn interactions, but it compresses the temporal sequence
-before the text is introduced.
-
-Cross-attention preserves the temporal tokens and allows the text
-representation to select relevant historical price patterns. Text-to-price
-cross-attention is defined by
-
-\begin{align}
-Q^T
-&=
-H^T_{i,t}W_Q,\\
-K^P
-&=
-H^P_{i,t}W_K,\\
-V^P
-&=
-H^P_{i,t}W_V,\\
-\widetilde H^T_{i,t}
-&=
-\softmax
-\left(
-\frac{
-Q^T(K^P)^\top
-}{
-\sqrt{d_{\mathrm{att}}}
-}
-\right)
-V^P.
-\end{align}
-
-Here $W_Q$, $W_K$, and $W_V$ are learned projection matrices and
-$d_{\mathrm{att}}$ is the per-head query/key dimension used for attention
-scaling. The superscripts $T$ and $P$ label the text and price modalities;
-only $\top$ denotes transpose.
-
-This operation asks:
-
-\begin{quote}
-Given the current text representation, which portions of the historical price
-trajectory are relevant for the directional prediction?
-\end{quote}
-
-A bidirectional variant additionally lets price tokens attend to text tokens:
+allows an MLP to learn interactions, but it assigns no explicit,
+market-dependent importance to the individual family--field text tokens.
+The implemented cross-attention instead projects the TFT market state into one
+query and attends over the self-contextualized text-token sequence:
 
 \begin{equation}
-\widetilde H^P_{i,t}
+h^T_{i,t}
 =
 \operatorname{Attention}
 \left(
-Q=H^P_{i,t},
-K=H^T_{i,t},
-V=H^T_{i,t}
+Q=W_Qh^C_{i,t},
+K=\widehat H^T_{i,t},
+V=\widehat H^T_{i,t}
 \right).
 \end{equation}
+
+This operation asks: given the present TimesFM--TFT market state, which
+available embedding families and text fields are most relevant for the
+directional prediction? It produces one vector of shape $1\times d_T$ per
+example before the singleton dimension is removed. Attention performs a
+weighted sum of the value vectors; it is not a multiplication of the query by
+the attention weights.
 
 \subsection{Gated Fusion Alternatives}
 
@@ -1829,9 +1791,8 @@ are:
     \item TCN price encoder with concatenated text;
     \item TCN price encoder with elementwise gated text fusion;
     \item TCN price encoder with text-to-price cross-attention;
-    \item frozen TimesFM price encoder with concatenated text;
-    \item frozen TimesFM price encoder with elementwise gated text fusion;
-    \item frozen TimesFM price encoder with text-to-price cross-attention;
+    \item frozen TimesFM plus TFT market encoder with unified raw-text
+    self-attention and market-to-text cross-attention;
     \item LoRA-adapted TimesFM price encoder with concatenated text, if
     permitted;
     \item LoRA-adapted TimesFM price encoder with elementwise gated text
@@ -1957,10 +1918,11 @@ compressed embedding features may remain correlated or high-dimensional.
 \subsection{Stage 4: Transfer Pretrained Representations}
 
 \begin{enumerate}
-    \item frozen TimesFM representation concatenated with engineered
-    covariates, encoded by a residual MLP, and fused with projected text;
-    \item frozen representation plus gated text fusion;
-    \item frozen representation plus text-to-price cross-attention;
+    \item frozen TimesFM representation as static context for a trainable TFT
+    over historical market covariates;
+    \item family-specific adapters over original, uncompressed embeddings;
+    \item joint text self-attention followed by market-to-text
+    cross-attention;
     \item LoRA adaptation, if permitted;
     \item partial unfreezing of the final backbone blocks, if permitted.
 \end{enumerate}
@@ -2175,29 +2137,41 @@ interpretation.
 \section{Recommended Initial Model}
 % =========================================================
 
-The initial high-priority model is
+The implemented high-priority model is
 
 \begin{equation}
 \boxed{
 \begin{aligned}
-H^P_{i,t}
+h^P_{i,t}
 &=
+\operatorname{Pool}\!\left(
 \operatorname{TimesFM}_{\theta_0}
-\left(
-X^P_{i,t-L+1:t}
+(X^{\mathrm{ret20}}_{i,t-L+1:t})
 \right),\\
-H^T_{i,t}
+h^C_{i,t}
 &=
-\operatorname{TextProjector}
+\operatorname{TFT}
+\left([h^P_{i,t};\bar x^C_{i,t}],X^M_{i,t-31:t}\right),\\
+\widehat H^T_{i,t}
+&=
+\operatorname{TextSelfAttention}
 \left(
-z^T_{i,t}
+\left[\operatorname{Adapter}_k(e^{(k)}_{i,t,a})
++\rho_k+\eta_a\right]_{k,a}
+\right),\\
+h^T_{i,t}
+&=
+\operatorname{CrossAttention}
+\left(
+Q=W_Qh^C_{i,t},
+K=\widehat H^T_{i,t},
+V=\widehat H^T_{i,t}
 \right),\\
 u_{i,t}
 &=
-\operatorname{GatedFusion}
+\operatorname{ResidualFusion}
 \left(
-\operatorname{Pool}(H^P_{i,t}),
-\operatorname{Pool}(H^T_{i,t})
+[h^C_{i,t};h^T_{i,t}]
 \right),\\
 p_{i,t}
 &=
@@ -2209,11 +2183,10 @@ p_{i,t}
 }
 \end{equation}
 
-The first implementation will keep TimesFM frozen. The subsequent versions
-will add:
+TimesFM remains frozen, whereas the TFT and the complete text/fusion path are
+trained jointly. Subsequent versions may add:
 
 \begin{enumerate}
-    \item text-to-price cross-attention;
     \item foundation-model forecast and uncertainty features;
     \item LoRA adaptation, if permitted;
     \item cross-sectional attention across stocks.
