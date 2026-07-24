@@ -8,19 +8,11 @@ Attention never crosses forecast dates.
 
 from __future__ import annotations
 
-from stage2_tft_forecasts import (
-    ARTIFACT_DIR,
-    parse_args,
-    run_tft_pipeline,
+from model_config import (
+    CROSS_STOCK_ATTENTION_HEADS,
+    CROSS_STOCK_TFT_OUTPUT_DIR as OUTPUT_DIR,
 )
-
-
-OUTPUT_DIR = (
-    ARTIFACT_DIR
-    / "stage2_pretrained_forecasts"
-    / "timesfm_temporal_tft_cross_stock_unified_raw_text_attention"
-)
-CROSS_STOCK_ATTENTION_HEADS = 4
+from stage2_tft_forecasts import parse_args, run_tft_pipeline
 
 
 def main() -> None:

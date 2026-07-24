@@ -23,72 +23,45 @@ from latent_fusion import (
     parquet_embedding_dim,
     run_walk_forward_fusion,
 )
-
-
-DATA_DIR = Path("data")
-ARTIFACT_DIR = DATA_DIR / "model_artifacts" / "pca_embeddings"
-BASELINE_DIR = ARTIFACT_DIR / "baselines"
-OUTPUT_DIR = (
-    ARTIFACT_DIR
-    / "stage2_pretrained_forecasts"
-    / "timesfm_covariates_unified_raw_text_attention3"
-)
-PRICE_CACHE_DIR = (
-    ARTIFACT_DIR
-    / "stage2_pretrained_forecasts"
-    / "timesfm_simple_concatenation"
-    / "price_latents"
-)
-PREPARED_TRAIN_PATH = ARTIFACT_DIR / "train_features_without_embeddings.parquet"
-PREPARED_TEST_PATH = ARTIFACT_DIR / "test_features_without_embeddings.parquet"
-TRAIN_TARGET_PATH = ARTIFACT_DIR / "train_target.parquet"
-TEST_TARGET_PATH = ARTIFACT_DIR / "test_target.parquet"
-TRAIN_LINK_PATH = ARTIFACT_DIR / "train_text_links.parquet"
-TEST_LINK_PATH = ARTIFACT_DIR / "test_text_links.parquet"
-FOLD_PATH = ARTIFACT_DIR / "walk_forward_assignments.parquet"
-
-PRICE_ENCODER_MODEL_ID = "google/timesfm-2.5-200m-pytorch"
-HORIZON = 20
-LOOKBACK = 512
-MIN_CONTEXT = 64
-TIMESFM_INPUT_COLUMN = "ret_20"
-DEFAULT_TEXT_FAMILIES = ("linq", "qwen") #"bert"
-RAW_TEXT_DIM = 384
-TEXT_ATTENTION_HEADS = 4
-TEXT_ATTENTION_LAYERS = 1
-FUSION_HIDDEN_DIM = 256
-MARKET_DEPTH = 2
-FUSION_DEPTH = 2
-RESIDUAL_EXPANSION = 2
-FUSION_DROPOUT = 0.20
-FUSION_EPOCHS = 100
-PRICE_BATCH_SIZE = 16
-FUSION_BATCH_SIZE = 128
-OPTUNA_TRIALS = 12
-SUBMISSION_YEARS = (2022, 2023)
-EXPECTED_SUBMISSION_ROWS = 52_000
-RANDOM_STATE = 42
-
-ID_COLUMNS = ("row_id", "date", "ticker")
-TEXT_AVAILABILITY_PREFIXES = (
-    "macro_",
-    "sector_category_",
-    "target_company_",
-    "related_company_",
-    "filing_",
-)
-KNOWN_FUTURE_PREFIXES = (
-    "calendar_",
-    "trading_day_",
-    "trading_days_",
-    "days_since_start",
-    "is_month_",
-    "is_first_",
-    "is_last_",
-    "is_quarter_end",
-    "trading_week_fourier_",
-    "month_of_year_fourier_",
-    "trading_month_fourier_",
+from model_config import (
+    BASELINE_DIR,
+    DATA_DIR,
+    DEFAULT_TEXT_FAMILIES,
+    DEFAULT_TRAINING_MODE,
+    EXPECTED_SUBMISSION_ROWS,
+    FOLD_PATH,
+    FUSION_BATCH_SIZE,
+    FUSION_DEPTH,
+    FUSION_DROPOUT,
+    FUSION_EPOCHS,
+    FUSION_HIDDEN_DIM,
+    HORIZON,
+    ID_COLUMNS,
+    KNOWN_FUTURE_PREFIXES,
+    LOOKBACK,
+    MARKET_DEPTH,
+    MIN_CONTEXT,
+    OPTUNA_TRIALS,
+    PREPARED_TEST_PATH,
+    PREPARED_TRAIN_PATH,
+    PRETRAINED_OUTPUT_DIR as OUTPUT_DIR,
+    PRICE_BATCH_SIZE,
+    PRICE_CACHE_DIR,
+    PRICE_ENCODER_MODEL_ID,
+    RANDOM_STATE,
+    RAW_TEST_PATH,
+    RAW_TEXT_DIM,
+    RESIDUAL_EXPANSION,
+    SUBMISSION_YEARS,
+    TEST_LINK_PATH,
+    TEST_TARGET_PATH,
+    TEXT_ATTENTION_HEADS,
+    TEXT_ATTENTION_LAYERS,
+    TEXT_AVAILABILITY_PREFIXES,
+    TIMESFM_INPUT_COLUMN,
+    TRAINING_MODES,
+    TRAIN_LINK_PATH,
+    TRAIN_TARGET_PATH,
 )
 
 
@@ -113,8 +86,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--training-mode",
-        choices=("nested-folds", "full-only"),
-        default="nested-folds",
+        choices=TRAINING_MODES,
+        default=DEFAULT_TRAINING_MODE,
         help=(
             "Run five nested walk-forward folds before the final refit, or "
             "skip them and tune on one purged split of all training data."
@@ -216,7 +189,7 @@ def main() -> None:
         TEST_TARGET_PATH,
         TRAIN_LINK_PATH,
         TEST_LINK_PATH,
-        DATA_DIR / "test.parquet",
+        RAW_TEST_PATH,
     ]
     if args.training_mode == "nested-folds":
         required_paths.append(FOLD_PATH)
@@ -345,7 +318,7 @@ def main() -> None:
         forecast_horizon_weekdays=HORIZON,
         submission_years=SUBMISSION_YEARS,
         expected_submission_rows=EXPECTED_SUBMISSION_ROWS,
-        raw_test_path=DATA_DIR / "test.parquet",
+        raw_test_path=RAW_TEST_PATH,
         seed=RANDOM_STATE,
         raw_text_dim=RAW_TEXT_DIM,
         text_attention_heads=TEXT_ATTENTION_HEADS,

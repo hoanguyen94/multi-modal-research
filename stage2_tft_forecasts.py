@@ -20,10 +20,11 @@ from latent_fusion import (
     parquet_embedding_dim,
     run_walk_forward_fusion,
 )
-from stage2_pretrained_forecasts import (
-    ARTIFACT_DIR,
+from model_config import (
     BASELINE_DIR,
     DATA_DIR,
+    DEFAULT_TEXT_FAMILIES,
+    DEFAULT_TRAINING_MODE,
     EXPECTED_SUBMISSION_ROWS,
     FOLD_PATH,
     FUSION_DEPTH,
@@ -42,58 +43,36 @@ from stage2_pretrained_forecasts import (
     PRICE_CACHE_DIR,
     PRICE_ENCODER_MODEL_ID,
     RANDOM_STATE,
+    RAW_FUSION_BATCH_SIZE,
+    RAW_TEST_PATH,
+    RAW_TEXT_DIM,
     RESIDUAL_EXPANSION,
     SUBMISSION_YEARS,
     TEST_LINK_PATH,
     TEST_TARGET_PATH,
+    TEXT_ATTENTION_HEADS,
+    TEXT_ATTENTION_LAYERS,
+    TFT_ATTENTION_HEADS,
+    TFT_LOOKBACK,
+    TFT_LOOKBACK_CANDIDATES,
+    TFT_OUTPUT_DIR as OUTPUT_DIR,
+    TFT_TEMPORAL_COLUMNS,
     TIMESFM_INPUT_COLUMN,
+    TRAINING_MODES,
     TRAIN_LINK_PATH,
     TRAIN_TARGET_PATH,
+)
+from stage2_pretrained_forecasts import (
     classify_covariates,
     require_paths,
     select_device,
 )
 
 
-OUTPUT_DIR = (
-    ARTIFACT_DIR
-    / "stage2_pretrained_forecasts"
-    / "timesfm_temporal_tft_unified_raw_text_attention"
-)
-
-# Keep the temporal tensor focused on genuinely historical price/market inputs.
-# The full current-origin covariate vector still enters the TFT as static context.
-TFT_TEMPORAL_COLUMNS = (
-    "ret_1",
-    "log_hl_range",
-    "log_close_open",
-    "ret_5",
-    "ret_20",
-    "ret_60",
-    "ret_std_5",
-    "ret_std_20",
-    "ret_std_60",
-    "drawdown_20",
-    "momentum_accel_5",
-    "log_volume",
-    "volume_change_1",
-    "volume_z_20",
-    "ret_1_market_relative",
-    "ret_20_market_relative",
-)
-TFT_LOOKBACK = 32
-TFT_LOOKBACK_CANDIDATES = (16, 20, 32)
-TFT_ATTENTION_HEADS = 4
-RAW_TEXT_DIM = 384
-TEXT_ATTENTION_HEADS = 4
-TEXT_ATTENTION_LAYERS = 1
-RAW_FUSION_BATCH_SIZE = 128
-
-
 def parse_args(description: str | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=description or __doc__)
     parser.add_argument(
-        "--families", nargs="+", default=["bert"],
+        "--families", nargs="+", default=list(DEFAULT_TEXT_FAMILIES),
         help="Original text-embedding families to use.",
     )
     parser.add_argument(
@@ -109,8 +88,8 @@ def parse_args(description: str | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--training-mode",
-        choices=("nested-folds", "full-only"),
-        default="nested-folds",
+        choices=TRAINING_MODES,
+        default=DEFAULT_TRAINING_MODE,
         help=(
             "Run five nested walk-forward folds before the final refit, or "
             "skip them and tune on one purged split of all training data."
@@ -166,7 +145,7 @@ def run_tft_pipeline(
         TEST_TARGET_PATH,
         TRAIN_LINK_PATH,
         TEST_LINK_PATH,
-        DATA_DIR / "test.parquet",
+        RAW_TEST_PATH,
     ]
     if args.training_mode == "nested-folds":
         required_paths.append(FOLD_PATH)
@@ -299,7 +278,7 @@ def run_tft_pipeline(
         forecast_horizon_weekdays=HORIZON,
         submission_years=SUBMISSION_YEARS,
         expected_submission_rows=EXPECTED_SUBMISSION_ROWS,
-        raw_test_path=DATA_DIR / "test.parquet",
+        raw_test_path=RAW_TEST_PATH,
         seed=RANDOM_STATE,
         market_encoder="tft",
         temporal_covariate_columns=TFT_TEMPORAL_COLUMNS,

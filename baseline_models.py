@@ -17,7 +17,6 @@ def main() -> None:
     # Optional baselines: lightgbm, catboost, xgboost, and tabpfn.
     
     
-    from pathlib import Path
     from importlib.util import find_spec
     import gc
     import json
@@ -31,22 +30,26 @@ def main() -> None:
     from sklearn.metrics import accuracy_score, balanced_accuracy_score, brier_score_loss, roc_auc_score
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
+    from model_config import (
+        ARTIFACT_DIR,
+        EMBEDDING_EXPORT,
+        EXPECTED_SUBMISSION_ROWS,
+        FOLD_PATH,
+        FORECAST_HORIZON_WEEKDAYS,
+        RANDOM_STATE,
+        RAW_TEST_PATH,
+        SUBMISSION_YEARS,
+        TEST_TARGET_PATH,
+        TRAIN_TARGET_PATH,
+    )
     from utils import directional_classification_metrics, predicted_direction, probability_to_direction_score, probability_to_price
     
     warnings.filterwarnings("ignore", category=FutureWarning)
     pl.Config.set_tbl_cols(100)
     
-    DATA_DIR = Path("data")
-    RAW_TEST_PATH = DATA_DIR / "test.parquet"
-    EMBEDDING_EXPORT = "pca_embeddings"  # no_embeddings | pca_embeddings | original_embeddings
     FEATURE_REPRESENTATION = "article_mean_embeddings"  # without_embeddings | article_mean_embeddings
-    ARTIFACT_DIR = DATA_DIR / "model_artifacts" / EMBEDDING_EXPORT
-    RANDOM_STATE = 42
     TABPFN_MAX_TRAIN_ROWS = None  # None uses all fold/full-training rows; set an integer only for a capped experiment
     TABPFN_PREDICT_BATCH_SIZE = 2_048
-    FORECAST_HORIZON_WEEKDAYS = 20
-    SUBMISSION_YEARS = (2022, 2023)
-    EXPECTED_SUBMISSION_ROWS = 52_000
     DECISION_THRESHOLDS = tuple(np.round(np.arange(0.35, 0.651, 0.05), 2))
     SELECTION_METRIC = "tuned_mean_balanced_accuracy"
     SELECTION_STD_METRIC = "tuned_std_balanced_accuracy"
@@ -69,9 +72,7 @@ def main() -> None:
     else:
         raise ValueError("Unknown FEATURE_REPRESENTATION.")
     
-    TARGET_PATH = ARTIFACT_DIR / "train_target.parquet"
-    TEST_TARGET_PATH = ARTIFACT_DIR / "test_target.parquet"
-    FOLD_PATH = ARTIFACT_DIR / "walk_forward_assignments.parquet"
+    TARGET_PATH = TRAIN_TARGET_PATH
     OUTPUT_DIR = ARTIFACT_DIR / "baselines" / FEATURE_TAG
     print(f"Training feature input: {FEATURE_PATH}")
     print(f"Test feature input: {TEST_FEATURE_PATH}")
