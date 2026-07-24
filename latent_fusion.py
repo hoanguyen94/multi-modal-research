@@ -1409,10 +1409,6 @@ def _raw_fusion_validation_metrics(
     was_training = model.training
     model.eval()
     loss_sum = 0.0
-    positive_loss_sum = 0.0
-    negative_loss_sum = 0.0
-    positive_count = 0
-    negative_count = 0
     score = np.empty(len(target), dtype=np.float32)
     for batch_indices in _fusion_batches(
         len(target),
@@ -1449,35 +1445,17 @@ def _raw_fusion_validation_metrics(
             logits, y, reduction="none"
         )
         loss_sum += float(per_example_loss.sum().cpu())
-        positive = y > 0.5
-        negative = ~positive
-        positive_loss_sum += float(
-            per_example_loss[positive].sum().cpu()
-        )
-        negative_loss_sum += float(
-            per_example_loss[negative].sum().cpu()
-        )
-        positive_count += int(positive.sum().item())
-        negative_count += int(negative.sum().item())
         score[batch_indices] = torch.sigmoid(logits).cpu().numpy()
     if was_training:
         model.train()
     truth = target.astype(np.int8, copy=False)
     prediction = (score >= 0.5).astype(np.int8)
-    if not positive_count or not negative_count:
-        raise ValueError(
-            "Balanced validation BCE requires both target classes"
-        )
     optimized_threshold = _best_validation_threshold(truth, score)
     optimized_prediction = (
         score >= optimized_threshold
     ).astype(np.int8)
     return {
         "validation_bce": loss_sum / len(target),
-        "validation_balanced_bce": 0.5 * (
-            positive_loss_sum / positive_count
-            + negative_loss_sum / negative_count
-        ),
         "validation_accuracy": float(accuracy_score(truth, prediction)),
         "validation_balanced_accuracy": float(
             balanced_accuracy_score(truth, prediction)
@@ -1524,16 +1502,6 @@ def _plot_fold_training_diagnostics(
             epoch, part["validation_bce"].to_numpy(),
             color=color, linestyle="--", label=f"Fold {fold} validation",
         )
-        axes[0].plot(
-            epoch, part["train_balanced_bce"].to_numpy(),
-            color=color, linestyle=":", alpha=0.8,
-            label=f"Fold {fold} train balanced",
-        )
-        axes[0].plot(
-            epoch, part["validation_balanced_bce"].to_numpy(),
-            color=color, linestyle="-.", alpha=0.8,
-            label=f"Fold {fold} validation balanced",
-        )
         axes[1].plot(
             epoch, part["validation_accuracy"].to_numpy(),
             color=color, linestyle=":", label=f"Fold {fold} accuracy",
@@ -1569,7 +1537,7 @@ def _plot_inner_selection_diagnostics(
     history: pl.DataFrame,
     output_path: Path,
 ) -> None:
-    """Plot the selected trial's curves across rolling inner windows."""
+    """Plot the selected trial's curves on the inner-validation split."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -1577,12 +1545,11 @@ def _plot_inner_selection_diagnostics(
     except ImportError:
         return
     required = {
-        "inner_window",
         "epoch",
         "train_bce",
         "validation_bce",
-        "train_balanced_bce",
-        "validation_balanced_bce",
+        "validation_accuracy",
+        "validation_balanced_accuracy",
     }
     if not required <= set(history.columns):
         raise ValueError(
@@ -1590,47 +1557,39 @@ def _plot_inner_selection_diagnostics(
         )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-    colors = plt.get_cmap("tab10")
-    windows = history["inner_window"].unique().sort().to_list()
-    for color_index, window in enumerate(windows):
-        part = history.filter(
-            pl.col("inner_window") == window
-        ).sort("epoch")
-        epoch = part["epoch"].to_numpy()
-        color = colors(color_index % 10)
-        axes[0].plot(
-            epoch,
-            part["train_bce"].to_numpy(),
-            color=color,
-            linestyle="-",
-            label=f"Window {int(window)} train",
-        )
-        axes[0].plot(
-            epoch,
-            part["validation_bce"].to_numpy(),
-            color=color,
-            linestyle="--",
-            label=f"Window {int(window)} validation",
-        )
-        axes[1].plot(
-            epoch,
-            part["train_balanced_bce"].to_numpy(),
-            color=color,
-            linestyle="-",
-            label=f"Window {int(window)} train",
-        )
-        axes[1].plot(
-            epoch,
-            part["validation_balanced_bce"].to_numpy(),
-            color=color,
-            linestyle="--",
-            label=f"Window {int(window)} validation",
-        )
-    axes[0].set_title("Selected trial: unweighted BCE")
-    axes[1].set_title("Selected trial: class-balanced BCE")
+    part = history.sort("epoch")
+    epoch = part["epoch"].to_numpy()
+    axes[0].plot(
+        epoch,
+        part["train_bce"].to_numpy(),
+        linestyle="-",
+        label="Inner train",
+    )
+    axes[0].plot(
+        epoch,
+        part["validation_bce"].to_numpy(),
+        linestyle="--",
+        label="Inner validation",
+    )
+    axes[1].plot(
+        epoch,
+        part["validation_accuracy"].to_numpy(),
+        linestyle="-",
+        label="Validation accuracy",
+    )
+    axes[1].plot(
+        epoch,
+        part["validation_balanced_accuracy"].to_numpy(),
+        linestyle="--",
+        label="Validation balanced accuracy",
+    )
+    axes[0].set_title("Selected trial: BCE")
+    axes[1].set_title("Selected trial: directional metrics")
+    axes[0].set_ylabel("Binary cross-entropy")
+    axes[1].set_ylabel("Score")
+    axes[1].set_ylim(0.0, 1.0)
     for axis in axes:
         axis.set_xlabel("Epoch")
-        axis.set_ylabel("Binary cross-entropy")
         axis.grid(alpha=0.25)
         axis.legend(fontsize=8, ncol=2)
     fig.tight_layout()
@@ -1806,11 +1765,6 @@ def fit_raw_fusion_model(
         },
     ], weight_decay=weight_decay)
     positive_count = int((target > 0.5).sum())
-    negative_count = int(len(target) - positive_count)
-    if not positive_count or not negative_count:
-        raise ValueError("Balanced training BCE requires both target classes")
-    positive_weight = len(target) / (2.0 * positive_count)
-    negative_weight = len(target) / (2.0 * negative_count)
     rng = np.random.default_rng(seed)
     history: list[dict[str, float]] = []
     best_validation_metric = float("inf")
@@ -1820,7 +1774,6 @@ def fit_raw_fusion_model(
     for epoch in range(1, epochs + 1):
         model.train()
         train_bce_sum = 0.0
-        train_balanced_bce_sum = 0.0
         train_example_count = 0
         for batch_indices in _fusion_batches(
             len(target),
@@ -1859,16 +1812,11 @@ def fit_raw_fusion_model(
                 )
             else:
                 logits = model(p, c, articles, masks)
-            loss = F.binary_cross_entropy_with_logits(
+            per_example_loss = F.binary_cross_entropy_with_logits(
                 logits, y, reduction="none"
             )
-            # class_weights = torch.where(
-            #     y > 0.5,
-            #     torch.full_like(y, positive_weight),
-            #     torch.full_like(y, negative_weight),
-            # )
-            # loss = (per_example_loss * class_weights).mean()
-            if not torch.isfinite(loss):
+            loss = per_example_loss.mean()
+            if not torch.isfinite(loss).item():
                 raise FloatingPointError(
                     f"Raw fusion loss became non-finite in epoch {epoch}"
                 )
@@ -1876,21 +1824,14 @@ def fit_raw_fusion_model(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             train_bce_sum += float(
-                loss.detach().sum().cpu()
-            )
-            train_balanced_bce_sum += (
-                float(loss.detach().cpu()) * len(batch_indices)
+                per_example_loss.detach().sum().cpu()
             )
             train_example_count += len(batch_indices)
         train_bce = train_bce_sum / max(train_example_count, 1)
-        train_balanced_bce = (
-            train_balanced_bce_sum / max(train_example_count, 1)
-        )
         epoch_metrics = {
             "epoch": float(epoch),
             "bce": float(train_bce),
             "train_bce": float(train_bce),
-            "train_balanced_bce": float(train_balanced_bce),
             "train_positive_rate": float(positive_count / len(target)),
         }
         if has_validation:
@@ -1913,9 +1854,7 @@ def fit_raw_fusion_model(
             ))
         history.append(epoch_metrics)
         if has_validation and select_best_checkpoint:
-            current_validation_metric = epoch_metrics[
-                "validation_balanced_bce"
-            ]
+            current_validation_metric = epoch_metrics["validation_bce"]
             if (
                 current_validation_metric
                 < best_validation_metric - float(early_stopping_min_delta)
@@ -2803,9 +2742,10 @@ def _best_validation_threshold(
         truth, score, drop_intermediate=False
     )
     finite = np.isfinite(thresholds)
-    thresholds = thresholds[finite]
+    thresholds = thresholds.copy()
+    thresholds[~finite] = np.nextafter(score.max(), np.inf)
     balanced_accuracy = 0.5 * (
-        true_positive_rate[finite] + 1.0 - false_positive_rate[finite]
+        true_positive_rate + 1.0 - false_positive_rate
     )
     best = np.flatnonzero(np.isclose(
         balanced_accuracy,
@@ -2857,6 +2797,7 @@ def _purged_inner_positions(
         raise ValueError("Inner training period is too short after purging")
     train_end_date = dates[train_end_position - 1]
     validation_start_date = dates[validation_start_position]
+    validation_end_date = dates[-1]
     row_dates = index["date"].to_numpy()
     train_positions = np.flatnonzero(row_dates <= train_end_date)
     validation_positions = np.flatnonzero(row_dates >= validation_start_date)
@@ -2870,94 +2811,9 @@ def _purged_inner_positions(
         "inner_validation_dates": int(validation_dates),
         "inner_train_end": train_end_date,
         "inner_validation_start": validation_start_date,
+        "inner_validation_end": validation_end_date,
     }
     return train_positions, validation_positions, manifest
-
-
-def _purged_inner_windows(
-    index: pl.DataFrame,
-    purge_dates: int,
-    window_count: int = 3,
-    validation_fraction: float = 0.20,
-    minimum_train_dates: int = 60,
-    minimum_validation_dates: int = 20,
-) -> tuple[list[tuple[np.ndarray, np.ndarray, dict]], dict]:
-    """Create expanding-train, purged rolling validation windows."""
-    if window_count < 1:
-        raise ValueError("Inner validation window_count must be positive")
-    if not 0.0 < validation_fraction < 1.0:
-        raise ValueError("Inner validation fraction must be between zero and one")
-    dates = index["date"].unique().sort().to_list()
-    available_dates = (
-        len(dates) - int(minimum_train_dates) - int(purge_dates)
-    )
-    validation_dates = min(
-        int(np.ceil(len(dates) * validation_fraction)),
-        available_dates // int(window_count),
-    )
-    if validation_dates < minimum_validation_dates:
-        raise ValueError(
-            "Not enough dates for the requested purged inner windows"
-        )
-    first_validation_start = len(dates) - window_count * validation_dates
-    row_dates = index["date"].to_numpy()
-    windows: list[tuple[np.ndarray, np.ndarray, dict]] = []
-    manifests: list[dict] = []
-    for window_index in range(window_count):
-        validation_start_position = (
-            first_validation_start + window_index * validation_dates
-        )
-        validation_end_position = (
-            validation_start_position + validation_dates
-        )
-        train_end_position = validation_start_position - int(purge_dates)
-        if train_end_position < minimum_train_dates:
-            raise ValueError(
-                "Inner training period is too short after purging"
-            )
-        train_end_date = dates[train_end_position - 1]
-        validation_start_date = dates[validation_start_position]
-        validation_end_date = dates[validation_end_position - 1]
-        train_positions = np.flatnonzero(row_dates <= train_end_date)
-        validation_positions = np.flatnonzero(
-            (row_dates >= validation_start_date)
-            & (row_dates <= validation_end_date)
-        )
-        manifest = {
-            "inner_window": int(window_index + 1),
-            "inner_train_rows": int(len(train_positions)),
-            "inner_validation_rows": int(len(validation_positions)),
-            "inner_train_dates": int(train_end_position),
-            "purged_dates": int(purge_dates),
-            "inner_validation_dates": int(validation_dates),
-            "inner_train_end": train_end_date,
-            "inner_validation_start": validation_start_date,
-            "inner_validation_end": validation_end_date,
-        }
-        windows.append((train_positions, validation_positions, manifest))
-        manifests.append(manifest)
-    aggregate_manifest = {
-        "inner_windows": int(window_count),
-        "inner_train_rows": manifests[-1]["inner_train_rows"],
-        "inner_validation_rows": int(sum(
-            manifest["inner_validation_rows"] for manifest in manifests
-        )),
-        "inner_train_dates": manifests[-1]["inner_train_dates"],
-        "purged_dates": int(purge_dates),
-        "inner_validation_dates": int(validation_dates),
-        "inner_train_end": manifests[-1]["inner_train_end"],
-        "inner_validation_start": manifests[0]["inner_validation_start"],
-        "inner_validation_end": manifests[-1]["inner_validation_end"],
-        "windows_json": json.dumps([
-            {
-                key: str(value)
-                if key.endswith(("_end", "_start")) else value
-                for key, value in manifest.items()
-            }
-            for manifest in manifests
-        ], sort_keys=True),
-    }
-    return windows, aggregate_manifest
 
 
 def _slice_raw_fusion_arrays(
@@ -3019,7 +2875,6 @@ def run_walk_forward_fusion(
     text_attention_layers: int = 1,
     cross_stock_attention: bool = False,
     cross_stock_attention_heads: int = 4,
-    inner_validation_windows: int = 3,
     run_outer_folds: bool = True,
 ) -> dict[str, pl.DataFrame]:
     """Optionally run nested outer folds, then select and refit on all data."""
@@ -3039,8 +2894,6 @@ def run_walk_forward_fusion(
         raise ValueError("fusion_dropout must be in [0, 1)")
     if tuning_trials < 0:
         raise ValueError("tuning_trials cannot be negative")
-    if inner_validation_windows < 1:
-        raise ValueError("inner_validation_windows must be positive")
     if forecast_horizon_weekdays < 1:
         raise ValueError("forecast_horizon_weekdays must be positive")
     if not submission_years:
@@ -3187,13 +3040,19 @@ def run_walk_forward_fusion(
     (output_dir / "training_mode.json").write_text(json.dumps({
         "run_outer_folds": bool(run_outer_folds),
         "mode": "nested-folds" if run_outer_folds else "full-only",
-        "final_selection": "rolling_purged_inner_validation",
-        "inner_validation_windows": int(inner_validation_windows),
-        "training_loss": "class_balanced_bce",
-        "checkpoint_metric": "validation_balanced_bce",
+        "final_selection": "purged_inner_validation",
+        "inner_validation_splits": 1,
+        "training_loss": "binary_cross_entropy",
+        "checkpoint_metric": "validation_bce",
+        "optuna_objective": "negative_validation_bce",
         "early_stopping_patience": 10,
         "early_stopping_min_delta": 1e-5,
-        "threshold_selection": "pooled_exact_balanced_accuracy",
+        "epoch_selection": (
+            "post_optuna_inner_validation"
+            if tune_hyperparameters and tuning_trials > 0 else
+            "fixed_configuration_inner_validation"
+        ),
+        "threshold_selection": "exact_inner_validation_balanced_accuracy",
         "cross_stock_attention": bool(cross_stock_attention),
     }, indent=2))
     if not covariate_columns:
@@ -3286,7 +3145,7 @@ def run_walk_forward_fusion(
         ),
     }
     study_signature = hashlib.sha256(json.dumps({
-        "selection_protocol_version": 3,
+        "selection_protocol_version": 7,
         "market_encoder": market_encoder,
         "families": families,
         "family_dims": {
@@ -3317,13 +3176,15 @@ def run_walk_forward_fusion(
         ),
         "seed": int(seed),
         "optuna_pruning": "none",
-        "inner_validation_windows": int(inner_validation_windows),
-        "checkpoint_metric": "validation_balanced_bce",
+        "inner_validation_splits": 1,
+        "checkpoint_metric": "validation_bce",
+        "optuna_objective": "negative_validation_bce",
         "early_stopping_patience": 10,
         "early_stopping_min_delta": 1e-5,
-        "training_loss": "class_balanced_bce",
+        "training_loss": "binary_cross_entropy",
         "adapter_learning_rate_multiplier": 0.1,
-        "threshold_selection": "pooled_exact_balanced_accuracy",
+        "epoch_selection": "post_optuna_inner_validation",
+        "threshold_selection": "exact_inner_validation_balanced_accuracy",
         "training_data_fingerprints": training_data_fingerprints,
         "train_target_rows": int(train_targets.height),
         "train_price_latent_rows": int(train_price_latents.height),
@@ -3496,86 +3357,82 @@ def run_walk_forward_fusion(
 
     inner_split_cache: dict[
         str,
-        tuple[list[tuple[np.ndarray, np.ndarray, dict]], dict],
+        tuple[np.ndarray, np.ndarray, dict],
     ] = {}
 
-    def ensure_inner_windows(
+    def ensure_inner_split(
         scope_name: str,
         base_arrays: tuple,
-    ) -> tuple[list[tuple[np.ndarray, np.ndarray, dict]], dict]:
+    ) -> tuple[np.ndarray, np.ndarray, dict]:
         if scope_name not in inner_split_cache:
-            inner_split_cache[scope_name] = _purged_inner_windows(
+            inner_split_cache[scope_name] = _purged_inner_positions(
                 base_arrays[0],
                 purge_dates=forecast_horizon_weekdays,
-                window_count=inner_validation_windows,
             )
         return inner_split_cache[scope_name]
 
-    def inner_candidate_windows(
+    def inner_candidate_data(
         scope_name: str,
         base_arrays: tuple,
         raw_covariates: np.ndarray,
         raw_sequence: np.ndarray | None,
         raw_padding: np.ndarray | None,
         lookback: int | None,
-    ) -> tuple[list[tuple], dict]:
-        """Prepare rolling purged windows using training-only scalers."""
-        split_windows, aggregate_manifest = ensure_inner_windows(
-            scope_name, base_arrays
-        )
-        prepared_windows = []
-        for window_index, (
+    ) -> tuple:
+        """Prepare the purged inner split using training-only scalers."""
+        (
             train_positions,
             validation_positions,
             manifest,
-        ) in enumerate(split_windows, start=1):
-            inner_train = _slice_raw_fusion_arrays(
-                base_arrays, train_positions
-            )
-            inner_validation = _slice_raw_fusion_arrays(
-                base_arrays, validation_positions
-            )
-            covariate_scaler = _fit_covariate_scaler(
-                raw_covariates[train_positions]
-            )
-            inner_train_cov = _apply_covariate_scaler(
-                raw_covariates[train_positions], covariate_scaler
-            )
-            inner_validation_cov = _apply_covariate_scaler(
-                raw_covariates[validation_positions], covariate_scaler
-            )
-            train_sequence = train_padding = None
-            validation_sequence = validation_padding = None
-            temporal_scaler = None
-            if market_encoder == "tft":
-                (
-                    train_sequence,
-                    train_padding,
-                    validation_sequence,
-                    validation_padding,
-                    temporal_scaler,
-                ) = scaled_temporal_view(
-                    f"inner_{scope_name}_window_{window_index}",
-                    raw_sequence[train_positions],
-                    raw_padding[train_positions],
-                    raw_sequence[validation_positions],
-                    raw_padding[validation_positions],
-                    int(lookback),
-                )
-            prepared_windows.append((
-                inner_train,
-                inner_validation,
-                inner_train_cov,
-                inner_validation_cov,
+        ) = ensure_inner_split(
+            scope_name, base_arrays
+        )
+        inner_train = _slice_raw_fusion_arrays(
+            base_arrays, train_positions
+        )
+        inner_validation = _slice_raw_fusion_arrays(
+            base_arrays, validation_positions
+        )
+        covariate_scaler = _fit_covariate_scaler(
+            raw_covariates[train_positions]
+        )
+        inner_train_cov = _apply_covariate_scaler(
+            raw_covariates[train_positions], covariate_scaler
+        )
+        inner_validation_cov = _apply_covariate_scaler(
+            raw_covariates[validation_positions], covariate_scaler
+        )
+        train_sequence = train_padding = None
+        validation_sequence = validation_padding = None
+        temporal_scaler = None
+        if market_encoder == "tft":
+            (
                 train_sequence,
                 train_padding,
                 validation_sequence,
                 validation_padding,
-                covariate_scaler,
                 temporal_scaler,
-                manifest,
-            ))
-        return prepared_windows, aggregate_manifest
+            ) = scaled_temporal_view(
+                f"inner_{scope_name}",
+                raw_sequence[train_positions],
+                raw_padding[train_positions],
+                raw_sequence[validation_positions],
+                raw_padding[validation_positions],
+                int(lookback),
+            )
+        return (
+            inner_train,
+            inner_validation,
+            inner_train_cov,
+            inner_validation_cov,
+            train_sequence,
+            train_padding,
+            validation_sequence,
+            validation_padding,
+            covariate_scaler,
+            temporal_scaler,
+            manifest,
+        )
 
     def sampled_hyperparameters(trial) -> dict:
         params = {
@@ -3612,13 +3469,33 @@ def run_walk_forward_fusion(
         raw_padding: np.ndarray | None,
         params: dict,
         candidate_seed: int,
-    ) -> tuple[nn.Module, list[dict[str, float]], float, float, dict]:
-        """Evaluate one configuration over rolling purged inner windows."""
+        calibrate_threshold: bool = True,
+    ) -> tuple[
+        nn.Module,
+        list[dict[str, float]],
+        float,
+        float,
+        float,
+        dict,
+    ]:
+        """Evaluate one configuration on the purged inner split."""
         lookback = (
             int(params["temporal_lookback"])
             if market_encoder == "tft" else None
         )
-        prepared_windows, manifest = inner_candidate_windows(
+        (
+            inner_train,
+            inner_validation,
+            inner_train_cov,
+            inner_validation_cov,
+            train_sequence,
+            train_padding,
+            validation_sequence,
+            validation_padding,
+            _,
+            _,
+            manifest,
+        ) = inner_candidate_data(
             scope_name,
             base_arrays,
             raw_covariates,
@@ -3626,59 +3503,54 @@ def run_walk_forward_fusion(
             raw_padding,
             lookback,
         )
-        combined_history: list[dict[str, float]] = []
-        validation_truths: list[np.ndarray] = []
-        validation_scores: list[np.ndarray] = []
-        window_best_epochs: list[int] = []
-        last_model: nn.Module | None = None
-        for window_index, prepared in enumerate(
-            prepared_windows, start=1
-        ):
-            (
-                inner_train,
-                inner_validation,
-                inner_train_cov,
-                inner_validation_cov,
-                train_sequence,
-                train_padding,
-                validation_sequence,
-                validation_padding,
-                _,
-                _,
-                _,
-            ) = prepared
-            model, history = fit_raw_fusion_model(
-                inner_train[1],
-                inner_train_cov,
-                inner_train[2],
-                stores,
-                inner_train[4],
-                device,
-                text_dim=raw_text_dim,
-                batch_size=fusion_batch_size,
-                seed=candidate_seed + 100 * window_index,
-                market_encoder=market_encoder,
-                market_sequence=train_sequence,
-                sequence_padding_mask=train_padding,
-                market_attention_heads=tft_attention_heads,
-                text_attention_heads=text_attention_heads,
-                text_attention_layers=text_attention_layers,
-                cross_stock_attention=cross_stock_attention,
-                cross_stock_attention_heads=cross_stock_attention_heads,
-                stock_group_ids=stock_groups(inner_train[0]),
-                validation_price=inner_validation[1],
-                validation_covariates=inner_validation_cov,
-                validation_text_indices=inner_validation[2],
-                validation_target=inner_validation[4],
-                validation_market_sequence=validation_sequence,
-                validation_sequence_padding_mask=validation_padding,
-                validation_stock_group_ids=stock_groups(
-                    inner_validation[0]
-                ),
-                adapter_learning_rate_multiplier=0.1,
-                select_best_checkpoint=True,
-                **model_fit_params(params),
-            )
+        model, history = fit_raw_fusion_model(
+            inner_train[1],
+            inner_train_cov,
+            inner_train[2],
+            stores,
+            inner_train[4],
+            device,
+            text_dim=raw_text_dim,
+            batch_size=fusion_batch_size,
+            seed=candidate_seed,
+            market_encoder=market_encoder,
+            market_sequence=train_sequence,
+            sequence_padding_mask=train_padding,
+            market_attention_heads=tft_attention_heads,
+            text_attention_heads=text_attention_heads,
+            text_attention_layers=text_attention_layers,
+            cross_stock_attention=cross_stock_attention,
+            cross_stock_attention_heads=cross_stock_attention_heads,
+            stock_group_ids=stock_groups(inner_train[0]),
+            validation_price=inner_validation[1],
+            validation_covariates=inner_validation_cov,
+            validation_text_indices=inner_validation[2],
+            validation_target=inner_validation[4],
+            validation_market_sequence=validation_sequence,
+            validation_sequence_padding_mask=validation_padding,
+            validation_stock_group_ids=stock_groups(
+                inner_validation[0]
+            ),
+            adapter_learning_rate_multiplier=0.1,
+            select_best_checkpoint=True,
+            **model_fit_params(params),
+        )
+        selected_epoch = int(history[0]["best_epoch"])
+        selected_history_row = next(
+            row for row in history
+            if int(row["epoch"]) == selected_epoch
+        )
+        optuna_objective = -float(
+            selected_history_row["validation_bce"]
+        )
+        for row in history:
+            row["calibration_best_epoch"] = float(selected_epoch)
+            row["selected_epoch"] = float(selected_epoch)
+        threshold = 0.5
+        inner_balanced_accuracy = float(
+            selected_history_row["validation_balanced_accuracy"]
+        )
+        if calibrate_threshold:
             score = predict_raw_fusion(
                 model,
                 inner_validation[1],
@@ -3692,64 +3564,32 @@ def run_walk_forward_fusion(
                 cross_stock_attention=cross_stock_attention,
                 stock_group_ids=stock_groups(inner_validation[0]),
             )
-            window_best_epoch = int(history[0]["best_epoch"])
-            window_best_epochs.append(window_best_epoch)
-            train_positive_rate = float(inner_train[4].mean())
-            validation_positive_rate = float(
-                inner_validation[4].mean()
+            validation_truth = inner_validation[4].astype(np.int8)
+            threshold = _best_validation_threshold(
+                validation_truth, score
             )
-            for row in history:
-                row["inner_window"] = float(window_index)
-                row["window_best_epoch"] = float(window_best_epoch)
-                row["train_positive_rate"] = train_positive_rate
-                row["validation_positive_rate"] = (
-                    validation_positive_rate
-                )
-            combined_history.extend(history)
-            validation_truths.append(
-                inner_validation[4].astype(np.int8)
-            )
-            validation_scores.append(score)
-            if last_model is not None:
-                del last_model
-            last_model = model
-        selected_epoch = max(
-            1,
-            int(np.floor(np.median(window_best_epochs) + 0.5)),
-        )
-        for row in combined_history:
-            row["selected_epoch"] = float(selected_epoch)
-        pooled_truth = np.concatenate(validation_truths)
-        pooled_score = np.concatenate(validation_scores)
-        threshold = _best_validation_threshold(
-            pooled_truth, pooled_score
-        )
-        window_balanced_accuracies = [
-            float(balanced_accuracy_score(
-                truth,
+            inner_balanced_accuracy = float(balanced_accuracy_score(
+                validation_truth,
                 (score >= threshold).astype(np.int8),
             ))
-            for truth, score in zip(
-                validation_truths, validation_scores
-            )
-        ]
-        mean_balanced_accuracy = float(
-            np.mean(window_balanced_accuracies)
-        )
         manifest = {
             **manifest,
-            "window_best_epochs": json.dumps(window_best_epochs),
+            "inner_best_epoch": selected_epoch,
             "selected_epoch": selected_epoch,
-            "pooled_decision_threshold": float(threshold),
-            "mean_window_balanced_accuracy": mean_balanced_accuracy,
+            "decision_threshold": float(threshold),
+            "inner_balanced_accuracy": inner_balanced_accuracy,
+            "threshold_calibrated": bool(calibrate_threshold),
+            "optuna_objective_name": (
+                "negative_validation_bce"
+            ),
+            "optuna_objective_value": optuna_objective,
         }
-        if last_model is None:
-            raise RuntimeError("No inner-validation model was trained")
         return (
-            last_model,
-            combined_history,
+            model,
+            history,
             threshold,
-            mean_balanced_accuracy,
+            inner_balanced_accuracy,
+            optuna_objective,
             manifest,
         )
 
@@ -3763,18 +3603,16 @@ def run_walk_forward_fusion(
         study_name: str,
         study_seed: int,
     ) -> tuple[dict, float, pl.DataFrame, dict]:
-        """Select configuration, checkpoint epoch, and threshold internally."""
-        split_windows, base_manifest = ensure_inner_windows(
-            scope_name, base_arrays
-        )
+        """Tune non-epoch parameters, then calibrate epoch and threshold."""
+        _, _, split_manifest = ensure_inner_split(scope_name, base_arrays)
         history_dir = (
             output_dir / "inner_selection_histories" / scope_name
         )
         history_dir.mkdir(parents=True, exist_ok=True)
-        pl.DataFrame([
-            manifest for _, _, manifest in split_windows
-        ], infer_schema_length=None).write_csv(
-            history_dir / "split_windows.csv"
+        pl.DataFrame(
+            [split_manifest], infer_schema_length=None
+        ).write_csv(
+            history_dir / "inner_split.csv"
         )
         if tune_hyperparameters and tuning_trials > 0:
             try:
@@ -3800,9 +3638,10 @@ def run_walk_forward_fusion(
                 (
                     model,
                     history,
-                    threshold,
-                    score,
-                    candidate_manifest,
+                    _,
+                    inner_balanced_accuracy,
+                    optuna_objective,
+                    _,
                 ) = fit_inner_candidate(
                     scope_name=scope_name,
                     base_arrays=base_arrays,
@@ -3813,13 +3652,19 @@ def run_walk_forward_fusion(
                     # Use common random numbers so Optuna compares model
                     # configurations rather than different initializations.
                     candidate_seed=study_seed,
+                    calibrate_threshold=False,
                 )
                 best_epoch = int(history[0]["selected_epoch"])
-                trial.set_user_attr("best_epoch", best_epoch)
-                trial.set_user_attr("decision_threshold", float(threshold))
                 trial.set_user_attr(
-                    "window_best_epochs",
-                    candidate_manifest["window_best_epochs"],
+                    "trial_diagnostic_epoch", best_epoch
+                )
+                trial.set_user_attr(
+                    "trial_balanced_accuracy_at_0_5",
+                    float(inner_balanced_accuracy),
+                )
+                trial.set_user_attr(
+                    "trial_validation_bce",
+                    -float(optuna_objective),
                 )
                 pl.DataFrame(history).with_columns(
                     pl.lit(scope_name).alias("scope"),
@@ -3831,12 +3676,10 @@ def run_walk_forward_fusion(
                 gc.collect()
                 if device == "mps":
                     torch.mps.empty_cache()
-                return score
+                return optuna_objective
 
             completed_before = sum(
                 trial.state == optuna.trial.TrialState.COMPLETE
-                and "best_epoch" in trial.user_attrs
-                and "decision_threshold" in trial.user_attrs
                 for trial in study.trials
             )
             remaining_trials = max(
@@ -3850,11 +3693,7 @@ def run_walk_forward_fusion(
                 )
             complete_trials = [
                 trial for trial in study.trials
-                if (
-                    trial.state == optuna.trial.TrialState.COMPLETE
-                    and "best_epoch" in trial.user_attrs
-                    and "decision_threshold" in trial.user_attrs
-                )
+                if trial.state == optuna.trial.TrialState.COMPLETE
             ]
             if not complete_trials:
                 raise RuntimeError(
@@ -3863,49 +3702,93 @@ def run_walk_forward_fusion(
             best_trial = max(
                 complete_trials, key=lambda trial: float(trial.value)
             )
-            best_params = {
+            winning_params = {
                 **default_params,
                 **best_trial.params,
-                "epochs": int(best_trial.user_attrs["best_epoch"]),
+                # Epoch is deliberately not inherited from the Optuna trial.
+                "epochs": int(fusion_epochs),
             }
-            threshold = float(
-                best_trial.user_attrs["decision_threshold"]
+            (
+                calibration_model,
+                calibration_history,
+                threshold,
+                calibration_inner_balanced_accuracy,
+                _,
+                manifest,
+            ) = fit_inner_candidate(
+                scope_name=scope_name,
+                base_arrays=base_arrays,
+                raw_covariates=raw_covariates,
+                raw_sequence=raw_sequence,
+                raw_padding=raw_padding,
+                params=winning_params,
+                # Calibrate epoch/threshold with a fresh initialization after
+                # Optuna has finished selecting all other hyperparameters.
+                candidate_seed=study_seed + 5_000_000,
             )
+            selected_epoch = int(
+                calibration_history[0]["selected_epoch"]
+            )
+            best_params = {
+                **winning_params,
+                "epochs": selected_epoch,
+            }
+            calibration_history_frame = pl.DataFrame(
+                calibration_history
+            ).with_columns(
+                pl.lit(scope_name).alias("scope"),
+                pl.lit(best_trial.number).cast(pl.Int64).alias(
+                    "optuna_best_trial"
+                ),
+                pl.lit("post_optuna_epoch_calibration").alias("phase"),
+            )
+            selected_history_path = (
+                history_dir / "post_optuna_epoch_calibration.csv"
+            )
+            calibration_history_frame.write_csv(selected_history_path)
+            del calibration_model
+            gc.collect()
+            if device == "mps":
+                torch.mps.empty_cache()
             rows = [{
                 "scope": scope_name,
                 "trial": trial.number,
                 "state": trial.state.name,
-                "inner_balanced_accuracy": trial.value,
-                "best_epoch": trial.user_attrs.get("best_epoch"),
-                "decision_threshold": trial.user_attrs.get(
-                    "decision_threshold"
+                "optuna_objective": trial.value,
+                "validation_bce": trial.user_attrs.get(
+                    "trial_validation_bce"
                 ),
-                "window_best_epochs": trial.user_attrs.get(
-                    "window_best_epochs"
+                "trial_balanced_accuracy_at_0_5": trial.user_attrs.get(
+                    "trial_balanced_accuracy_at_0_5"
+                ),
+                "trial_diagnostic_epoch": trial.user_attrs.get(
+                    "trial_diagnostic_epoch"
                 ),
                 "params_json": json.dumps(trial.params, sort_keys=True),
             } for trial in study.trials]
             trials = pl.DataFrame(rows, infer_schema_length=None)
             manifest = {
-                **base_manifest,
-                "selected_epoch": int(
-                    best_trial.user_attrs["best_epoch"]
+                **manifest,
+                "optuna_best_trial": int(best_trial.number),
+                "optuna_best_objective": float(best_trial.value),
+                "optuna_best_validation_bce": float(
+                    -best_trial.value
                 ),
-                "pooled_decision_threshold": threshold,
-                "window_best_epochs": best_trial.user_attrs.get(
-                    "window_best_epochs", "[]"
+                "calibration_inner_balanced_accuracy": float(
+                    calibration_inner_balanced_accuracy
+                ),
+                "epoch_selection": (
+                    "post_optuna_inner_validation"
                 ),
             }
             selected_trial_number = int(best_trial.number)
-            selected_history_path = (
-                history_dir / f"trial_{selected_trial_number}.csv"
-            )
         else:
             (
                 model,
                 history,
                 threshold,
-                score,
+                inner_balanced_accuracy,
+                optuna_objective,
                 manifest,
             ) = fit_inner_candidate(
                 scope_name=scope_name,
@@ -3928,17 +3811,21 @@ def run_walk_forward_fusion(
                 "scope": scope_name,
                 "trial": 0,
                 "state": "FIXED_DEFAULT",
-                "inner_balanced_accuracy": score,
-                "best_epoch": int(history[0]["selected_epoch"]),
-                "decision_threshold": threshold,
-                "window_best_epochs": manifest[
-                    "window_best_epochs"
-                ],
+                "optuna_objective": optuna_objective,
+                "validation_bce": -optuna_objective,
+                "trial_balanced_accuracy_at_0_5": inner_balanced_accuracy,
+                "trial_diagnostic_epoch": int(
+                    history[0]["selected_epoch"]
+                ),
                 "params_json": json.dumps(default_params, sort_keys=True),
             }], infer_schema_length=None)
             del model
             selected_trial_number = 0
             selected_history_path = history_dir / "fixed_default.csv"
+            manifest = {
+                **manifest,
+                "epoch_selection": "fixed_configuration_inner_validation",
+            }
         if selected_history_path.exists():
             selected_history = pl.read_csv(selected_history_path)
             selected_history.write_csv(
@@ -3956,9 +3843,10 @@ def run_walk_forward_fusion(
         (history_dir / "selection.json").write_text(json.dumps({
             "scope": scope_name,
             "selected_trial": selected_trial_number,
+            "epoch_selection": manifest["epoch_selection"],
             "hyperparameters": best_params,
             "selected_epoch": int(best_params["epochs"]),
-            "pooled_decision_threshold": float(threshold),
+            "decision_threshold": float(threshold),
             "inner_split": {
                 key: (
                     str(value)
@@ -3997,7 +3885,7 @@ def run_walk_forward_fusion(
             raw_padding=tuning_train_padding,
             study_name=(
                 f"timesfm_{market_encoder}_nested_outer_fold_{fold}_"
-                f"{study_signature}_v3"
+                f"{study_signature}_v7"
             ),
             study_seed=seed + 10_000 * fold,
         )
@@ -4036,6 +3924,7 @@ def run_walk_forward_fusion(
                     inner_model,
                     inner_history,
                     threshold,
+                    _,
                     _,
                     selection_manifest,
                 ) = fit_inner_candidate(
@@ -4206,9 +4095,8 @@ def run_walk_forward_fusion(
                 "model": model_name,
                 "best_epoch": int(variant_params["epochs"]),
                 "decision_threshold": threshold,
-                "inner_windows": selection_manifest["inner_windows"],
-                "window_best_epochs": selection_manifest[
-                    "window_best_epochs"
+                "inner_best_epoch": selection_manifest[
+                    "inner_best_epoch"
                 ],
                 "inner_train_rows": selection_manifest["inner_train_rows"],
                 "inner_validation_rows": selection_manifest[
@@ -4240,10 +4128,10 @@ def run_walk_forward_fusion(
             "scope": pl.String,
             "trial": pl.Int64,
             "state": pl.String,
-            "inner_balanced_accuracy": pl.Float64,
-            "best_epoch": pl.Int64,
-            "decision_threshold": pl.Float64,
-            "window_best_epochs": pl.String,
+            "optuna_objective": pl.Float64,
+            "validation_bce": pl.Float64,
+            "trial_balanced_accuracy_at_0_5": pl.Float64,
+            "trial_diagnostic_epoch": pl.Int64,
             "params_json": pl.String,
             "outer_fold": pl.Int8,
         })
@@ -4261,8 +4149,7 @@ def run_walk_forward_fusion(
             "model": pl.String,
             "best_epoch": pl.Int64,
             "decision_threshold": pl.Float64,
-            "inner_windows": pl.Int64,
-            "window_best_epochs": pl.String,
+            "inner_best_epoch": pl.Int64,
             "inner_train_rows": pl.Int64,
             "inner_validation_rows": pl.Int64,
             "purged_dates": pl.Int64,
@@ -4303,10 +4190,8 @@ def run_walk_forward_fusion(
             "epoch": pl.Float64,
             "bce": pl.Float64,
             "train_bce": pl.Float64,
-            "train_balanced_bce": pl.Float64,
             "train_positive_rate": pl.Float64,
             "validation_bce": pl.Float64,
-            "validation_balanced_bce": pl.Float64,
             "validation_accuracy": pl.Float64,
             "validation_balanced_accuracy": pl.Float64,
             "validation_roc_auc": pl.Float64,
@@ -4454,7 +4339,7 @@ def run_walk_forward_fusion(
         raw_padding=final_tuning_padding,
         study_name=(
             f"timesfm_{market_encoder}_nested_final_"
-            f"{study_signature}_v3"
+            f"{study_signature}_v7"
         ),
         study_seed=seed + 900_000,
     )
@@ -4470,6 +4355,7 @@ def run_walk_forward_fusion(
     )
     (output_dir / "best_hyperparameters.json").write_text(json.dumps({
         "selection": "nested_inner_validation",
+        "epoch_selection": final_split_manifest["epoch_selection"],
         "optuna_study_signature": study_signature,
         "cross_stock_attention": bool(cross_stock_attention),
         "cross_stock_attention_heads": (
@@ -4526,6 +4412,7 @@ def run_walk_forward_fusion(
                 inner_model,
                 inner_history,
                 threshold,
+                _,
                 _,
                 variant_selection_manifest,
             ) = fit_inner_candidate(

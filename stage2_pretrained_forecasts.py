@@ -112,18 +112,12 @@ def parse_args() -> argparse.Namespace:
         help="Use the default residual-network hyperparameters.",
     )
     parser.add_argument(
-        "--inner-validation-windows",
-        type=int,
-        default=3,
-        help="Number of rolling purged windows used for inner selection.",
-    )
-    parser.add_argument(
         "--training-mode",
         choices=("nested-folds", "full-only"),
         default="nested-folds",
         help=(
             "Run five nested walk-forward folds before the final refit, or "
-            "skip them and tune on rolling purged windows of all training data."
+            "skip them and tune on one purged split of all training data."
         ),
     )
     parser.add_argument(
@@ -194,8 +188,6 @@ def main() -> None:
         raise ValueError(
             "--no-price-extraction and --force-price-refresh cannot be combined"
         )
-    if args.inner_validation_windows < 1:
-        raise ValueError("--inner-validation-windows must be positive")
     if args.optuna_trials < 0:
         raise ValueError("--optuna-trials cannot be negative")
     args.families = list(dict.fromkeys(args.families))
@@ -256,12 +248,18 @@ def main() -> None:
         "text_attention_heads": TEXT_ATTENTION_HEADS,
         "text_attention_layers": TEXT_ATTENTION_LAYERS,
         "adapter_learning_rate_multiplier": 0.1,
-        "inner_validation_windows": args.inner_validation_windows,
-        "training_loss": "class_balanced_bce",
-        "checkpoint_metric": "validation_balanced_bce",
+        "inner_validation_splits": 1,
+        "training_loss": "binary_cross_entropy",
+        "checkpoint_metric": "validation_bce",
+        "optuna_objective": "negative_validation_bce",
         "early_stopping_patience": 10,
         "early_stopping_min_delta": 1e-5,
-        "threshold_selection": "pooled_exact_balanced_accuracy",
+        "epoch_selection": (
+            "post_optuna_inner_validation"
+            if not args.no_tune and args.optuna_trials > 0 else
+            "fixed_configuration_inner_validation"
+        ),
+        "threshold_selection": "exact_inner_validation_balanced_accuracy",
         "training_mode": args.training_mode,
     }, indent=2))
 
@@ -352,7 +350,6 @@ def main() -> None:
         raw_text_dim=RAW_TEXT_DIM,
         text_attention_heads=TEXT_ATTENTION_HEADS,
         text_attention_layers=TEXT_ATTENTION_LAYERS,
-        inner_validation_windows=args.inner_validation_windows,
         run_outer_folds=args.training_mode == "nested-folds",
     )
 
