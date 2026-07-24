@@ -1859,15 +1859,15 @@ def fit_raw_fusion_model(
                 )
             else:
                 logits = model(p, c, articles, masks)
-            per_example_loss = F.binary_cross_entropy_with_logits(
+            loss = F.binary_cross_entropy_with_logits(
                 logits, y, reduction="none"
             )
-            class_weights = torch.where(
-                y > 0.5,
-                torch.full_like(y, positive_weight),
-                torch.full_like(y, negative_weight),
-            )
-            loss = (per_example_loss * class_weights).mean()
+            # class_weights = torch.where(
+            #     y > 0.5,
+            #     torch.full_like(y, positive_weight),
+            #     torch.full_like(y, negative_weight),
+            # )
+            # loss = (per_example_loss * class_weights).mean()
             if not torch.isfinite(loss):
                 raise FloatingPointError(
                     f"Raw fusion loss became non-finite in epoch {epoch}"
@@ -1876,7 +1876,7 @@ def fit_raw_fusion_model(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             train_bce_sum += float(
-                per_example_loss.detach().sum().cpu()
+                loss.detach().sum().cpu()
             )
             train_balanced_bce_sum += (
                 float(loss.detach().cpu()) * len(batch_indices)

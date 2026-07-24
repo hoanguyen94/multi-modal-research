@@ -31,7 +31,7 @@ BASELINE_DIR = ARTIFACT_DIR / "baselines"
 OUTPUT_DIR = (
     ARTIFACT_DIR
     / "stage2_pretrained_forecasts"
-    / "timesfm_covariates_unified_raw_text_attention2"
+    / "timesfm_covariates_unified_raw_text_attention3"
 )
 PRICE_CACHE_DIR = (
     ARTIFACT_DIR
