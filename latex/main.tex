@@ -2392,9 +2392,9 @@ foundation model both decision-specific and intrinsically case-interpretable.
 The central research question is:
 
 \begin{quote}
-Can pretrained time-series models be adapted through inspectable historical
-regimes while retaining competitive decision performance and providing exact,
-sparse, and stable case-based explanations?
+Can a pretrained time-series model achieve competitive directional performance
+when both its adaptation and its final prediction are constrained to pass
+through a sparse set of real, inspectable historical cases?
 \end{quote}
 
 Directly optimizing a binary directional loss is standard classification, and
@@ -2421,7 +2421,8 @@ minimizes
 \ell\left(\widehat Y_{i,t},Y_{i,t}\right),
 \end{equation}
 
-where $\ell$ may be a point or probabilistic forecasting loss. The competition
+where $\mathcal B$ is a minibatch of $B=|\mathcal B|$ stock--date observations
+and $\ell$ may be a point or probabilistic forecasting loss. The competition
 decision is instead
 
 \begin{equation}
@@ -2453,7 +2454,11 @@ h^0_{i,t}
 \in\R^d.
 \end{equation}
 
-Within the training portion of each chronological fold, construct
+Here, $X^P_{i,t}$ is the historical price window for stock $i$ at forecast
+origin $t$; $f_{\theta_0}$ is the pretrained TSFM with frozen parameters
+$\theta_0$; $H^0_{i,t}$ contains its $M$ token representations of width $d$;
+and $h^0_{i,t}$ is their pooled representation. Within the training portion of
+each chronological fold, construct
 
 \begin{equation}
 \mathcal P
@@ -2463,9 +2468,12 @@ P_k=(X_k^P,c_k,y_k)
 \right\}_{k=1}^{K},
 \end{equation}
 
-where each prototype is an actual stock--date observation containing a
-historical price window, its permitted contextual embeddings, and its
-directional label. Cache
+where $K$ is the number of prototypes, $X_k^P$ is the historical price window
+of the $k$th prototype, $c_k=\{c_k^{(m)}\}_{m=1}^{K_T}$ is its collection of
+permitted contextual embeddings across the $K_T$ supplied embedding families,
+and $y_k\in\{-1,+1\}$ is its realized directional label. Thus, each $P_k$ is an
+actual stock--date observation rather than a free latent vector. Cache its
+frozen pooled TSFM representation as
 
 \begin{equation}
 p_k
@@ -2509,7 +2517,9 @@ d^{T,m}_{i,t,k}
 }.
 \end{equation}
 
-The combined distance is
+Here, $c^{(m)}_{i,t}$ and $c^{(m)}_k$ are respectively the query and prototype
+embeddings from supplied family $m$, and $\epsilon>0$ prevents division by
+zero. The combined distance is
 
 \begin{equation}
 d_{i,t,k}
@@ -2530,9 +2540,24 @@ where
 \omega_P+\sum_{m=1}^{K_T}\omega_m=1.
 \end{equation}
 
-These global weights expose the contribution of price and each embedding
-family to case retrieval, without assigning semantic meaning to individual
-embedding coordinates.
+The modality weights are learned rather than manually specified. Introduce
+global trainable logits $\alpha_P,\alpha_1,\ldots,\alpha_{K_T}$ and set
+
+\begin{equation}
+\left(
+\omega_P,\omega_1,\ldots,\omega_{K_T}
+\right)
+=
+\operatorname{softmax}
+\left(
+\alpha_P,\alpha_1,\ldots,\alpha_{K_T}
+\right).
+\end{equation}
+
+Thus, $\omega_P$ is the learned global price-distance weight and $\omega_m$ is
+the learned global weight for contextual embedding family $m$. These weights
+expose the contribution of price and each embedding family to case retrieval,
+without assigning semantic meaning to individual embedding coordinates.
 
 Only the $K_0$ closest prototypes may affect one observation:
 
@@ -2567,7 +2592,8 @@ k\notin\mathcal S_{i,t}.
 \end{cases}
 \end{equation}
 
-Thus,
+Here, $\tau>0$ is the routing temperature, and $r_{i,t,k}$ is the normalized
+weight assigned to prototype $k$ for observation $(i,t)$. Thus,
 
 \begin{equation}
 \|\mathbf r_{i,t}\|_0\leq K_0,
@@ -2637,7 +2663,13 @@ k\notin\mathcal S_{i,t}.
 \end{cases}
 \end{equation}
 
-The main intrinsically interpretable variant constrains
+Here, $\sigma_k>0$ is the median frozen-representation distance from prototype
+$k$ to the training-fold observations assigned to its $K$-medoids cluster,
+with a small positive floor for degenerate clusters. Thus, it introduces no
+additional trainable parameter.
+The quantity $z_{i,t,k}\in(0,1]$ measures post-adaptation similarity for an
+active prototype and is zero for an inactive one. The main intrinsically
+interpretable variant constrains
 
 \begin{equation}
 \beta_k
@@ -2645,9 +2677,10 @@ The main intrinsically interpretable variant constrains
 y_k\operatorname{softplus}(\eta_k).
 \end{equation}
 
-A positive prototype can therefore provide only positive evidence and a
-negative prototype only negative evidence. An ablation removes this constraint
-to measure its predictive cost.
+Here, $\eta_k$ is an unconstrained learned scalar and $\beta_k$ is the resulting
+sign-constrained coefficient. A positive prototype can therefore provide only
+positive evidence and a negative prototype only negative evidence. An ablation
+removes this constraint to measure its predictive cost.
 
 The final directional logit and probability are
 
@@ -2661,7 +2694,26 @@ p_{i,t}
 \sigmoid(s_{i,t}).
 \end{align}
 
-There is no parallel unrestricted MLP head. Define the exact contribution
+Here, $b$ is a scalar intercept, $s_{i,t}$ is the directional logit, and
+$p_{i,t}$ is the predicted probability of the positive class. There is no
+parallel unrestricted MLP head. The core trainable parameter collection is
+
+\begin{equation}
+\Theta_{\mathrm{train}}
+=
+\left\{
+A_k,B_k,\eta_k
+\right\}_{k=1}^{K}
+\cup
+\left\{
+b,\alpha_P,\alpha_1,\ldots,\alpha_{K_T}
+\right\}.
+\end{equation}
+
+The pretrained parameters $\theta_0$, prototype observations $P_k$, cached
+prototype representations $p_k$, and training-fold-derived bandwidths
+$\sigma_k$ remain fixed. The routing temperature $\tau$ is selected using
+inner chronological validation. Define the exact contribution
 
 \begin{equation}
 C_{i,t,k}
@@ -2679,9 +2731,12 @@ b+
 C_{i,t,k}.
 \end{equation}
 
-The explanation identifies which historical regimes the model used and their
-exact numerical contributions. It is a faithful account of the model
-calculation, not a claim that those regimes caused the future return.
+The explanation identifies which historical prototype cases the model used
+and their exact numerical contributions. It is a faithful account of the model
+calculation, not a claim that those cases caused the future return. The method
+is intrinsically case-interpretable and contribution-faithful, but it does not
+assign semantic meaning to individual embedding dimensions or automatically
+explain why two contextual embeddings are similar.
 
 \subsection{Directional Training Objective}
 
@@ -2779,8 +2834,8 @@ For each outer walk-forward fold:
 
     \item select class-balanced prototype medoids from that period;
 
-    \item train prototype adapters, modality weights, distance scales, and
-    additive coefficients;
+    \item train prototype adapters, modality-weight logits, and additive
+    coefficients;
 
     \item select $K$, $K_0$, $r$, and $\tau$ using inner chronological
     validation;

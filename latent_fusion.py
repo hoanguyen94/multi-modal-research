@@ -33,6 +33,7 @@ from model_config import (
     ADAPTER_LEARNING_RATE_MULTIPLIER,
     CROSS_STOCK_ATTENTION_HEADS,
     EARLY_STOPPING_MIN_DELTA,
+    EARLY_STOPPING_MIN_EPOCHS,
     EARLY_STOPPING_PATIENCE,
     EXPECTED_SUBMISSION_ROWS,
     FUSION_BATCH_SIZE,
@@ -64,6 +65,20 @@ from model_config import (
     TFT_LOOKBACK_CANDIDATES,
 )
 from utils import directional_classification_metrics, probability_to_price
+
+
+def _early_stopping_reached(
+    *,
+    epoch: int,
+    epochs_without_improvement: int,
+    min_epochs: int,
+    patience: int,
+) -> bool:
+    """Return whether patience is exhausted after the minimum epoch."""
+    return (
+        int(epoch) >= int(min_epochs)
+        and int(epochs_without_improvement) >= int(patience)
+    )
 
 
 def parquet_embedding_dim(path: Path) -> int:
@@ -1686,6 +1701,7 @@ def fit_raw_fusion_model(
     validation_sequence_padding_mask: np.ndarray | None = None,  # (N_validation, T); True = padding
     validation_stock_group_ids: np.ndarray | None = None,  # (N_validation,), date IDs
     select_best_checkpoint: bool = True,
+    early_stopping_min_epochs: int = EARLY_STOPPING_MIN_EPOCHS,
     early_stopping_patience: int = EARLY_STOPPING_PATIENCE,
     early_stopping_min_delta: float = EARLY_STOPPING_MIN_DELTA,
 ) -> tuple[nn.Module, list[dict[str, float]]]:
@@ -1699,6 +1715,16 @@ def fit_raw_fusion_model(
         raise ValueError(
             "adapter_learning_rate_multiplier must be in (0, 1]"
         )
+    if early_stopping_min_epochs < 1:
+        raise ValueError("early_stopping_min_epochs must be positive")
+    if epochs < early_stopping_min_epochs:
+        raise ValueError(
+            "epochs must be at least early_stopping_min_epochs"
+        )
+    if early_stopping_patience < 1:
+        raise ValueError("early_stopping_patience must be positive")
+    if early_stopping_min_delta < 0.0:
+        raise ValueError("early_stopping_min_delta cannot be negative")
     if cross_stock_attention and market_encoder != "tft":
         raise ValueError("Cross-stock attention currently requires TFT")
     if cross_stock_attention and stock_group_ids is None:
@@ -1906,7 +1932,11 @@ def fit_raw_fusion_model(
                 ),
             ))
         history.append(epoch_metrics)
-        if has_validation and select_best_checkpoint:
+        if (
+            has_validation
+            and select_best_checkpoint
+            and epoch >= early_stopping_min_epochs
+        ):
             current_validation_metric = epoch_metrics["validation_bce"]
             if (
                 current_validation_metric
@@ -1921,7 +1951,12 @@ def fit_raw_fusion_model(
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
-            if epochs_without_improvement >= int(early_stopping_patience):
+            if _early_stopping_reached(
+                epoch=epoch,
+                epochs_without_improvement=epochs_without_improvement,
+                min_epochs=early_stopping_min_epochs,
+                patience=early_stopping_patience,
+            ):
                 break
     model = model.cpu()
     if best_state is not None:
@@ -3235,6 +3270,7 @@ def run_walk_forward_fusion(
     cross_stock_attention: bool = False,
     cross_stock_attention_heads: int = CROSS_STOCK_ATTENTION_HEADS,
     adapter_learning_rate_multiplier: float = ADAPTER_LEARNING_RATE_MULTIPLIER,
+    early_stopping_min_epochs: int = EARLY_STOPPING_MIN_EPOCHS,
     early_stopping_patience: int = EARLY_STOPPING_PATIENCE,
     early_stopping_min_delta: float = EARLY_STOPPING_MIN_DELTA,
     run_outer_folds: bool = True,
@@ -3287,6 +3323,8 @@ def run_walk_forward_fusion(
         raise ValueError(
             "adapter_learning_rate_multiplier must be in (0, 1]"
         )
+    if early_stopping_min_epochs < 1:
+        raise ValueError("early_stopping_min_epochs must be positive")
     if early_stopping_patience < 1:
         raise ValueError("early_stopping_patience must be positive")
     if early_stopping_min_delta < 0.0:
@@ -3422,6 +3460,7 @@ def run_walk_forward_fusion(
         "training_loss": "binary_cross_entropy",
         "checkpoint_metric": "validation_bce",
         "optuna_objective": "negative_validation_bce",
+        "early_stopping_min_epochs": int(early_stopping_min_epochs),
         "early_stopping_patience": int(early_stopping_patience),
         "early_stopping_min_delta": float(early_stopping_min_delta),
         "epoch_selection": (
@@ -3576,6 +3615,7 @@ def run_walk_forward_fusion(
         "inner_validation_splits": 1,
         "checkpoint_metric": "validation_bce",
         "optuna_objective": "negative_validation_bce",
+        "early_stopping_min_epochs": int(early_stopping_min_epochs),
         "early_stopping_patience": int(early_stopping_patience),
         "early_stopping_min_delta": float(early_stopping_min_delta),
         "training_loss": "binary_cross_entropy",
@@ -3951,6 +3991,7 @@ def run_walk_forward_fusion(
                 adapter_learning_rate_multiplier
             ),
             select_best_checkpoint=True,
+            early_stopping_min_epochs=early_stopping_min_epochs,
             early_stopping_patience=early_stopping_patience,
             early_stopping_min_delta=early_stopping_min_delta,
             **model_fit_params(params),

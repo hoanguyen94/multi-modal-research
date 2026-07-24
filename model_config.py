@@ -74,6 +74,20 @@ CROSS_STOCK_TFT_OUTPUT_DIRS = {
     "timesfm": CROSS_STOCK_TFT_OUTPUT_DIR,
     "chronos2": CHRONOS2_CROSS_STOCK_TFT_OUTPUT_DIR,
 }
+CHRONOS2_LORA_FUSION_OUTPUT_DIR = (
+    ARTIFACT_DIR
+    / "stage2_pretrained_forecasts"
+    / "chronos2_lora_multivariate_raw_text_attention"
+)
+CHRONOS2_TOPLORA_FUSION_OUTPUT_DIR = (
+    ARTIFACT_DIR
+    / "stage2_pretrained_forecasts"
+    / "chronos2_toplora_multivariate_raw_text_attention"
+)
+CHRONOS2_ADAPTER_OUTPUT_DIRS = {
+    "lora": CHRONOS2_LORA_FUSION_OUTPUT_DIR,
+    "toplora": CHRONOS2_TOPLORA_FUSION_OUTPUT_DIR,
+}
 
 # Shared experiment protocol.
 RANDOM_STATE = 42
@@ -137,6 +151,12 @@ CHRONOS2_INPUT_COLUMNS = (
     "log_volume",
     "volume_change_1",
 )
+CHRONOS2_LORA_RANK = 8
+CHRONOS2_LORA_ALPHA = 16
+CHRONOS2_LORA_DROPOUT = 0.05
+CHRONOS2_LORA_LEARNING_RATE = 1e-4
+CHRONOS2_LORA_BATCH_SIZE = 8
+CHRONOS2_LORA_EPOCHS = 10
 RAW_TEXT_DIM = 384
 TEXT_ATTENTION_HEADS = 4
 TEXT_ATTENTION_LAYERS = 1
@@ -149,7 +169,8 @@ FUSION_EPOCHS = 100
 PRICE_BATCH_SIZE = 16
 FUSION_BATCH_SIZE = 128
 ADAPTER_LEARNING_RATE_MULTIPLIER = 0.1
-EARLY_STOPPING_PATIENCE = 10
+EARLY_STOPPING_MIN_EPOCHS = 10
+EARLY_STOPPING_PATIENCE = 5
 EARLY_STOPPING_MIN_DELTA = 1e-5
 
 # Optuna search space shared by the residual and TFT fusion models.

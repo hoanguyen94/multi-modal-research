@@ -33,6 +33,7 @@ from model_config import (
     DEFAULT_TEXT_FAMILIES,
     DEFAULT_TRAINING_MODE,
     EARLY_STOPPING_MIN_DELTA,
+    EARLY_STOPPING_MIN_EPOCHS,
     EARLY_STOPPING_PATIENCE,
     EXPECTED_SUBMISSION_ROWS,
     FOLD_PATH,
@@ -283,6 +284,7 @@ def main() -> None:
         "training_loss": "binary_cross_entropy",
         "checkpoint_metric": "validation_bce",
         "optuna_objective": "negative_validation_bce",
+        "early_stopping_min_epochs": EARLY_STOPPING_MIN_EPOCHS,
         "early_stopping_patience": EARLY_STOPPING_PATIENCE,
         "early_stopping_min_delta": EARLY_STOPPING_MIN_DELTA,
         "epoch_selection": (
@@ -392,6 +394,7 @@ def main() -> None:
         adapter_learning_rate_multiplier=(
             ADAPTER_LEARNING_RATE_MULTIPLIER
         ),
+        early_stopping_min_epochs=EARLY_STOPPING_MIN_EPOCHS,
         early_stopping_patience=EARLY_STOPPING_PATIENCE,
         early_stopping_min_delta=EARLY_STOPPING_MIN_DELTA,
         run_outer_folds=args.training_mode == "nested-folds",
