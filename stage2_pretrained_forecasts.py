@@ -24,10 +24,13 @@ from latent_fusion import (
     run_walk_forward_fusion,
 )
 from model_config import (
+    ADAPTER_LEARNING_RATE_MULTIPLIER,
     BASELINE_DIR,
     DATA_DIR,
     DEFAULT_TEXT_FAMILIES,
     DEFAULT_TRAINING_MODE,
+    EARLY_STOPPING_MIN_DELTA,
+    EARLY_STOPPING_PATIENCE,
     EXPECTED_SUBMISSION_ROWS,
     FOLD_PATH,
     FUSION_BATCH_SIZE,
@@ -220,13 +223,15 @@ def main() -> None:
         "raw_text_shared_dim": RAW_TEXT_DIM,
         "text_attention_heads": TEXT_ATTENTION_HEADS,
         "text_attention_layers": TEXT_ATTENTION_LAYERS,
-        "adapter_learning_rate_multiplier": 0.1,
+        "adapter_learning_rate_multiplier": (
+            ADAPTER_LEARNING_RATE_MULTIPLIER
+        ),
         "inner_validation_splits": 1,
         "training_loss": "binary_cross_entropy",
         "checkpoint_metric": "validation_bce",
         "optuna_objective": "negative_validation_bce",
-        "early_stopping_patience": 10,
-        "early_stopping_min_delta": 1e-5,
+        "early_stopping_patience": EARLY_STOPPING_PATIENCE,
+        "early_stopping_min_delta": EARLY_STOPPING_MIN_DELTA,
         "epoch_selection": (
             "post_optuna_inner_validation"
             if not args.no_tune and args.optuna_trials > 0 else
@@ -323,6 +328,11 @@ def main() -> None:
         raw_text_dim=RAW_TEXT_DIM,
         text_attention_heads=TEXT_ATTENTION_HEADS,
         text_attention_layers=TEXT_ATTENTION_LAYERS,
+        adapter_learning_rate_multiplier=(
+            ADAPTER_LEARNING_RATE_MULTIPLIER
+        ),
+        early_stopping_patience=EARLY_STOPPING_PATIENCE,
+        early_stopping_min_delta=EARLY_STOPPING_MIN_DELTA,
         run_outer_folds=args.training_mode == "nested-folds",
     )
 

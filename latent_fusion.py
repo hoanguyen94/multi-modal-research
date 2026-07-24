@@ -29,6 +29,40 @@ from sklearn.metrics import (
     roc_curve,
     roc_auc_score,
 )
+from model_config import (
+    ADAPTER_LEARNING_RATE_MULTIPLIER,
+    CROSS_STOCK_ATTENTION_HEADS,
+    EARLY_STOPPING_MIN_DELTA,
+    EARLY_STOPPING_PATIENCE,
+    EXPECTED_SUBMISSION_ROWS,
+    FUSION_BATCH_SIZE,
+    FUSION_DEPTH,
+    FUSION_DROPOUT,
+    FUSION_EPOCHS,
+    FUSION_HIDDEN_DIM,
+    HORIZON,
+    MARKET_DEPTH,
+    OPTUNA_DROPOUT_CANDIDATES,
+    OPTUNA_EXPANSION_CANDIDATES,
+    OPTUNA_FUSION_DEPTH_CANDIDATES,
+    OPTUNA_HIDDEN_DIM_CANDIDATES,
+    OPTUNA_LEARNING_RATE_MAX,
+    OPTUNA_LEARNING_RATE_MIN,
+    OPTUNA_MARKET_DEPTH_CANDIDATES,
+    OPTUNA_TRIALS,
+    OPTUNA_WEIGHT_DECAY_MAX,
+    OPTUNA_WEIGHT_DECAY_MIN,
+    RANDOM_STATE,
+    RAW_TEXT_DIM,
+    RESIDUAL_EXPANSION,
+    SELECTION_PROTOCOL_VERSION,
+    SUBMISSION_YEARS,
+    TEXT_ATTENTION_HEADS,
+    TEXT_ATTENTION_LAYERS,
+    TFT_ATTENTION_HEADS,
+    TFT_LOOKBACK,
+    TFT_LOOKBACK_CANDIDATES,
+)
 from utils import directional_classification_metrics, probability_to_price
 
 
@@ -944,7 +978,7 @@ class RawTextTFTFusion(nn.Module):
         text_attention_heads: int = 4,
         text_attention_layers: int = 1,
         cross_stock_attention: bool = False,
-        cross_stock_attention_heads: int = 4,
+        cross_stock_attention_heads: int = CROSS_STOCK_ATTENTION_HEADS,
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -1633,7 +1667,7 @@ def fit_raw_fusion_model(
     batch_size: int = 128,
     learning_rate: float = 3e-4,
     weight_decay: float = 1e-4,
-    adapter_learning_rate_multiplier: float = 0.1,
+    adapter_learning_rate_multiplier: float = ADAPTER_LEARNING_RATE_MULTIPLIER,
     seed: int = 42,
     market_encoder: str = "mlp",
     market_sequence: np.ndarray | None = None,  # (N_train, T, V)
@@ -1642,7 +1676,7 @@ def fit_raw_fusion_model(
     text_attention_heads: int = 4,
     text_attention_layers: int = 1,
     cross_stock_attention: bool = False,
-    cross_stock_attention_heads: int = 4,
+    cross_stock_attention_heads: int = CROSS_STOCK_ATTENTION_HEADS,
     stock_group_ids: np.ndarray | None = None,  # (N_train,), date IDs
     validation_price: np.ndarray | None = None,  # (N_validation, D_price)
     validation_covariates: np.ndarray | None = None,  # (N_validation, D_covariate)
@@ -1652,8 +1686,8 @@ def fit_raw_fusion_model(
     validation_sequence_padding_mask: np.ndarray | None = None,  # (N_validation, T); True = padding
     validation_stock_group_ids: np.ndarray | None = None,  # (N_validation,), date IDs
     select_best_checkpoint: bool = True,
-    early_stopping_patience: int = 10,
-    early_stopping_min_delta: float = 1e-5,
+    early_stopping_patience: int = EARLY_STOPPING_PATIENCE,
+    early_stopping_min_delta: float = EARLY_STOPPING_MIN_DELTA,
 ) -> tuple[nn.Module, list[dict[str, float]]]:
     """Train raw-family adapters and all attention/fusion layers end to end."""
     _require_finite("raw-fusion price latents", price)
@@ -2870,30 +2904,33 @@ def run_walk_forward_fusion(
     requested_families: Sequence[str],
     covariate_columns: Sequence[str],
     device: str,
-    fusion_epochs: int = 10,
-    fusion_batch_size: int = 512,
-    fusion_hidden_dim: int = 256,
-    market_depth: int = 2,
-    fusion_depth: int = 2,
-    residual_expansion: int = 2,
-    fusion_dropout: float = 0.1,
-    tuning_trials: int = 20,
+    fusion_epochs: int = FUSION_EPOCHS,
+    fusion_batch_size: int = FUSION_BATCH_SIZE,
+    fusion_hidden_dim: int = FUSION_HIDDEN_DIM,
+    market_depth: int = MARKET_DEPTH,
+    fusion_depth: int = FUSION_DEPTH,
+    residual_expansion: int = RESIDUAL_EXPANSION,
+    fusion_dropout: float = FUSION_DROPOUT,
+    tuning_trials: int = OPTUNA_TRIALS,
     tune_hyperparameters: bool = True,
-    forecast_horizon_weekdays: int = 20,
-    submission_years: Sequence[int] = (2022, 2023),
-    expected_submission_rows: int = 52_000,
+    forecast_horizon_weekdays: int = HORIZON,
+    submission_years: Sequence[int] = SUBMISSION_YEARS,
+    expected_submission_rows: int = EXPECTED_SUBMISSION_ROWS,
     raw_test_path: Path | None = None,
-    seed: int = 42,
+    seed: int = RANDOM_STATE,
     market_encoder: str = "mlp",
     temporal_covariate_columns: Sequence[str] = (),
-    temporal_lookback: int = 32,
-    temporal_lookback_candidates: Sequence[int] = (),
-    tft_attention_heads: int = 4,
-    raw_text_dim: int = 384,
-    text_attention_heads: int = 4,
-    text_attention_layers: int = 1,
+    temporal_lookback: int = TFT_LOOKBACK,
+    temporal_lookback_candidates: Sequence[int] = TFT_LOOKBACK_CANDIDATES,
+    tft_attention_heads: int = TFT_ATTENTION_HEADS,
+    raw_text_dim: int = RAW_TEXT_DIM,
+    text_attention_heads: int = TEXT_ATTENTION_HEADS,
+    text_attention_layers: int = TEXT_ATTENTION_LAYERS,
     cross_stock_attention: bool = False,
-    cross_stock_attention_heads: int = 4,
+    cross_stock_attention_heads: int = CROSS_STOCK_ATTENTION_HEADS,
+    adapter_learning_rate_multiplier: float = ADAPTER_LEARNING_RATE_MULTIPLIER,
+    early_stopping_patience: int = EARLY_STOPPING_PATIENCE,
+    early_stopping_min_delta: float = EARLY_STOPPING_MIN_DELTA,
     run_outer_folds: bool = True,
 ) -> dict[str, pl.DataFrame]:
     """Optionally run nested outer folds, then select and refit on all data."""
@@ -2937,6 +2974,14 @@ def run_walk_forward_fusion(
         raise ValueError("Cross-stock attention currently requires TFT")
     if cross_stock_attention and cross_stock_attention_heads < 1:
         raise ValueError("cross_stock_attention_heads must be positive")
+    if not 0.0 < adapter_learning_rate_multiplier <= 1.0:
+        raise ValueError(
+            "adapter_learning_rate_multiplier must be in (0, 1]"
+        )
+    if early_stopping_patience < 1:
+        raise ValueError("early_stopping_patience must be positive")
+    if early_stopping_min_delta < 0.0:
+        raise ValueError("early_stopping_min_delta cannot be negative")
     if market_encoder == "tft" and not temporal_covariate_columns:
         raise ValueError("TFT requires temporal_covariate_columns")
     if market_encoder == "tft" and tft_attention_heads < 1:
@@ -2958,7 +3003,7 @@ def run_walk_forward_fusion(
         lookback_candidates = ()
         max_temporal_lookback = int(temporal_lookback)
     hidden_dim_candidates = tuple(
-        hidden_dim for hidden_dim in (64, 128, 256)
+        hidden_dim for hidden_dim in OPTUNA_HIDDEN_DIM_CANDIDATES
         if (
             market_encoder != "tft"
             or (
@@ -3064,8 +3109,8 @@ def run_walk_forward_fusion(
         "training_loss": "binary_cross_entropy",
         "checkpoint_metric": "validation_bce",
         "optuna_objective": "negative_validation_bce",
-        "early_stopping_patience": 10,
-        "early_stopping_min_delta": 1e-5,
+        "early_stopping_patience": int(early_stopping_patience),
+        "early_stopping_min_delta": float(early_stopping_min_delta),
         "epoch_selection": (
             "post_optuna_inner_validation"
             if tune_hyperparameters and tuning_trials > 0 else
@@ -3164,7 +3209,7 @@ def run_walk_forward_fusion(
         ),
     }
     study_signature = hashlib.sha256(json.dumps({
-        "selection_protocol_version": 7,
+        "selection_protocol_version": SELECTION_PROTOCOL_VERSION,
         "market_encoder": market_encoder,
         "families": families,
         "family_dims": {
@@ -3185,6 +3230,26 @@ def run_walk_forward_fusion(
         "forecast_horizon_weekdays": int(forecast_horizon_weekdays),
         "fusion_epochs": int(fusion_epochs),
         "fusion_batch_size": int(fusion_batch_size),
+        "hyperparameter_search_space": {
+            "hidden_dim": list(hidden_dim_candidates),
+            "fusion_depth": list(OPTUNA_FUSION_DEPTH_CANDIDATES),
+            "expansion": list(OPTUNA_EXPANSION_CANDIDATES),
+            "dropout": list(OPTUNA_DROPOUT_CANDIDATES),
+            "learning_rate": [
+                OPTUNA_LEARNING_RATE_MIN,
+                OPTUNA_LEARNING_RATE_MAX,
+                "log",
+            ],
+            "weight_decay": [
+                OPTUNA_WEIGHT_DECAY_MIN,
+                OPTUNA_WEIGHT_DECAY_MAX,
+                "log",
+            ],
+            "market_depth": (
+                list(OPTUNA_MARKET_DEPTH_CANDIDATES)
+                if market_encoder == "mlp" else [0]
+            ),
+        },
         "raw_text_dim": int(raw_text_dim),
         "tft_attention_heads": int(tft_attention_heads),
         "text_attention_heads": int(text_attention_heads),
@@ -3198,10 +3263,12 @@ def run_walk_forward_fusion(
         "inner_validation_splits": 1,
         "checkpoint_metric": "validation_bce",
         "optuna_objective": "negative_validation_bce",
-        "early_stopping_patience": 10,
-        "early_stopping_min_delta": 1e-5,
+        "early_stopping_patience": int(early_stopping_patience),
+        "early_stopping_min_delta": float(early_stopping_min_delta),
         "training_loss": "binary_cross_entropy",
-        "adapter_learning_rate_multiplier": 0.1,
+        "adapter_learning_rate_multiplier": float(
+            adapter_learning_rate_multiplier
+        ),
         "epoch_selection": "post_optuna_inner_validation",
         "threshold_selection": "exact_inner_validation_balanced_accuracy",
         "training_data_fingerprints": training_data_fingerprints,
@@ -3458,18 +3525,33 @@ def run_walk_forward_fusion(
             "hidden_dim": trial.suggest_categorical(
                 "hidden_dim", list(hidden_dim_candidates)
             ),
-            "fusion_depth": trial.suggest_int("fusion_depth", 1, 2, 3),
-            "expansion": trial.suggest_categorical("expansion", [1, 2]),
-            "dropout": trial.suggest_float("dropout", 0.15, 0.20, 0.25),
+            "fusion_depth": trial.suggest_categorical(
+                "fusion_depth", list(OPTUNA_FUSION_DEPTH_CANDIDATES)
+            ),
+            "expansion": trial.suggest_categorical(
+                "expansion", list(OPTUNA_EXPANSION_CANDIDATES)
+            ),
+            "dropout": trial.suggest_categorical(
+                "dropout", list(OPTUNA_DROPOUT_CANDIDATES)
+            ),
             "epochs": int(fusion_epochs),
             "learning_rate": trial.suggest_float(
-                "learning_rate", 1e-5, 3e-4, log=True
+                "learning_rate",
+                OPTUNA_LEARNING_RATE_MIN,
+                OPTUNA_LEARNING_RATE_MAX,
+                log=True,
             ),
             "weight_decay": trial.suggest_float(
-                "weight_decay", 1e-4, 1e-2, log=True
+                "weight_decay",
+                OPTUNA_WEIGHT_DECAY_MIN,
+                OPTUNA_WEIGHT_DECAY_MAX,
+                log=True,
             ),
             "market_depth": (
-                trial.suggest_int("market_depth", 1, 2, 3)
+                trial.suggest_categorical(
+                    "market_depth",
+                    list(OPTUNA_MARKET_DEPTH_CANDIDATES),
+                )
                 if market_encoder == "mlp" else 0
             ),
         }
@@ -3550,8 +3632,12 @@ def run_walk_forward_fusion(
             validation_stock_group_ids=stock_groups(
                 inner_validation[0]
             ),
-            adapter_learning_rate_multiplier=0.1,
+            adapter_learning_rate_multiplier=(
+                adapter_learning_rate_multiplier
+            ),
             select_best_checkpoint=True,
+            early_stopping_patience=early_stopping_patience,
+            early_stopping_min_delta=early_stopping_min_delta,
             **model_fit_params(params),
         )
         selected_epoch = int(history[0]["best_epoch"])
@@ -3904,7 +3990,7 @@ def run_walk_forward_fusion(
             raw_padding=tuning_train_padding,
             study_name=(
                 f"timesfm_{market_encoder}_nested_outer_fold_{fold}_"
-                f"{study_signature}_v7"
+                f"{study_signature}_v{SELECTION_PROTOCOL_VERSION}"
             ),
             study_seed=seed + 10_000 * fold,
         )
@@ -4024,6 +4110,9 @@ def run_walk_forward_fusion(
                 validation_market_sequence=val_sequence,
                 validation_sequence_padding_mask=val_padding,
                 validation_stock_group_ids=stock_groups(val_a[0]),
+                adapter_learning_rate_multiplier=(
+                    adapter_learning_rate_multiplier
+                ),
                 select_best_checkpoint=False,
                 **model_fit_params(variant_params),
             )
@@ -4045,7 +4134,9 @@ def run_walk_forward_fusion(
                 "raw_text_shared_dim": raw_text_dim,
                 "text_attention_heads": text_attention_heads,
                 "text_attention_layers": text_attention_layers,
-                "adapter_learning_rate_multiplier": 0.1,
+                "adapter_learning_rate_multiplier": float(
+                    adapter_learning_rate_multiplier
+                ),
                 "cross_stock_attention": cross_stock_attention,
                 "cross_stock_attention_heads": (
                     cross_stock_attention_heads
@@ -4358,7 +4449,7 @@ def run_walk_forward_fusion(
         raw_padding=final_tuning_padding,
         study_name=(
             f"timesfm_{market_encoder}_nested_final_"
-            f"{study_signature}_v7"
+            f"{study_signature}_v{SELECTION_PROTOCOL_VERSION}"
         ),
         study_seed=seed + 900_000,
     )
@@ -4496,6 +4587,9 @@ def run_walk_forward_fusion(
             cross_stock_attention=cross_stock_attention,
             cross_stock_attention_heads=cross_stock_attention_heads,
             stock_group_ids=stock_groups(train_a[0]),
+            adapter_learning_rate_multiplier=(
+                adapter_learning_rate_multiplier
+            ),
             **model_fit_params(variant_params),
         )
         save_torch_model(final_dir / "fusion_models" / f"{model_name}.pt", model, {
@@ -4513,7 +4607,9 @@ def run_walk_forward_fusion(
             "raw_text_shared_dim": raw_text_dim,
             "text_attention_heads": text_attention_heads,
             "text_attention_layers": text_attention_layers,
-            "adapter_learning_rate_multiplier": 0.1,
+            "adapter_learning_rate_multiplier": float(
+                adapter_learning_rate_multiplier
+            ),
             "cross_stock_attention": cross_stock_attention,
             "cross_stock_attention_heads": (
                 cross_stock_attention_heads
