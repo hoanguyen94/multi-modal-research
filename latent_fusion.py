@@ -1345,11 +1345,30 @@ def _raw_text_batch(
 
 
 def _date_group_ids(index: pl.DataFrame) -> np.ndarray:
-    """Return one integer group per date while preserving row order."""
-    if "date" not in index.columns:
-        raise ValueError("Cross-stock attention requires a date column")
-    if index["date"].null_count():
-        raise ValueError("Cross-stock attention dates cannot be null")
+    """Return date IDs; each date group contains at most one row per stock."""
+    required = {"date", "ticker"}
+    missing = sorted(required - set(index.columns))
+    if missing:
+        raise ValueError(
+            f"Cross-stock attention index is missing columns: {missing}"
+        )
+    if index.select(
+        pl.any_horizontal(
+            pl.col("date").is_null(),
+            pl.col("ticker").is_null(),
+        ).any()
+    ).item():
+        raise ValueError(
+            "Cross-stock attention dates and tickers cannot be null"
+        )
+    duplicate_stock_dates = index.select(
+        pl.struct(["date", "ticker"]).is_duplicated().any()
+    ).item()
+    if duplicate_stock_dates:
+        raise ValueError(
+            "Cross-stock attention requires at most one row per "
+            "(date, ticker) pair"
+        )
     return np.ascontiguousarray(
         index["date"].cast(pl.Int32).to_numpy().astype(np.int64, copy=False)
     )
@@ -1598,11 +1617,11 @@ def _plot_inner_selection_diagnostics(
 
 
 def fit_raw_fusion_model(
-    price: np.ndarray,
-    covariates: np.ndarray,
-    text_indices: dict[str, np.ndarray],
-    stores: dict[str, RawEmbeddingStore],
-    target: np.ndarray,
+    price: np.ndarray,  # (N_train, D_price)
+    covariates: np.ndarray,  # (N_train, D_covariate)
+    text_indices: dict[str, np.ndarray],  # each: (N_train, A); -1 means missing
+    stores: dict[str, RawEmbeddingStore],  # each values table: (M_family, D_family)
+    target: np.ndarray,  # (N_train,)
     device: str,
     text_dim: int = 384,
     hidden_dim: int = 256,
@@ -1617,21 +1636,21 @@ def fit_raw_fusion_model(
     adapter_learning_rate_multiplier: float = 0.1,
     seed: int = 42,
     market_encoder: str = "mlp",
-    market_sequence: np.ndarray | None = None,
-    sequence_padding_mask: np.ndarray | None = None,
+    market_sequence: np.ndarray | None = None,  # (N_train, T, V)
+    sequence_padding_mask: np.ndarray | None = None,  # (N_train, T); True = padding
     market_attention_heads: int = 4,
     text_attention_heads: int = 4,
     text_attention_layers: int = 1,
     cross_stock_attention: bool = False,
     cross_stock_attention_heads: int = 4,
-    stock_group_ids: np.ndarray | None = None,
-    validation_price: np.ndarray | None = None,
-    validation_covariates: np.ndarray | None = None,
-    validation_text_indices: dict[str, np.ndarray] | None = None,
-    validation_target: np.ndarray | None = None,
-    validation_market_sequence: np.ndarray | None = None,
-    validation_sequence_padding_mask: np.ndarray | None = None,
-    validation_stock_group_ids: np.ndarray | None = None,
+    stock_group_ids: np.ndarray | None = None,  # (N_train,), date IDs
+    validation_price: np.ndarray | None = None,  # (N_validation, D_price)
+    validation_covariates: np.ndarray | None = None,  # (N_validation, D_covariate)
+    validation_text_indices: dict[str, np.ndarray] | None = None,  # each: (N_validation, A); -1 = missing
+    validation_target: np.ndarray | None = None,  # (N_validation,)
+    validation_market_sequence: np.ndarray | None = None,  # (N_validation, T, V)
+    validation_sequence_padding_mask: np.ndarray | None = None,  # (N_validation, T); True = padding
+    validation_stock_group_ids: np.ndarray | None = None,  # (N_validation,), date IDs
     select_best_checkpoint: bool = True,
     early_stopping_patience: int = 10,
     early_stopping_min_delta: float = 1e-5,
@@ -3439,9 +3458,9 @@ def run_walk_forward_fusion(
             "hidden_dim": trial.suggest_categorical(
                 "hidden_dim", list(hidden_dim_candidates)
             ),
-            "fusion_depth": trial.suggest_int("fusion_depth", 1, 2),
+            "fusion_depth": trial.suggest_int("fusion_depth", 1, 2, 3),
             "expansion": trial.suggest_categorical("expansion", [1, 2]),
-            "dropout": trial.suggest_float("dropout", 0.15, 0.50),
+            "dropout": trial.suggest_float("dropout", 0.15, 0.20, 0.25),
             "epochs": int(fusion_epochs),
             "learning_rate": trial.suggest_float(
                 "learning_rate", 1e-5, 3e-4, log=True
@@ -3450,7 +3469,7 @@ def run_walk_forward_fusion(
                 "weight_decay", 1e-4, 1e-2, log=True
             ),
             "market_depth": (
-                trial.suggest_int("market_depth", 1, 2)
+                trial.suggest_int("market_depth", 1, 2, 3)
                 if market_encoder == "mlp" else 0
             ),
         }
