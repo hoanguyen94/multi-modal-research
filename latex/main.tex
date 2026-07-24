@@ -355,6 +355,11 @@ $\odot$; $[a;b]$ & Elementwise multiplication and vector concatenation. \\
 $u_{i,t}\in\R^{d_u}$ & Fused representation of stock $i$ at date $t$; $d_u$ is its dimension. \\
 $U_t\in\R^{N\times d_u}$; $\widetilde U_t$ & Matrix of all stock representations at date $t$ and its cross-sectionally contextualized version. \\
 $\widetilde u_{i,t}$; $w,b$ & Row of $\widetilde U_t$ for stock $i$, and the final classifier's weight vector and scalar bias. \\
+$P_k=(X_k^P,c_k,y_k)$; $p_k$ & The $k$th prototype, which is an actual training observation, and its frozen pooled TSFM representation. \\
+$K$; $K_0$ & Number of prototypes and maximum number of prototypes activated for one observation, with $K_0\ll K$. \\
+$d_{i,t,k}$; $r_{i,t,k}$ & Multimodal distance from observation $(i,t)$ to prototype $k$, and the corresponding sparse routing weight. \\
+$A_k,B_k$ & Rank-$r$ adapter matrices associated with prototype $k$. \\
+$z_{i,t,k}$; $\beta_k$; $C_{i,t,k}$ & Post-adaptation prototype evidence, prototype coefficient, and exact contribution $\beta_kz_{i,t,k}$ to the directional logit. \\
 $X\in\R^{L\times F}$; $x^{(f)}$ & Generic iTransformer input with $F$ variables, and the length-$L$ trajectory of variable $f$. \\
 $W_{\mathrm{emb}},b_{\mathrm{emb}},h_f^{(0)}$ & iTransformer trajectory-embedding matrix, bias, and initial token for variable $f$. \\
 $\mathcal A\in\R^{F\times F}$ & iTransformer attention-weight matrix across variables. \\
@@ -383,6 +388,8 @@ $\alpha$; $\widehat\sigma_{i,t}^{(H)}$; $\epsilon$ & Weighting strength, estimat
 $\widehat R_{i,t}^{(H)}$; $g_R$ & Predicted $H$-day log return and its auxiliary regression head. \\
 $\lambda_R$; $\lambda_D$ & Nonnegative weights on the auxiliary return loss and distillation loss. \\
 $\operatorname{Huber}$; $\operatorname{KL}$ & Huber regression loss and Kullback--Leibler divergence. \\
+$\mathcal L_{\mathrm{forecast}}$ & Mean forecasting loss over the current mini-batch; $\ell$ denotes the selected point or probabilistic forecasting loss. \\
+$\mathcal L_{\mathrm{margin}}$ & Logistic margin loss for directional prediction. \\
 $p^{\mathrm{teacher}}_{i,t}$; $p^{\mathrm{student}}_{i,t}$ & Ensemble teacher probability and student-model probability used for distillation. \\
 $w_S,b_S$ & Weight vector and scalar bias of the standalone student classifier. \\
 $\mathcal L_{\mathrm{distill}}$ & Combined binary-classification and teacher--student distillation objective. \\
@@ -2369,13 +2376,469 @@ across stocks.
 
 The proposed staged evaluation will determine whether the strongest practical
 solution is a simple stacked classifier, a frozen-representation model, a
-LoRA-adapted multimodal foundation model, or an ensemble of these approaches.
+LoRA-adapted multimodal foundation model, a prototype-routed interpretable
+model, or an ensemble of these approaches. The prototype-routed variant adds a
+separate methodological objective: each directional logit must be reconstructed
+exactly from a sparse set of inspectable historical cases, without an
+unrestricted prediction path that can bypass the explanation.
 
 
 % =========================================================
 \section{Methodological Novelty}
 % =========================================================
 
+The methodological objective is to make adaptation of a pretrained time-series
+foundation model both decision-specific and intrinsically case-interpretable.
+The central research question is:
+
+\begin{quote}
+Can pretrained time-series models be adapted through inspectable historical
+regimes while retaining competitive decision performance and providing exact,
+sparse, and stable case-based explanations?
+\end{quote}
+
+Directly optimizing a binary directional loss is standard classification, and
+input-dependent low-rank adaptation is already studied in parameter-efficient
+fine-tuning \citep{toplora}. Prototypes have also been used to explain
+time-series predictions \citep{obermair2023prototype}. The proposed
+contribution is therefore their integration under a strict architectural
+constraint: inspectable historical prototypes both route the low-rank
+adaptation and form the only evidence available to the final decision head.
+There is no unrestricted prediction path that can bypass the prototype
+bottleneck.
+
+\subsection{Forecasting Objective and Directional Decision}
+
+Let $Y_{i,t}$ be the future return for observation $(i,t)$ and let
+$\widehat Y_{i,t}$ be its numerical forecast. A conventional forecasting model
+minimizes
+
+\begin{equation}
+\mathcal L_{\mathrm{forecast}}
+=
+\frac{1}{B}
+\sum_{(i,t)\in\mathcal B}
+\ell\left(\widehat Y_{i,t},Y_{i,t}\right),
+\end{equation}
+
+where $\ell$ may be a point or probabilistic forecasting loss. The competition
+decision is instead
+
+\begin{equation}
+y_{i,t}
+=
+2\ind\{Y_{i,t}>0\}-1
+\in\{-1,+1\}.
+\end{equation}
+
+A small numerical forecasting error can reverse the sign when $Y_{i,t}$ is
+close to zero, whereas a large magnitude error may leave the sign unchanged.
+The primary model is therefore trained directly for direction. The forecasting
+loss remains an auxiliary ablation rather than a claimed methodological
+contribution.
+
+\subsection{Frozen Representation and Inspectable Prototype Bank}
+
+A pretrained TSFM with frozen parameters $\theta_0$ produces
+
+\begin{equation}
+H^0_{i,t}
+=
+f_{\theta_0}(X^P_{i,t})
+\in\R^{M\times d},
+\qquad
+h^0_{i,t}
+=
+\operatorname{Pool}(H^0_{i,t})
+\in\R^d.
+\end{equation}
+
+Within the training portion of each chronological fold, construct
+
+\begin{equation}
+\mathcal P
+=
+\left\{
+P_k=(X_k^P,c_k,y_k)
+\right\}_{k=1}^{K},
+\end{equation}
+
+where each prototype is an actual stock--date observation containing a
+historical price window, its permitted contextual embeddings, and its
+directional label. Cache
+
+\begin{equation}
+p_k
+=
+\operatorname{Pool}
+\left(
+f_{\theta_0}(X_k^P)
+\right).
+\end{equation}
+
+The bank is initialized using class-balanced $K$-medoids in the frozen
+representation space. Unlike a free latent prototype, every $P_k$ can be
+inspected as an observed historical price window. Prototype selection is
+repeated inside every outer fold and never uses validation or future data.
+
+\subsection{Multimodal Distance and Sparse Routing}
+
+Define the price-representation distance
+
+\begin{equation}
+d^P_{i,t,k}
+=
+1-
+\frac{
+(h^0_{i,t})^\top p_k
+}{
+\|h^0_{i,t}\|_2\|p_k\|_2
+}.
+\end{equation}
+
+For supplied text-embedding family $m$, define
+
+\begin{equation}
+d^{T,m}_{i,t,k}
+=
+1-
+\frac{
+(c^{(m)}_{i,t})^\top c^{(m)}_k
+}{
+\|c^{(m)}_{i,t}\|_2\|c^{(m)}_k\|_2+\epsilon
+}.
+\end{equation}
+
+The combined distance is
+
+\begin{equation}
+d_{i,t,k}
+=
+\omega_Pd^P_{i,t,k}
++
+\sum_{m=1}^{K_T}
+\omega_md^{T,m}_{i,t,k},
+\end{equation}
+
+where
+
+\begin{equation}
+\omega_P\geq0,
+\qquad
+\omega_m\geq0,
+\qquad
+\omega_P+\sum_{m=1}^{K_T}\omega_m=1.
+\end{equation}
+
+These global weights expose the contribution of price and each embedding
+family to case retrieval, without assigning semantic meaning to individual
+embedding coordinates.
+
+Only the $K_0$ closest prototypes may affect one observation:
+
+\begin{equation}
+\mathcal S_{i,t}
+=
+\operatorname{TopK}_{K_0}
+\left(
+-d_{i,t,1},\ldots,-d_{i,t,K}
+\right).
+\end{equation}
+
+The corresponding routing weights are
+
+\begin{equation}
+r_{i,t,k}
+=
+\begin{cases}
+\dfrac{
+\exp(-d_{i,t,k}/\tau)
+}{
+\displaystyle
+\sum_{\ell\in\mathcal S_{i,t}}
+\exp(-d_{i,t,\ell}/\tau)
+},
+&
+k\in\mathcal S_{i,t},
+\\[3ex]
+0,
+&
+k\notin\mathcal S_{i,t}.
+\end{cases}
+\end{equation}
+
+Thus,
+
+\begin{equation}
+\|\mathbf r_{i,t}\|_0\leq K_0,
+\qquad
+\sum_{k=1}^{K}r_{i,t,k}=1.
+\end{equation}
+
+Routing weights are inspectable but are not claimed to be faithful
+explanations by themselves; attention weights alone need not explain a
+prediction \citep{jain2019attention}.
+
+\subsection{Prototype-Routed Low-Rank Adaptation}
+
+Prototype $k$ owns a rank-$r$ representation adapter
+
+\begin{equation}
+A_k\in\R^{r\times d},
+\qquad
+B_k\in\R^{d\times r},
+\qquad
+r\ll d.
+\end{equation}
+
+The routed adapted representation is
+
+\begin{equation}
+\widetilde H_{i,t}
+=
+H^0_{i,t}
++
+\sum_{k\in\mathcal S_{i,t}}
+r_{i,t,k}
+H^0_{i,t}A_k^\top B_k^\top,
+\qquad
+\widetilde h_{i,t}
+=
+\operatorname{Pool}(\widetilde H_{i,t}).
+\end{equation}
+
+The rule-conservative implementation applies this adapter outside the frozen
+backbone. If backbone adaptation is explicitly permitted, the same
+prototype router can activate adapters at selected internal layers.
+
+\subsection{No-Bypass Additive Decision Bottleneck}
+
+After adaptation, the evidence supplied by prototype $k$ is
+
+\begin{equation}
+z_{i,t,k}
+=
+\begin{cases}
+\exp
+\left(
+-
+\dfrac{
+\|\widetilde h_{i,t}-p_k\|_2^2
+}{
+\sigma_k^2
+}
+\right),
+&
+k\in\mathcal S_{i,t},
+\\[2ex]
+0,
+&
+k\notin\mathcal S_{i,t}.
+\end{cases}
+\end{equation}
+
+The main intrinsically interpretable variant constrains
+
+\begin{equation}
+\beta_k
+=
+y_k\operatorname{softplus}(\eta_k).
+\end{equation}
+
+A positive prototype can therefore provide only positive evidence and a
+negative prototype only negative evidence. An ablation removes this constraint
+to measure its predictive cost.
+
+The final directional logit and probability are
+
+\begin{align}
+s_{i,t}
+&=
+b+\sum_{k=1}^{K}\beta_kz_{i,t,k},
+\\
+p_{i,t}
+&=
+\sigmoid(s_{i,t}).
+\end{align}
+
+There is no parallel unrestricted MLP head. Define the exact contribution
+
+\begin{equation}
+C_{i,t,k}
+=
+\beta_kz_{i,t,k}.
+\end{equation}
+
+Then
+
+\begin{equation}
+s_{i,t}
+=
+b+
+\sum_{k\in\mathcal S_{i,t}}
+C_{i,t,k}.
+\end{equation}
+
+The explanation identifies which historical regimes the model used and their
+exact numerical contributions. It is a faithful account of the model
+calculation, not a claim that those regimes caused the future return.
+
+\subsection{Directional Training Objective}
+
+The model minimizes the unweighted logistic margin loss
+
+\begin{equation}
+\mathcal L_{\mathrm{margin}}
+=
+\frac{1}{B}
+\sum_{(i,t)\in\mathcal B}
+\log
+\left[
+1+
+\exp
+\left(
+-y_{i,t}s_{i,t}
+\right)
+\right].
+\end{equation}
+
+Every stock--date observation receives equal weight, matching the directional
+hit-rate criterion. Capacity is controlled by $(K,K_0,r)$, adapter norm
+control, and chronological early stopping.
+
+\subsection{Formal Interpretability Properties}
+
+\paragraph{Exact completeness.}
+The explanation vector
+$C_{i,t}=(C_{i,t,1},\ldots,C_{i,t,K})$ satisfies
+
+\begin{equation}
+s_{i,t}-b
+=
+\sum_{k=1}^{K}C_{i,t,k}.
+\end{equation}
+
+It reconstructs the complete pre-sigmoid prediction, with no residual from a
+hidden decision head.
+
+\paragraph{Exact sparsity.}
+Because $z_{i,t,k}=0$ outside $\mathcal S_{i,t}$,
+
+\begin{equation}
+\|C_{i,t}\|_0
+\leq
+K_0.
+\end{equation}
+
+\paragraph{Intervention consistency.}
+Under the explicit intervention that sets $z_{i,t,k}$ to zero while holding
+the remaining evidence fixed, the resulting logit $s_{i,t}^{(-k)}$ obeys
+
+\begin{equation}
+s_{i,t}
+-
+s_{i,t}^{(-k)}
+=
+C_{i,t,k}.
+\end{equation}
+
+\paragraph{Selection stability.}
+Let $\xi_{i,t}$ be the concatenated normalized price and context
+representation used by the distance function, and suppose every
+$d_k(\xi)$ is $L_d$-Lipschitz. Define the retrieval gap
+
+\begin{equation}
+\Delta(\xi)
+=
+d_{(K_0+1)}(\xi)
+-
+d_{(K_0)}(\xi),
+\end{equation}
+
+where the subscripts denote ordered distances. If $\Delta(\xi)>0$ and
+
+\begin{equation}
+\|\xi'-\xi\|_2
+<
+\frac{\Delta(\xi)}{2L_d},
+\end{equation}
+
+then $\mathcal S(\xi')=\mathcal S(\xi)$. Each selected distance can increase
+by at most $L_d\|\xi'-\xi\|_2$, while each unselected distance can decrease by
+at most the same amount, so the ordering across the selection boundary cannot
+reverse. This supplies a testable sufficient condition for explanation
+stability.
+
+\subsection{Leakage-Safe Training and Evaluation}
+
+For each outer walk-forward fold:
+
+\begin{enumerate}
+    \item fit preprocessing and extract frozen representations using only the
+    outer training period;
+
+    \item select class-balanced prototype medoids from that period;
+
+    \item train prototype adapters, modality weights, distance scales, and
+    additive coefficients;
+
+    \item select $K$, $K_0$, $r$, and $\tau$ using inner chronological
+    validation;
+
+    \item freeze the pipeline and evaluate it once on the outer future period.
+\end{enumerate}
+
+Predictive evaluation reports hit rate, binary cross-entropy, parameter count,
+and fold-to-fold variability. Interpretability evaluation reports
+completeness, active-prototype count, comprehensiveness after removing the
+largest contributions, sufficiency when retaining only the largest
+contributions, Jaccard stability under small permissible perturbations,
+prototype-neighborhood purity and diversity, temporal coverage, and
+intervention consistency.
+
+Required comparisons include a frozen linear probe, forecast-then-threshold,
+an unrestricted MLP head, standard LoRA, token-wise or mixture-of-LoRA
+adaptation, a prototype classifier without adaptation, and the proposed model
+with and without the no-bypass bottleneck. The unrestricted-head ablation
+quantifies the accuracy cost of intrinsic interpretability.
+
+\subsection{Research Hypotheses and Claimed Contributions}
+
+\begin{description}
+    \item[H1.]
+    Prototype-routed adaptation improves directional accuracy over a frozen
+    prototype classifier and static LoRA under the same trainable-parameter
+    budget.
+
+    \item[H2.]
+    The sparse additive bottleneck retains most of the accuracy of an
+    unrestricted head while providing exact and more stable explanations.
+
+    \item[H3.]
+    Multimodal prototype retrieval improves prediction and regime
+    identification relative to price-only or text-only retrieval.
+
+    \item[H4.]
+    Prototype routing improves performance across chronological folds by
+    localizing adaptation to historically similar regimes.
+\end{description}
+
+The proposed research makes three focused contributions:
+
+\begin{enumerate}
+    \item a sparse, case-routed low-rank adapter for pretrained time-series
+    representations, grounded in actual historical observations;
+
+    \item a no-bypass additive prototype bottleneck that provides exact,
+    sparse, and intervention-consistent explanations of every directional
+    logit;
+
+    \item a leakage-safe evaluation framework that jointly measures predictive
+    performance, explanation faithfulness, prototype quality, and stability
+    under temporal shift.
+\end{enumerate}
+
+\iffalse
 The proposed work is not intended to contribute only a new architecture for
 one financial forecasting competition. Its broader methodological objective is
 to develop a decision-aligned and parameter-efficient adaptation framework for
@@ -2393,13 +2856,17 @@ downstream evaluation criterion.
 
 \subsection{Forecasting Loss versus Decision Loss}
 
-Let $Y$ denote the future quantity of interest and let $\widehat Y$ denote the
-model forecast. A conventional forecasting model minimizes a numerical loss
+Let $Y_{i,t}$ denote the future quantity of interest for observation $(i,t)$
+and let $\widehat Y_{i,t}$ denote its model forecast. Over a mini-batch
+$\mathcal B$, a conventional forecasting model minimizes the mean numerical
+loss
 
 \begin{equation}
 \mathcal{L}_{\mathrm{forecast}}
 =
-\ell(\widehat Y,Y),
+\frac{1}{B}
+\sum_{(i,t)\in\mathcal B}
+\ell\left(\widehat Y_{i,t},Y_{i,t}\right),
 \end{equation}
 
 where $\ell$ may be the mean squared error, mean absolute error, negative
@@ -2625,38 +3092,35 @@ representation.
 The zero-one directional loss is non-differentiable. A smooth surrogate is
 therefore required.
 
-For a realized future return $Y$ and a scalar model score $s_\theta(X)$, define
+For each $(i,t)\in\mathcal B$, let
+$y_{i,t}=2\ind\{Y_{i,t}>0\}-1\in\{-1,+1\}$ be the realized directional label
+and let $s_\theta(X_{i,t})\in\R$ be the model's signed directional score. The
+decision-aligned surrogate is
 
 \begin{equation}
 \mathcal{L}_{\mathrm{margin}}
 =
+\frac{1}{B}
+\sum_{(i,t)\in\mathcal B}
 \log
 \left[
 1+
 \exp
 \left(
--
-\frac{
-Y\,s_\theta(X)
-}{
-\tau_\theta(X)+\epsilon
-}
+-y_{i,t}\,s_\theta(X_{i,t})
 \right)
-\right],
+\right].
 \end{equation}
-
-where $\tau_\theta(X)>0$ is a learned local uncertainty or noise scale.
 
 The product
 
 \begin{equation}
-Y\,s_\theta(X)
+y_{i,t}\,s_\theta(X_{i,t})
 \end{equation}
 
 is positive when the prediction and the realized outcome have the same sign.
-The loss therefore encourages directional agreement. The uncertainty scale
-prevents observations with intrinsically high noise from dominating the
-training objective.
+The loss therefore encourages directional agreement and weights every
+observation equally, matching the unweighted directional hit-rate criterion.
 
 The full objective may combine decision quality, forecast information, and
 adaptation regularization:
@@ -2708,19 +3172,33 @@ frozen representation:
 \right\|_2^2.
 \end{equation}
 
-A relational alternative preserves pairwise token geometry:
+A relational alternative preserves pairwise token geometry. Let
+$Z\in\R^{M\times d}$ have nonzero token rows $z_1,\ldots,z_M$. Define its
+pairwise cosine-similarity matrix $S(Z)\in\R^{M\times M}$ entrywise as
+
+\begin{equation}
+\left[S(Z)\right]_{jk}
+=
+\frac{z_j^\top z_k}
+{\|z_j\|_2\|z_k\|_2},
+\qquad
+j,k\in\{1,\ldots,M\}.
+\end{equation}
+
+The relational consistency loss is then
 
 \begin{equation}
 \mathcal{L}_{\mathrm{rel}}
 =
 \left\|
-\operatorname{sim}(\widetilde H,\widetilde H)
+S(\widetilde H)
 -
-\operatorname{sim}(H,H)
+S(H)
 \right\|_F^2,
 \end{equation}
 
-where $\operatorname{sim}$ denotes a cosine-similarity matrix.
+so the diagonal entries of each similarity matrix are one, whereas its
+off-diagonal entries encode similarities between distinct tokens.
 
 This encourages the adapter to modify only the information needed for the
 downstream decision while preserving the global structure of the pretrained
@@ -2910,8 +3388,8 @@ The proposed research aims to make the following contributions:
     \item A multimodal adaptation mechanism in which contextual embeddings
     control the adaptation of the pretrained temporal backbone.
 
-    \item A margin-aware surrogate objective that accounts for both directional
-    correctness and local outcome uncertainty.
+    \item A margin-based surrogate objective that directly targets directional
+    correctness.
 
     \item An optional robustness framework for maintaining decision quality
     under temporal distribution shift.
@@ -2931,6 +3409,7 @@ modifies pretrained time-series representations according to downstream
 decision sensitivity, and we evaluate whether this approach reduces decision
 regret under limited supervision and temporal distribution shift.
 \end{quote}
+\fi
 
 
 
@@ -2973,6 +3452,27 @@ Woo, G., Liu, C., Kumar, A., Xiong, C., Savarese, S., and Sahoo, D.
 \newblock Unified training of universal time series forecasting transformers.
 \newblock \emph{Proceedings of the 41st International Conference on
 Machine Learning}, 2024.
+
+\bibitem[Jain and Wallace(2019)]{jain2019attention}
+Jain, S. and Wallace, B. C.
+\newblock Attention is not explanation.
+\newblock \emph{Proceedings of the 2019 Conference of the North American
+Chapter of the Association for Computational Linguistics}, 2019.
+
+\bibitem[Li et al.(2025)]{toplora}
+Li, S., Luo, X., Wang, H., Tang, X., Cui, Z., Liu, D., Li, Y., He, X.,
+and Li, R.
+\newblock Beyond higher rank: Token-wise input--output projections for
+efficient low-rank adaptation.
+\newblock \emph{Advances in Neural Information Processing Systems}, 2025.
+
+\bibitem[Obermair et al.(2023)]{obermair2023prototype}
+Obermair, C., Fuchs, A., Pernkopf, F., Felsberger, L., Apollonio, A.,
+and Wollmann, D.
+\newblock Example or prototype? Learning concept-based explanations in
+time-series.
+\newblock \emph{Proceedings of the 14th Asian Conference on Machine Learning},
+2023.
 
 \bibitem[Bai et al.(2018)]{tcn}
 Bai, S., Kolter, J. Z., and Koltun, V.

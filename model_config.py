@@ -22,21 +22,58 @@ PRICE_CACHE_DIR = (
     / "timesfm_simple_concatenation"
     / "price_latents"
 )
+CHRONOS2_PRICE_CACHE_DIR = (
+    ARTIFACT_DIR
+    / "stage2_pretrained_forecasts"
+    / "chronos2_multivariate"
+    / "price_latents"
+)
+PRICE_CACHE_DIRS = {
+    "timesfm": PRICE_CACHE_DIR,
+    "chronos2": CHRONOS2_PRICE_CACHE_DIR,
+}
 PRETRAINED_OUTPUT_DIR = (
     ARTIFACT_DIR
     / "stage2_pretrained_forecasts"
     / "timesfm_covariates_unified_raw_text_attention3"
 )
+CHRONOS2_PRETRAINED_OUTPUT_DIR = (
+    ARTIFACT_DIR
+    / "stage2_pretrained_forecasts"
+    / "chronos2_multivariate_covariates_unified_raw_text_attention"
+)
+PRETRAINED_OUTPUT_DIRS = {
+    "timesfm": PRETRAINED_OUTPUT_DIR,
+    "chronos2": CHRONOS2_PRETRAINED_OUTPUT_DIR,
+}
 TFT_OUTPUT_DIR = (
     ARTIFACT_DIR
     / "stage2_pretrained_forecasts"
     / "timesfm_temporal_tft_unified_raw_text_attention"
 )
+CHRONOS2_TFT_OUTPUT_DIR = (
+    ARTIFACT_DIR
+    / "stage2_pretrained_forecasts"
+    / "chronos2_multivariate_temporal_tft_unified_raw_text_attention"
+)
+TFT_OUTPUT_DIRS = {
+    "timesfm": TFT_OUTPUT_DIR,
+    "chronos2": CHRONOS2_TFT_OUTPUT_DIR,
+}
 CROSS_STOCK_TFT_OUTPUT_DIR = (
     ARTIFACT_DIR
     / "stage2_pretrained_forecasts"
     / "timesfm_temporal_tft_cross_stock_unified_raw_text_attention"
 )
+CHRONOS2_CROSS_STOCK_TFT_OUTPUT_DIR = (
+    ARTIFACT_DIR
+    / "stage2_pretrained_forecasts"
+    / "chronos2_multivariate_temporal_tft_cross_stock_unified_raw_text_attention"
+)
+CROSS_STOCK_TFT_OUTPUT_DIRS = {
+    "timesfm": CROSS_STOCK_TFT_OUTPUT_DIR,
+    "chronos2": CHRONOS2_CROSS_STOCK_TFT_OUTPUT_DIR,
+}
 
 # Shared experiment protocol.
 RANDOM_STATE = 42
@@ -73,11 +110,33 @@ KNOWN_FUTURE_PREFIXES = (
     "trading_month_fourier_",
 )
 
-# Frozen TimesFM and shared fusion defaults.
-PRICE_ENCODER_MODEL_ID = "google/timesfm-2.5-200m-pytorch"
+# Frozen price encoders and shared fusion defaults.
+PRICE_ENCODERS = ("timesfm", "chronos2")
+DEFAULT_PRICE_ENCODER = "chronos2"
+TIMESFM_MODEL_ID = "google/timesfm-2.5-200m-pytorch"
+CHRONOS2_MODEL_ID = "amazon/chronos-2"
+PRICE_ENCODER_MODEL_IDS = {
+    "timesfm": TIMESFM_MODEL_ID,
+    "chronos2": CHRONOS2_MODEL_ID,
+}
+# Backward-compatible alias for code that still names the TimesFM-only default.
+PRICE_ENCODER_MODEL_ID = TIMESFM_MODEL_ID
 LOOKBACK = 512
 MIN_CONTEXT = 64
 TIMESFM_INPUT_COLUMN = "ret_20"
+# Chronos-2 treats these ordered histories as jointly attended target
+# variates. They are all observed by the forecast origin and are stationary or
+# approximately stationary, apart from log-volume which Chronos-2 normalizes
+# per variate.
+CHRONOS2_INPUT_COLUMNS = (
+    "ret_1",
+    "ret_5",
+    "ret_20",
+    "log_hl_range",
+    "log_close_open",
+    "log_volume",
+    "volume_change_1",
+)
 RAW_TEXT_DIM = 384
 TEXT_ATTENTION_HEADS = 4
 TEXT_ATTENTION_LAYERS = 1

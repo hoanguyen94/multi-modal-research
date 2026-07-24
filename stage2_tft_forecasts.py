@@ -1,6 +1,7 @@
 """Run Stage 2 with a Temporal Fusion Transformer market encoder.
 
-This variant preserves the frozen TimesFM price representation and replaces
+This variant preserves a frozen TimesFM or multivariate Chronos-2 price
+representation and replaces
 the row-level residual market MLP with an encoder-only TFT over historical
 market feature windows. Raw embedding families are adapted jointly inside the
 model, combined with field/family identities, contextualized by text
@@ -16,7 +17,7 @@ import json
 import polars as pl
 
 from latent_fusion import (
-    generate_timesfm_price_latents,
+    generate_frozen_price_latents,
     parquet_embedding_dim,
     run_walk_forward_fusion,
 )
@@ -24,6 +25,7 @@ from model_config import (
     ADAPTER_LEARNING_RATE_MULTIPLIER,
     BASELINE_DIR,
     DATA_DIR,
+    DEFAULT_PRICE_ENCODER,
     DEFAULT_TEXT_FAMILIES,
     DEFAULT_TRAINING_MODE,
     EARLY_STOPPING_MIN_DELTA,
@@ -43,8 +45,7 @@ from model_config import (
     PREPARED_TEST_PATH,
     PREPARED_TRAIN_PATH,
     PRICE_BATCH_SIZE,
-    PRICE_CACHE_DIR,
-    PRICE_ENCODER_MODEL_ID,
+    PRICE_ENCODERS,
     RANDOM_STATE,
     RAW_FUSION_BATCH_SIZE,
     RAW_TEST_PATH,
@@ -58,9 +59,8 @@ from model_config import (
     TFT_ATTENTION_HEADS,
     TFT_LOOKBACK,
     TFT_LOOKBACK_CANDIDATES,
-    TFT_OUTPUT_DIR as OUTPUT_DIR,
+    TFT_OUTPUT_DIRS,
     TFT_TEMPORAL_COLUMNS,
-    TIMESFM_INPUT_COLUMN,
     TRAINING_MODES,
     TRAIN_LINK_PATH,
     TRAIN_TARGET_PATH,
@@ -68,6 +68,7 @@ from model_config import (
 )
 from stage2_pretrained_forecasts import (
     classify_covariates,
+    price_encoder_settings,
     require_paths,
     select_device,
 )
@@ -100,12 +101,21 @@ def parse_args(description: str | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--price-encoder",
+        choices=PRICE_ENCODERS,
+        default=DEFAULT_PRICE_ENCODER,
+        help=(
+            "Frozen backbone: TimesFM over ret_20 or Chronos-2 over jointly "
+            "attended market variates."
+        ),
+    )
+    parser.add_argument(
         "--no-price-extraction", action="store_true",
-        help="Require existing TimesFM latent caches.",
+        help="Require existing frozen price-latent caches.",
     )
     parser.add_argument(
         "--force-price-refresh", action="store_true",
-        help="Regenerate the frozen TimesFM latent caches.",
+        help="Regenerate the frozen price-latent caches.",
     )
     return parser.parse_args()
 
@@ -113,7 +123,7 @@ def parse_args(description: str | None = None) -> argparse.Namespace:
 def run_tft_pipeline(
     args: argparse.Namespace,
     *,
-    output_dir=OUTPUT_DIR,
+    output_dir=None,
     cross_stock_attention: bool = False,
     cross_stock_attention_heads: int = CROSS_STOCK_ATTENTION_HEADS,
 ) -> dict[str, pl.DataFrame]:
@@ -167,14 +177,41 @@ def run_tft_pipeline(
         text_availability_covariates,
         model_covariates,
     ) = classify_covariates(train_features)
+    (
+        price_model_id,
+        price_input_columns,
+        price_cache_dir,
+        _,
+    ) = price_encoder_settings(args.price_encoder)
+    if output_dir is None:
+        output_dir = TFT_OUTPUT_DIRS[args.price_encoder]
+    missing_price_inputs = sorted(
+        set(price_input_columns) - set(past_market_covariates)
+    )
+    if missing_price_inputs:
+        raise ValueError(
+            f"{args.price_encoder} historical inputs are unavailable: "
+            f"{missing_price_inputs}"
+        )
     missing_temporal = sorted(set(TFT_TEMPORAL_COLUMNS) - set(past_market_covariates))
     if missing_temporal:
         raise ValueError(f"TFT temporal features are unavailable: {missing_temporal}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "feature_groups.json").write_text(json.dumps({
-        "frozen_price_encoder": PRICE_ENCODER_MODEL_ID,
-        "timesfm_hidden_input": TIMESFM_INPUT_COLUMN,
+        "frozen_price_encoder": args.price_encoder,
+        "price_encoder_model_id": price_model_id,
+        "price_encoder_input_columns": list(price_input_columns),
+        "price_hidden_covariate_support": (
+            "univariate_target_only"
+            if args.price_encoder == "timesfm"
+            else "joint_multivariate_targets"
+        ),
+        "price_hidden_pooling": (
+            "mean_context_patches"
+            if args.price_encoder == "chronos2"
+            else "mean_hidden_sequence"
+        ),
         "market_encoder": "temporal_fusion_transformer",
         "tft_temporal_covariates": list(TFT_TEMPORAL_COLUMNS),
         "tft_lookback": TFT_LOOKBACK,
@@ -227,12 +264,16 @@ def run_tft_pipeline(
     ).select(ID_COLUMNS)
     test_origins = test_features.select(ID_COLUMNS)
 
-    train_price_latents = generate_timesfm_price_latents(
+    train_price_latents = generate_frozen_price_latents(
+        encoder=args.price_encoder,
+        input_columns=price_input_columns,
         split="train",
         prepared_features=train_features,
         origins=train_origins,
-        cache_path=PRICE_CACHE_DIR / "train_timesfm_pooled_hidden.parquet",
-        model_id=PRICE_ENCODER_MODEL_ID,
+        cache_path=price_cache_dir / (
+            f"train_{args.price_encoder}_pooled_hidden.parquet"
+        ),
+        model_id=price_model_id,
         device=device,
         horizon=HORIZON,
         lookback=LOOKBACK,
@@ -241,12 +282,16 @@ def run_tft_pipeline(
         run_extraction=not args.no_price_extraction,
         force_refresh=args.force_price_refresh,
     )
-    test_price_latents = generate_timesfm_price_latents(
+    test_price_latents = generate_frozen_price_latents(
+        encoder=args.price_encoder,
+        input_columns=price_input_columns,
         split="test",
         prepared_features=test_features,
         origins=test_origins,
-        cache_path=PRICE_CACHE_DIR / "test_timesfm_pooled_hidden.parquet",
-        model_id=PRICE_ENCODER_MODEL_ID,
+        cache_path=price_cache_dir / (
+            f"test_{args.price_encoder}_pooled_hidden.parquet"
+        ),
+        model_id=price_model_id,
         device=device,
         horizon=HORIZON,
         lookback=LOOKBACK,
@@ -302,6 +347,7 @@ def run_tft_pipeline(
         early_stopping_patience=EARLY_STOPPING_PATIENCE,
         early_stopping_min_delta=EARLY_STOPPING_MIN_DELTA,
         run_outer_folds=args.training_mode == "nested-folds",
+        price_encoder=args.price_encoder,
     )
 
     reports = []

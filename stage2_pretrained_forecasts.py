@@ -1,8 +1,9 @@
-"""Run Stage 2 frozen-TimesFM covariate and text fusion outside Jupyter.
+"""Run Stage 2 frozen-TSFM covariate and text fusion outside Jupyter.
 
 This is the script equivalent of ``stage2_pretrained_forecasts.ipynb``.  It
-loads the prepared Polars artifacts, reuses or extracts frozen TimesFM hidden
-states, jointly adapts raw text-embedding families inside each fold, performs
+loads the prepared Polars artifacts, reuses or extracts frozen TimesFM or
+multivariate Chronos-2 hidden states, jointly adapts raw text-embedding
+families inside each fold, performs
 Optuna model selection, refits on all labeled training rows, evaluates 2022
 and 2023 separately, and writes one 52,000-row submission CSV per fitted model.
 """
@@ -19,14 +20,16 @@ import polars as pl
 import torch
 
 from latent_fusion import (
-    generate_timesfm_price_latents,
+    generate_frozen_price_latents,
     parquet_embedding_dim,
     run_walk_forward_fusion,
 )
 from model_config import (
     ADAPTER_LEARNING_RATE_MULTIPLIER,
     BASELINE_DIR,
+    CHRONOS2_INPUT_COLUMNS,
     DATA_DIR,
+    DEFAULT_PRICE_ENCODER,
     DEFAULT_TEXT_FAMILIES,
     DEFAULT_TRAINING_MODE,
     EARLY_STOPPING_MIN_DELTA,
@@ -47,10 +50,11 @@ from model_config import (
     OPTUNA_TRIALS,
     PREPARED_TEST_PATH,
     PREPARED_TRAIN_PATH,
-    PRETRAINED_OUTPUT_DIR as OUTPUT_DIR,
+    PRETRAINED_OUTPUT_DIRS,
     PRICE_BATCH_SIZE,
-    PRICE_CACHE_DIR,
-    PRICE_ENCODER_MODEL_ID,
+    PRICE_CACHE_DIRS,
+    PRICE_ENCODER_MODEL_IDS,
+    PRICE_ENCODERS,
     RANDOM_STATE,
     RAW_TEST_PATH,
     RAW_TEXT_DIM,
@@ -97,14 +101,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--price-encoder",
+        choices=PRICE_ENCODERS,
+        default=DEFAULT_PRICE_ENCODER,
+        help=(
+            "Frozen backbone: TimesFM over ret_20 or Chronos-2 over the "
+            "configured jointly attended market variates."
+        ),
+    )
+    parser.add_argument(
         "--no-price-extraction",
         action="store_true",
-        help="Require existing TimesFM latent caches.",
+        help="Require existing frozen price-latent caches.",
     )
     parser.add_argument(
         "--force-price-refresh",
         action="store_true",
-        help="Regenerate the frozen TimesFM latent caches.",
+        help="Regenerate the frozen price-latent caches.",
     )
     return parser.parse_args()
 
@@ -148,14 +161,29 @@ def classify_covariates(
         and column not in known_future
         and column not in text_availability
     )
-    if TIMESFM_INPUT_COLUMN not in past_market:
-        raise ValueError(
-            f"{TIMESFM_INPUT_COLUMN} is absent from historical market features"
-        )
     model_covariates = (*past_market, *known_future, *text_availability)
     if len(model_covariates) != len(set(model_covariates)):
         raise ValueError("Engineered covariate groups overlap")
     return past_market, known_future, text_availability, model_covariates
+
+
+def price_encoder_settings(
+    encoder: str,
+) -> tuple[str, tuple[str, ...], Path, Path]:
+    """Resolve the model, ordered inputs, cache, and output for one backbone."""
+    if encoder not in PRICE_ENCODERS:
+        raise ValueError(f"Unknown price encoder {encoder!r}")
+    input_columns = (
+        (TIMESFM_INPUT_COLUMN,)
+        if encoder == "timesfm"
+        else tuple(CHRONOS2_INPUT_COLUMNS)
+    )
+    return (
+        PRICE_ENCODER_MODEL_IDS[encoder],
+        input_columns,
+        PRICE_CACHE_DIRS[encoder],
+        PRETRAINED_OUTPUT_DIRS[encoder],
+    )
 
 
 def main() -> None:
@@ -210,15 +238,40 @@ def main() -> None:
         text_availability_covariates,
         model_covariates,
     ) = classify_covariates(train_features)
+    (
+        price_model_id,
+        price_input_columns,
+        price_cache_dir,
+        output_dir,
+    ) = price_encoder_settings(args.price_encoder)
+    missing_price_inputs = sorted(
+        set(price_input_columns) - set(past_market_covariates)
+    )
+    if missing_price_inputs:
+        raise ValueError(
+            f"{args.price_encoder} historical inputs are unavailable: "
+            f"{missing_price_inputs}"
+        )
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    (OUTPUT_DIR / "feature_groups.json").write_text(json.dumps({
-        "timesfm_hidden_input": TIMESFM_INPUT_COLUMN,
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "feature_groups.json").write_text(json.dumps({
+        "frozen_price_encoder": args.price_encoder,
+        "price_encoder_model_id": price_model_id,
+        "price_encoder_input_columns": list(price_input_columns),
         "past_market_covariates": list(past_market_covariates),
         "known_future_covariates": list(known_future_covariates),
         "past_text_availability_covariates": list(text_availability_covariates),
         "model_covariate_count": len(model_covariates),
-        "timesfm_hidden_covariate_support": "univariate_target_only",
+        "price_hidden_covariate_support": (
+            "univariate_target_only"
+            if args.price_encoder == "timesfm"
+            else "joint_multivariate_targets"
+        ),
+        "price_hidden_pooling": (
+            "mean_context_patches"
+            if args.price_encoder == "chronos2"
+            else "mean_hidden_sequence"
+        ),
         "text_input": "raw_embedding_families",
         "raw_text_shared_dim": RAW_TEXT_DIM,
         "text_attention_heads": TEXT_ATTENTION_HEADS,
@@ -262,12 +315,16 @@ def main() -> None:
         f"covariates={len(model_covariates)}"
     )
 
-    train_price_latents = generate_timesfm_price_latents(
+    train_price_latents = generate_frozen_price_latents(
+        encoder=args.price_encoder,
+        input_columns=price_input_columns,
         split="train",
         prepared_features=train_features,
         origins=train_origins,
-        cache_path=PRICE_CACHE_DIR / "train_timesfm_pooled_hidden.parquet",
-        model_id=PRICE_ENCODER_MODEL_ID,
+        cache_path=price_cache_dir / (
+            f"train_{args.price_encoder}_pooled_hidden.parquet"
+        ),
+        model_id=price_model_id,
         device=device,
         horizon=HORIZON,
         lookback=LOOKBACK,
@@ -276,12 +333,16 @@ def main() -> None:
         run_extraction=not args.no_price_extraction,
         force_refresh=args.force_price_refresh,
     )
-    test_price_latents = generate_timesfm_price_latents(
+    test_price_latents = generate_frozen_price_latents(
+        encoder=args.price_encoder,
+        input_columns=price_input_columns,
         split="test",
         prepared_features=test_features,
         origins=test_origins,
-        cache_path=PRICE_CACHE_DIR / "test_timesfm_pooled_hidden.parquet",
-        model_id=PRICE_ENCODER_MODEL_ID,
+        cache_path=price_cache_dir / (
+            f"test_{args.price_encoder}_pooled_hidden.parquet"
+        ),
+        model_id=price_model_id,
         device=device,
         horizon=HORIZON,
         lookback=LOOKBACK,
@@ -297,7 +358,7 @@ def main() -> None:
 
     results = run_walk_forward_fusion(
         data_dir=DATA_DIR,
-        output_dir=OUTPUT_DIR,
+        output_dir=output_dir,
         baseline_dir=BASELINE_DIR,
         train_price_latents=train_price_latents,
         test_price_latents=test_price_latents,
@@ -334,6 +395,7 @@ def main() -> None:
         early_stopping_patience=EARLY_STOPPING_PATIENCE,
         early_stopping_min_delta=EARLY_STOPPING_MIN_DELTA,
         run_outer_folds=args.training_mode == "nested-folds",
+        price_encoder=args.price_encoder,
     )
 
     if args.training_mode == "nested-folds":

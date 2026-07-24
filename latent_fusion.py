@@ -1,7 +1,7 @@
 """Memory-conscious helpers for frozen-price, covariate, and text fusion.
 
-The notebook owns TimesFM loading and hidden-state extraction. This module
-streams raw embedding families through trainable in-model adapters, preserves
+This module owns frozen TSFM hidden-state extraction and streams raw embedding
+families through trainable in-model adapters, preserves
 semantic text-field tokens, applies shared text self-attention, and uses the
 market representation as a cross-attention query before fusion.
 """
@@ -357,7 +357,7 @@ class MarketConditionedArticlePool(nn.Module):
 class CovariateResidualFusion(nn.Module):
     """Fuse a residual market MLP with family-specific text representations.
 
-    The frozen TimesFM vector is concatenated with fold-standardized engineered
+    The frozen price vector is concatenated with fold-standardized engineered
     covariates first.  A residual MLP turns that joint numeric input into the
     market representation. Original text-embedding families and semantic text
     fields remain separate until market-conditioned masked attention pools the
@@ -2013,6 +2013,35 @@ def _prepared_history_lookup(
     return histories, positions
 
 
+def _prepared_multivariate_history_lookup(
+    features: pl.DataFrame,
+    target_columns: Sequence[str],
+) -> tuple[dict, dict]:
+    """Return per-ticker ``(n_variates, time)`` histories in a fixed order."""
+    columns = tuple(target_columns)
+    if not columns:
+        raise ValueError("At least one Chronos-2 input column is required")
+    missing = sorted(set(columns) - set(features.columns))
+    if missing:
+        raise ValueError(f"Missing Chronos-2 input columns: {missing}")
+    if len(columns) != len(set(columns)):
+        raise ValueError("Chronos-2 input columns must be unique")
+
+    histories, positions = {}, {}
+    for ticker, frame in features.sort(["ticker", "date"]).partition_by(
+        "ticker", as_dict=True
+    ).items():
+        key = ticker[0] if isinstance(ticker, tuple) else ticker
+        dates = frame["date"].to_list()
+        # Chronos2Pipeline.embed expects each multivariate case as
+        # (n_variates, history_length).
+        histories[key] = (
+            frame.select(columns).to_numpy().astype(np.float32).T
+        )
+        positions[key] = {date: index for index, date in enumerate(dates)}
+    return histories, positions
+
+
 def _context_record(
     history: dict,
     position: int,
@@ -2025,6 +2054,25 @@ def _context_record(
     if len(target) < min_context or np.any(~np.isfinite(target)):
         return None
     return {"target": target}
+
+
+def _multivariate_context_array(
+    history: np.ndarray,
+    position: int,
+    horizon: int,
+    lookback: int,
+    min_context: int,
+) -> np.ndarray | None:
+    """Slice a finite ``(n_variates, time)`` context ending at ``position``."""
+    if history.ndim != 2:
+        raise ValueError(
+            f"Expected a 2D multivariate history, received shape {history.shape}"
+        )
+    start = max(horizon, position + 1 - lookback)
+    target = history[:, start:position + 1].astype(np.float32, copy=False)
+    if target.shape[1] < min_context or np.any(~np.isfinite(target)):
+        return None
+    return target
 
 
 def _load_frozen_timesfm(model_id: str, device: str):
@@ -2266,6 +2314,264 @@ def generate_timesfm_price_latents(
     return result
 
 
+def _load_frozen_chronos2(model_id: str, device: str):
+    """Load Chronos-2 for inference without enabling any trainable parameter."""
+    try:
+        from chronos import Chronos2Pipeline
+    except ImportError as error:
+        raise ImportError(
+            "Chronos-2 extraction requires chronos-forecasting>=2.1.0. "
+            "Install it with `python -m pip install "
+            "\"chronos-forecasting>=2.1.0\"`."
+        ) from error
+
+    pipeline = Chronos2Pipeline.from_pretrained(
+        model_id,
+        device_map=device,
+    )
+    if not hasattr(pipeline, "embed"):
+        raise RuntimeError(
+            "The installed chronos-forecasting package does not expose "
+            "Chronos2Pipeline.embed; version 2.1.0 or newer is required"
+        )
+    pipeline.model.eval()
+    for parameter in pipeline.model.parameters():
+        parameter.requires_grad_(False)
+    return pipeline
+
+
+def _pooled_chronos2_hidden(
+    pipeline,
+    contexts: Sequence[np.ndarray],
+    *,
+    input_columns: Sequence[str],
+    lookback: int,
+    batch_size: int,
+) -> np.ndarray:
+    """Pool context patches per variate and concatenate variates in order.
+
+    ``Chronos2Pipeline.embed`` returns one tensor per case with shape
+    ``(n_variates, num_patches + 2, d_model)``. Chronos-2 orders these as the
+    observed context patches followed by the REG token and masked output-patch
+    token. The final two positions are excluded so that the cached vector is
+    the mean of observed context patches only. Concatenation, rather than
+    averaging over variates, preserves the configured variate identity for the
+    downstream fusion model.
+    """
+    columns = tuple(input_columns)
+    if not contexts:
+        raise ValueError("Cannot extract Chronos-2 embeddings from an empty batch")
+    expected_variates = len(columns)
+    if expected_variates < 1:
+        raise ValueError("Chronos-2 requires at least one configured variate")
+    for context in contexts:
+        if context.ndim != 2 or context.shape[0] != expected_variates:
+            raise ValueError(
+                "Chronos-2 context shape does not match configured variates: "
+                f"expected ({expected_variates}, T), received {context.shape}"
+            )
+        if context.shape[1] > lookback:
+            raise ValueError(
+                f"Chronos-2 context length {context.shape[1]} exceeds {lookback}"
+            )
+        if not np.isfinite(context).all():
+            raise ValueError("Chronos-2 contexts must contain only finite values")
+
+    embeddings, _ = pipeline.embed(
+        list(contexts),
+        batch_size=max(int(batch_size), expected_variates),
+        context_length=lookback,
+    )
+    if len(embeddings) != len(contexts):
+        raise RuntimeError(
+            "Chronos-2 returned a different number of embeddings than inputs"
+        )
+
+    pooled_rows = []
+    hidden_width = None
+    for embedding in embeddings:
+        tensor = torch.as_tensor(embedding).detach().float().cpu()
+        if tensor.ndim != 3 or tensor.shape[0] != expected_variates:
+            raise RuntimeError(
+                "Unexpected Chronos-2 embedding shape: expected "
+                f"({expected_variates}, patches + 2, d_model), got "
+                f"{tuple(tensor.shape)}"
+            )
+        if tensor.shape[1] <= 2:
+            raise RuntimeError(
+                "Chronos-2 embedding contains no observed context-patch tokens"
+            )
+        # Chronos2Model.encode appends [REG] and then the masked future patch
+        # after all context patches.
+        context_tokens = tensor[:, :-2, :]
+        pooled = context_tokens.mean(dim=1)
+        if not torch.isfinite(pooled).all():
+            raise ValueError("Chronos-2 produced a non-finite pooled embedding")
+        if hidden_width is None:
+            hidden_width = int(pooled.shape[1])
+        elif pooled.shape[1] != hidden_width:
+            raise RuntimeError("Chronos-2 hidden width changed within one batch")
+        pooled_rows.append(pooled.reshape(-1).numpy())
+    return np.stack(pooled_rows).astype(np.float32, copy=False)
+
+
+def generate_chronos2_price_latents(
+    *,
+    split: str,
+    prepared_features: pl.DataFrame,
+    origins: pl.DataFrame,
+    cache_path: Path,
+    model_id: str,
+    input_columns: Sequence[str],
+    device: str,
+    horizon: int,
+    lookback: int,
+    min_context: int,
+    batch_size: int = 16,
+    run_extraction: bool = True,
+    force_refresh: bool = False,
+) -> pl.DataFrame:
+    """Cache frozen multivariate Chronos-2 last-encoder representations."""
+    columns = tuple(input_columns)
+    manifest_path = cache_path.with_suffix(".manifest.json")
+    expected_manifest = {
+        "encoder": "chronos2",
+        "model_id": model_id,
+        "input_columns": list(columns),
+        "pooling": "mean_context_patches_per_variate_then_concatenate",
+        "embedding_layout": "context_patches_then_reg_then_masked_output",
+        "lookback": int(lookback),
+        "min_context": int(min_context),
+        "horizon": int(horizon),
+        "prepared_features_fingerprint": _dataframe_fingerprint(
+            prepared_features,
+            ["row_id", "date", "ticker", *columns],
+        ),
+        "origins_fingerprint": _dataframe_fingerprint(
+            origins,
+            ["row_id", "date", "ticker"],
+        ),
+    }
+    if cache_path.exists() and not force_refresh:
+        manifest = (
+            json.loads(manifest_path.read_text())
+            if manifest_path.exists() else None
+        )
+        cached = pl.read_parquet(cache_path)
+        latent_columns = [
+            column for column in cached.columns
+            if column.startswith("price_latent_")
+        ]
+        invalid_rows = _nonfinite_row_count(cached, latent_columns)
+        if manifest == expected_manifest and latent_columns and invalid_rows == 0:
+            return cached
+        if not run_extraction:
+            raise ValueError(
+                f"{cache_path} is stale or invalid for the requested "
+                "Chronos-2 configuration; enable extraction to rebuild it"
+            )
+        print(
+            f"Rebuilding {cache_path}: its manifest or latent values do not "
+            "match the requested Chronos-2 configuration."
+        )
+    if not run_extraction:
+        raise FileNotFoundError(
+            f"{cache_path} is absent; enable Chronos-2 latent extraction"
+        )
+
+    histories, positions = _prepared_multivariate_history_lookup(
+        prepared_features, columns
+    )
+    pipeline = _load_frozen_chronos2(model_id, device)
+    parts = []
+    for batch in origins.iter_slices(batch_size):
+        kept, contexts = [], []
+        for row in batch.iter_rows(named=True):
+            context = _multivariate_context_array(
+                histories[row["ticker"]],
+                positions[row["ticker"]][row["date"]],
+                horizon,
+                lookback,
+                min_context,
+            )
+            if context is not None:
+                kept.append(row)
+                contexts.append(context)
+        if not contexts:
+            continue
+        latent = _pooled_chronos2_hidden(
+            pipeline,
+            contexts,
+            input_columns=columns,
+            lookback=lookback,
+            batch_size=batch_size,
+        )
+        identity = pl.DataFrame({
+            "row_id": [row["row_id"] for row in kept],
+            "date": [row["date"] for row in kept],
+            "ticker": [row["ticker"] for row in kept],
+        })
+        parts.append(pl.concat([
+            identity,
+            pl.DataFrame(
+                latent,
+                schema=[
+                    f"price_latent_{j:04d}" for j in range(latent.shape[1])
+                ],
+            ),
+        ], how="horizontal"))
+
+    if not parts:
+        raise RuntimeError(f"No valid {split} Chronos-2 contexts were created")
+    result = pl.concat(parts).sort("row_id")
+    latent_columns = [
+        column for column in result.columns if column.startswith("price_latent_")
+    ]
+    invalid_rows = _nonfinite_row_count(result, latent_columns)
+    if invalid_rows:
+        raise ValueError(
+            f"Refusing to cache {invalid_rows:,} rows with non-finite "
+            "Chronos-2 latents"
+        )
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    result.write_parquet(cache_path, compression="zstd")
+    manifest_path.write_text(json.dumps(expected_manifest, indent=2))
+    del pipeline
+    gc.collect()
+    if device == "mps":
+        torch.mps.empty_cache()
+    elif device == "cuda":
+        torch.cuda.empty_cache()
+    return result
+
+
+def generate_frozen_price_latents(
+    *,
+    encoder: str,
+    input_columns: Sequence[str],
+    **kwargs,
+) -> pl.DataFrame:
+    """Dispatch frozen hidden-state extraction without changing cache schema."""
+    columns = tuple(input_columns)
+    if encoder == "timesfm":
+        if len(columns) != 1:
+            raise ValueError(
+                "The TimesFM hidden interface requires exactly one input column"
+            )
+        # The legacy TimesFM helper owns its established input-column contract.
+        if columns[0] != "ret_20":
+            raise ValueError(
+                "The current TimesFM implementation extracts only ret_20"
+            )
+        return generate_timesfm_price_latents(**kwargs)
+    if encoder == "chronos2":
+        return generate_chronos2_price_latents(
+            input_columns=columns,
+            **kwargs,
+        )
+    raise ValueError(f"Unsupported frozen price encoder: {encoder}")
+
+
 def _load_text_coder(path: Path, input_dim: int, latent_dim: int) -> TextCoder:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     coder = TextCoder(input_dim, latent_dim)
@@ -2381,7 +2687,7 @@ def _assemble_fusion_arrays(
         The rows belonging to the requested partition, such as one fold's
         training or validation IDs. Rows outside this table are excluded.
     price_latents:
-        Frozen TimesFM representations. It must contain ``row_id``, ``date``,
+        Frozen price representations. It must contain ``row_id``, ``date``,
         ``ticker``, and columns named ``price_latent_*``.
     targets:
         Direction labels keyed by ``row_id``. A null label is allowed for test
@@ -2431,7 +2737,7 @@ def _assemble_fusion_arrays(
         pl.col("row_id").cast(pl.UInt64), "target_up"
     ])
     frame = (
-        # Keep only requested rows that have a frozen TimesFM representation.
+        # Keep only requested rows that have a frozen price representation.
         scoped_ids.join(scoped_price, on="row_id", how="inner")
         # Labels are attached without determining row inclusion at this stage.
         .join(scoped_targets, on="row_id", how="left")
@@ -2501,7 +2807,7 @@ def _assemble_fusion_arrays(
     text = np.ascontiguousarray(text)
     mask = np.ascontiguousarray(mask)
     target = frame["target_up"].to_numpy().astype(np.float32)
-    _require_finite("TimesFM price latents", price)
+    _require_finite("frozen price latents", price)
     _require_finite("text-coder latents", text)
     _require_finite("text-family availability mask", mask)
     if require_target:
@@ -2581,7 +2887,7 @@ def _assemble_raw_fusion_arrays(
         frame.select(price_columns).to_numpy().astype(np.float32)
     )
     target = frame["target_up"].to_numpy().astype(np.float32)
-    _require_finite("TimesFM price latents", price)
+    _require_finite("frozen price latents", price)
     if require_target:
         _require_finite("training targets", target)
     return (
@@ -2932,6 +3238,7 @@ def run_walk_forward_fusion(
     early_stopping_patience: int = EARLY_STOPPING_PATIENCE,
     early_stopping_min_delta: float = EARLY_STOPPING_MIN_DELTA,
     run_outer_folds: bool = True,
+    price_encoder: str = "timesfm",
 ) -> dict[str, pl.DataFrame]:
     """Optionally run nested outer folds, then select and refit on all data."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2942,6 +3249,8 @@ def run_walk_forward_fusion(
         raise ValueError("fusion_batch_size must be positive")
     if fusion_hidden_dim < 1:
         raise ValueError("fusion_hidden_dim must be positive")
+    if price_encoder not in {"timesfm", "chronos2"}:
+        raise ValueError("price_encoder must be 'timesfm' or 'chronos2'")
     if min(market_depth, fusion_depth) < 0:
         raise ValueError("Network depths cannot be negative")
     if residual_expansion < 1:
@@ -3035,12 +3344,16 @@ def run_walk_forward_fusion(
         )
     if cross_stock_attention:
         feature_set = (
-            "timesfm_temporal_tft_cross_stock_unified_raw_text_attention"
+            f"{price_encoder}_temporal_tft_cross_stock_unified_raw_text_attention"
         )
     elif market_encoder == "tft":
-        feature_set = "timesfm_temporal_tft_unified_raw_text_attention"
+        feature_set = (
+            f"{price_encoder}_temporal_tft_unified_raw_text_attention"
+        )
     else:
-        feature_set = "timesfm_covariates_unified_raw_text_attention"
+        feature_set = (
+            f"{price_encoder}_covariates_unified_raw_text_attention"
+        )
     if run_outer_folds:
         if fold_assignments is None:
             raise ValueError(
@@ -3322,11 +3635,13 @@ def run_walk_forward_fusion(
 
     def fusion_model_name(variant: str) -> str:
         if cross_stock_attention:
-            prefix = "timesfm_tft_cross_stock_unified_raw_text_plus"
+            prefix = (
+                f"{price_encoder}_tft_cross_stock_unified_raw_text_plus"
+            )
         elif market_encoder == "tft":
-            prefix = "timesfm_tft_unified_raw_text_plus"
+            prefix = f"{price_encoder}_tft_unified_raw_text_plus"
         else:
-            prefix = "timesfm_covariates_unified_raw_text_plus"
+            prefix = f"{price_encoder}_covariates_unified_raw_text_plus"
         return f"{prefix}_{variant}"
 
     def select_families(
@@ -3989,7 +4304,7 @@ def run_walk_forward_fusion(
             raw_sequence=tuning_train_sequence,
             raw_padding=tuning_train_padding,
             study_name=(
-                f"timesfm_{market_encoder}_nested_outer_fold_{fold}_"
+                f"{price_encoder}_{market_encoder}_nested_outer_fold_{fold}_"
                 f"{study_signature}_v{SELECTION_PROTOCOL_VERSION}"
             ),
             study_seed=seed + 10_000 * fold,
@@ -4120,7 +4435,7 @@ def run_walk_forward_fusion(
                 "scope": f"fold_{fold}",
                 "model": model_name,
                 "selection": "nested_inner_validation",
-                "price_encoder": "timesfm",
+                "price_encoder": price_encoder,
                 "price_encoder_frozen": True,
                 "market_encoder": market_encoder,
                 "covariates": list(covariate_columns),
@@ -4448,7 +4763,7 @@ def run_walk_forward_fusion(
         raw_sequence=final_tuning_sequence,
         raw_padding=final_tuning_padding,
         study_name=(
-            f"timesfm_{market_encoder}_nested_final_"
+            f"{price_encoder}_{market_encoder}_nested_final_"
             f"{study_signature}_v{SELECTION_PROTOCOL_VERSION}"
         ),
         study_seed=seed + 900_000,
@@ -4594,7 +4909,7 @@ def run_walk_forward_fusion(
         )
         save_torch_model(final_dir / "fusion_models" / f"{model_name}.pt", model, {
             "scope": "final", "model": model_name,
-            "price_encoder": "timesfm", "price_encoder_frozen": True,
+            "price_encoder": price_encoder, "price_encoder_frozen": True,
             "market_encoder": market_encoder,
             "covariates": list(covariate_columns),
             "covariate_preprocessing": "all-training median then zscore",
