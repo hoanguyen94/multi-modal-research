@@ -49,12 +49,12 @@ PRETRAINED_OUTPUT_DIRS = {
 TFT_OUTPUT_DIR = (
     ARTIFACT_DIR
     / "stage2_pretrained_forecasts"
-    / "timesfm_temporal_tft_unified_raw_text_attention_dim32"
+    / "timesfm_temporal_tft_unified_raw_text_attention_0.5thres"
 )
 CHRONOS2_TFT_OUTPUT_DIR = (
     ARTIFACT_DIR
     / "stage2_pretrained_forecasts"
-    / "chronos2_multivariate_temporal_tft_unified_raw_text_attention_dim32"
+    / "chronos2_multivariate_temporal_tft_unified_raw_text_attention_0.5thres"
 )
 TFT_OUTPUT_DIRS = {
     "timesfm": TFT_OUTPUT_DIR,
@@ -159,7 +159,7 @@ CHRONOS2_LORA_DROPOUT = 0.1
 CHRONOS2_LORA_LEARNING_RATE = 1e-4
 CHRONOS2_LORA_BATCH_SIZE = 8
 CHRONOS2_LORA_EPOCHS = 10
-RAW_TEXT_DIM = 32
+RAW_TEXT_DIM = 384
 TEXT_ATTENTION_HEADS = 4
 TEXT_ATTENTION_LAYERS = 1
 FUSION_HIDDEN_DIM = 256
