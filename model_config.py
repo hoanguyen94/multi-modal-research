@@ -49,12 +49,12 @@ PRETRAINED_OUTPUT_DIRS = {
 TFT_OUTPUT_DIR = (
     ARTIFACT_DIR
     / "stage2_pretrained_forecasts"
-    / "timesfm_temporal_tft_unified_raw_text_attention_0.5thres"
+    / "timesfm_temporal_tft_unified_raw_text_attention_0.5thres2"
 )
 CHRONOS2_TFT_OUTPUT_DIR = (
     ARTIFACT_DIR
     / "stage2_pretrained_forecasts"
-    / "chronos2_multivariate_temporal_tft_unified_raw_text_attention_0.5thres"
+    / "chronos2_multivariate_temporal_tft_unified_raw_text_attention_0.5thres2"
 )
 TFT_OUTPUT_DIRS = {
     "timesfm": TFT_OUTPUT_DIR,
@@ -179,7 +179,7 @@ EARLY_STOPPING_MIN_DELTA = 1e-5
 OPTUNA_HIDDEN_DIM_CANDIDATES = (64, 128)
 OPTUNA_FUSION_DEPTH_CANDIDATES = (1, 2)
 OPTUNA_EXPANSION_CANDIDATES = (1, 2, 3, 4, 5)
-OPTUNA_DROPOUT_CANDIDATES = (0.10, 0.15, 0.20, 0.25)
+OPTUNA_DROPOUT_CANDIDATES = (0.05, 0.10, 0.15, 0.20)
 OPTUNA_LEARNING_RATE_MIN = 2e-6
 OPTUNA_LEARNING_RATE_MAX = 6e-5
 OPTUNA_WEIGHT_DECAY_MIN = 1e-4
