@@ -49,12 +49,12 @@ PRETRAINED_OUTPUT_DIRS = {
 TFT_OUTPUT_DIR = (
     ARTIFACT_DIR
     / "stage2_pretrained_forecasts"
-    / "timesfm_temporal_tft_unified_raw_text_attention"
+    / "timesfm_temporal_tft_unified_raw_text_attention_dim32"
 )
 CHRONOS2_TFT_OUTPUT_DIR = (
     ARTIFACT_DIR
     / "stage2_pretrained_forecasts"
-    / "chronos2_multivariate_temporal_tft_unified_raw_text_attention"
+    / "chronos2_multivariate_temporal_tft_unified_raw_text_attention_dim32"
 )
 TFT_OUTPUT_DIRS = {
     "timesfm": TFT_OUTPUT_DIR,
@@ -99,7 +99,7 @@ DEFAULT_TEXT_FAMILIES = ("linq", "qwen")
 OPTUNA_TRIALS = 12
 SELECTION_PROTOCOL_VERSION = 8
 TRAINING_MODES = ("nested-folds", "full-only")
-DEFAULT_TRAINING_MODE = "nested-folds"
+DEFAULT_TRAINING_MODE = "full-only"
 
 # Feature classification shared by Stage 2 models.
 ID_COLUMNS = ("row_id", "date", "ticker")
@@ -126,7 +126,7 @@ KNOWN_FUTURE_PREFIXES = (
 
 # Frozen price encoders and shared fusion defaults.
 PRICE_ENCODERS = ("timesfm", "chronos2")
-DEFAULT_PRICE_ENCODER = "chronos2"
+DEFAULT_PRICE_ENCODER = "timesfm"
 TIMESFM_MODEL_ID = "google/timesfm-2.5-200m-pytorch"
 CHRONOS2_MODEL_ID = "amazon/chronos-2"
 PRICE_ENCODER_MODEL_IDS = {
@@ -153,11 +153,11 @@ CHRONOS2_INPUT_COLUMNS = (
 )
 CHRONOS2_LORA_RANK = 8
 CHRONOS2_LORA_ALPHA = 16
-CHRONOS2_LORA_DROPOUT = 0.05
+CHRONOS2_LORA_DROPOUT = 0.1
 CHRONOS2_LORA_LEARNING_RATE = 1e-4
 CHRONOS2_LORA_BATCH_SIZE = 8
 CHRONOS2_LORA_EPOCHS = 10
-RAW_TEXT_DIM = 384
+RAW_TEXT_DIM = 32
 TEXT_ATTENTION_HEADS = 4
 TEXT_ATTENTION_LAYERS = 1
 FUSION_HIDDEN_DIM = 256
@@ -169,7 +169,7 @@ FUSION_EPOCHS = 100
 PRICE_BATCH_SIZE = 16
 FUSION_BATCH_SIZE = 128
 ADAPTER_LEARNING_RATE_MULTIPLIER = 0.1
-EARLY_STOPPING_MIN_EPOCHS = 10
+EARLY_STOPPING_MIN_EPOCHS = 1
 EARLY_STOPPING_PATIENCE = 5
 EARLY_STOPPING_MIN_DELTA = 1e-5
 
