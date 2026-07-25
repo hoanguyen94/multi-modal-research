@@ -1,0 +1,58 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+import polars as pl
+
+from latent_fusion import _write_training_diagnostics
+
+
+class TrainingDiagnosticsTests(unittest.TestCase):
+    def test_full_only_final_refit_writes_rows_and_plot(self):
+        history = pl.DataFrame({
+            "epoch": [1.0, 2.0],
+            "bce": [0.70, 0.65],
+            "train_bce": [0.70, 0.65],
+            "train_positive_rate": [0.51, 0.51],
+            "best_epoch": [2.0, 2.0],
+            "is_best_epoch": [0.0, 1.0],
+            "stopped_early": [0.0, 0.0],
+            "fold": pl.Series([0, 0], dtype=pl.Int8),
+            "model": ["timesfm_tft", "timesfm_tft"],
+            "variant": ["all_families", "all_families"],
+            "scope": ["final_full_training", "final_full_training"],
+            "phase": ["final_full_refit", "final_full_refit"],
+        })
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            result = _write_training_diagnostics(
+                {"timesfm_tft": [history]},
+                output_dir,
+            )
+
+            self.assertEqual(result.height, 2)
+            combined = pl.read_csv(
+                output_dir / "all_fold_learning_curves.csv"
+            )
+            self.assertEqual(combined.height, 2)
+            self.assertEqual(
+                combined["phase"].unique().to_list(),
+                ["final_full_refit"],
+            )
+            self.assertTrue(
+                (
+                    output_dir
+                    / "timesfm_tft_fold_learning_curves.csv"
+                ).exists()
+            )
+            self.assertTrue(
+                (
+                    output_dir
+                    / "timesfm_tft_fold_learning_curves.png"
+                ).exists()
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

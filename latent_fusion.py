@@ -1544,7 +1544,7 @@ def _plot_fold_training_diagnostics(
     history: pl.DataFrame,
     output_path: Path,
 ) -> None:
-    """Plot selected-model learning curves for all walk-forward folds."""
+    """Plot outer-fold or final-full-training learning curves."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -1560,34 +1560,62 @@ def _plot_fold_training_diagnostics(
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
     colors = plt.get_cmap("tab10")
     fold_numbers = history["fold"].unique().sort().to_list()
+    plotted_validation = False
     for color_index, fold in enumerate(fold_numbers):
         part = history.filter(pl.col("fold") == fold).sort("epoch")
         epoch = part["epoch"].to_numpy()
         color = colors(color_index % 10)
+        label = f"Fold {fold}"
+        if "phase" in part.columns and part.height:
+            phases = part["phase"].drop_nulls().unique().to_list()
+            if phases == ["final_full_refit"]:
+                label = "Final full-data refit"
         axes[0].plot(
             epoch, part["train_bce"].to_numpy(),
-            color=color, linestyle="-", label=f"Fold {fold} train",
+            color=color, linestyle="-", label=f"{label} train",
         )
-        axes[0].plot(
-            epoch, part["validation_bce"].to_numpy(),
-            color=color, linestyle="--", label=f"Fold {fold} validation",
+
+        def finite_values(column: str) -> np.ndarray | None:
+            if column not in part.columns:
+                return None
+            values = (
+                part[column]
+                .cast(pl.Float64)
+                .fill_null(float("nan"))
+                .to_numpy()
+            )
+            return values if np.isfinite(values).any() else None
+
+        validation_bce = finite_values("validation_bce")
+        if validation_bce is not None:
+            axes[0].plot(
+                epoch, validation_bce,
+                color=color, linestyle="--", label=f"{label} validation",
+            )
+        validation_metrics = (
+            ("validation_accuracy", ":", "accuracy"),
+            (
+                "validation_balanced_accuracy",
+                "-",
+                "balanced accuracy",
+            ),
+            (
+                "validation_optimized_balanced_accuracy",
+                "--",
+                "optimized balanced accuracy",
+            ),
         )
-        axes[1].plot(
-            epoch, part["validation_accuracy"].to_numpy(),
-            color=color, linestyle=":", label=f"Fold {fold} accuracy",
-        )
-        axes[1].plot(
-            epoch, part["validation_balanced_accuracy"].to_numpy(),
-            color=color, linestyle="-",
-            label=f"Fold {fold} balanced accuracy",
-        )
-        axes[1].plot(
-            epoch,
-            part["validation_optimized_balanced_accuracy"].to_numpy(),
-            color=color,
-            linestyle="--",
-            label=f"Fold {fold} optimized balanced accuracy",
-        )
+        for column, linestyle, metric_label in validation_metrics:
+            values = finite_values(column)
+            if values is not None:
+                plotted_validation = True
+                axes[1].plot(
+                    epoch,
+                    values,
+                    color=color,
+                    linestyle=linestyle,
+                    label=f"{label} {metric_label}",
+                )
     axes[0].set_title("Training and validation BCE")
     axes[0].set_xlabel("Epoch")
     axes[0].set_ylabel("Binary cross-entropy")
@@ -1595,12 +1623,75 @@ def _plot_fold_training_diagnostics(
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("Score")
     axes[1].set_ylim(0.0, 1.0)
+    if not plotted_validation:
+        axes[1].text(
+            0.5,
+            0.5,
+            "No validation split in the final full-data refit",
+            ha="center",
+            va="center",
+            transform=axes[1].transAxes,
+        )
     for axis in axes:
         axis.grid(alpha=0.25)
-        axis.legend(fontsize=8, ncol=2)
+        handles, labels = axis.get_legend_handles_labels()
+        if handles:
+            axis.legend(fontsize=8, ncol=2)
     fig.tight_layout()
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
+
+
+def _write_training_diagnostics(
+    diagnostic_histories: dict[str, list[pl.DataFrame]],
+    diagnostic_dir: Path,
+) -> pl.DataFrame:
+    """Persist all available outer-fold and final-refit learning curves."""
+    diagnostic_dir.mkdir(parents=True, exist_ok=True)
+    combined_diagnostics = []
+    for model_name, history_parts in diagnostic_histories.items():
+        model_history = pl.concat(
+            history_parts, how="diagonal_relaxed"
+        ).sort(["fold", "epoch"])
+        model_history.write_csv(
+            diagnostic_dir / f"{model_name}_fold_learning_curves.csv"
+        )
+        _plot_fold_training_diagnostics(
+            model_history,
+            diagnostic_dir / f"{model_name}_fold_learning_curves.png",
+        )
+        combined_diagnostics.append(model_history)
+    if combined_diagnostics:
+        training_diagnostics = pl.concat(
+            combined_diagnostics, how="diagonal_relaxed"
+        ).sort(["model", "fold", "epoch"])
+    else:
+        training_diagnostics = pl.DataFrame(schema={
+            "epoch": pl.Float64,
+            "bce": pl.Float64,
+            "train_bce": pl.Float64,
+            "train_positive_rate": pl.Float64,
+            "validation_bce": pl.Float64,
+            "validation_accuracy": pl.Float64,
+            "validation_balanced_accuracy": pl.Float64,
+            "validation_roc_auc": pl.Float64,
+            "validation_optimized_balanced_accuracy": pl.Float64,
+            "validation_optimized_threshold": pl.Float64,
+            "validation_mean_probability": pl.Float64,
+            "validation_positive_rate": pl.Float64,
+            "best_epoch": pl.Float64,
+            "is_best_epoch": pl.Float64,
+            "stopped_early": pl.Float64,
+            "fold": pl.Int8,
+            "model": pl.String,
+            "variant": pl.String,
+            "scope": pl.String,
+            "phase": pl.String,
+        })
+    training_diagnostics.write_csv(
+        diagnostic_dir / "all_fold_learning_curves.csv"
+    )
+    return training_diagnostics
 
 
 def _plot_inner_selection_diagnostics(
@@ -4795,48 +4886,6 @@ def run_walk_forward_fusion(
         }, indent=2, sort_keys=True)
     )
 
-    diagnostic_dir = output_dir / "training_diagnostics"
-    diagnostic_dir.mkdir(parents=True, exist_ok=True)
-    combined_diagnostics = []
-    for model_name, history_parts in diagnostic_histories.items():
-        model_history = pl.concat(history_parts).sort(["fold", "epoch"])
-        model_history.write_csv(
-            diagnostic_dir / f"{model_name}_fold_learning_curves.csv"
-        )
-        _plot_fold_training_diagnostics(
-            model_history,
-            diagnostic_dir / f"{model_name}_fold_learning_curves.png",
-        )
-        combined_diagnostics.append(model_history)
-    if combined_diagnostics:
-        training_diagnostics = pl.concat(combined_diagnostics).sort(
-            ["model", "fold", "epoch"]
-        )
-    else:
-        training_diagnostics = pl.DataFrame(schema={
-            "epoch": pl.Float64,
-            "bce": pl.Float64,
-            "train_bce": pl.Float64,
-            "train_positive_rate": pl.Float64,
-            "validation_bce": pl.Float64,
-            "validation_accuracy": pl.Float64,
-            "validation_balanced_accuracy": pl.Float64,
-            "validation_roc_auc": pl.Float64,
-            "validation_optimized_balanced_accuracy": pl.Float64,
-            "validation_optimized_threshold": pl.Float64,
-            "validation_mean_probability": pl.Float64,
-            "validation_positive_rate": pl.Float64,
-            "best_epoch": pl.Float64,
-            "is_best_epoch": pl.Float64,
-            "stopped_early": pl.Float64,
-            "fold": pl.Int8,
-            "model": pl.String,
-            "variant": pl.String,
-        })
-    training_diagnostics.write_csv(
-        diagnostic_dir / "all_fold_learning_curves.csv"
-    )
-
     if prediction_parts:
         raw_oof = pl.concat(prediction_parts)
     else:
@@ -5164,8 +5213,18 @@ def run_walk_forward_fusion(
                 temporal_covariate_columns,
                 temporal_scaler,
             )
-        pl.DataFrame(history).write_csv(
+        final_history_frame = pl.DataFrame(history).with_columns(
+            pl.lit(0).cast(pl.Int8).alias("fold"),
+            pl.lit(model_name).alias("model"),
+            pl.lit(variant).alias("variant"),
+            pl.lit("final_full_training").alias("scope"),
+            pl.lit("final_full_refit").alias("phase"),
+        )
+        final_history_frame.write_csv(
             final_dir / "fusion_models" / f"{model_name}_training_history.csv"
+        )
+        diagnostic_histories.setdefault(model_name, []).append(
+            final_history_frame
         )
         score = predict_raw_fusion(
             model, test_a[1], test_cov, test_a[2], stores, device,
@@ -5188,6 +5247,11 @@ def run_walk_forward_fusion(
         gc.collect()
         if device == "mps":
             torch.mps.empty_cache()
+
+    training_diagnostics = _write_training_diagnostics(
+        diagnostic_histories,
+        output_dir / "training_diagnostics",
+    )
 
     final_predictions = (
         pl.concat(final_prediction_parts)
