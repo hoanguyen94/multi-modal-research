@@ -9,6 +9,7 @@ from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
     brier_score_loss,
+    log_loss,
     roc_auc_score,
 )
 
@@ -130,7 +131,7 @@ def directional_classification_metrics(
     probability_up: ArrayLike,
     threshold: ArrayLike = 0.5,
 ) -> dict[str, float]:
-    """Return hit rate, balanced accuracy, ROC AUC, and Brier score."""
+    """Return directional classification and probabilistic-loss metrics."""
     truth = np.asarray(y_true, dtype=np.int8).reshape(-1)
     probability = _float_array(probability_up).reshape(-1)
     if truth.size != probability.size:
@@ -147,4 +148,5 @@ def directional_classification_metrics(
         "balanced_accuracy": float(balanced_accuracy_score(truth, prediction)),
         "roc_auc": float(auc),
         "brier_score": float(brier_score_loss(truth, clipped)),
+        "bce": float(log_loss(truth, clipped, labels=[0, 1])),
     }

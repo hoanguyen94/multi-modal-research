@@ -1675,14 +1675,14 @@ def fit_raw_fusion_model(
     target: np.ndarray,  # (N_train,)
     device: str,
     text_dim: int = 384,
-    hidden_dim: int = 256,
-    market_depth: int = 2,
-    fusion_depth: int = 2,
+    hidden_dim: int = 128,
+    market_depth: int = 1,
+    fusion_depth: int = 1,
     expansion: int = 2,
     dropout: float = 0.1,
     epochs: int = 10,
     batch_size: int = 128,
-    learning_rate: float = 3e-4,
+    learning_rate: float = 6e-5,
     weight_decay: float = 1e-4,
     adapter_learning_rate_multiplier: float = ADAPTER_LEARNING_RATE_MULTIPLIER,
     seed: int = 42,
@@ -3684,7 +3684,7 @@ def run_walk_forward_fusion(
         "expansion": int(residual_expansion),
         "dropout": float(fusion_dropout),
         "epochs": int(fusion_epochs),
-        "learning_rate": 1e-4,
+        "learning_rate": 2e-5,
         "weight_decay": 1e-3,
     }
     if market_encoder == "tft":
@@ -4155,12 +4155,26 @@ def run_walk_forward_fusion(
                     calibrate_threshold=False,
                 )
                 best_epoch = int(history[0]["selected_epoch"])
+                best_history_row = next(
+                    row for row in history
+                    if int(row["epoch"]) == best_epoch
+                )
                 trial.set_user_attr(
                     "trial_diagnostic_epoch", best_epoch
                 )
                 trial.set_user_attr(
+                    "trial_accuracy_at_0_5",
+                    float(best_history_row["validation_accuracy"]),
+                )
+                trial.set_user_attr(
                     "trial_balanced_accuracy_at_0_5",
-                    float(inner_balanced_accuracy),
+                    float(best_history_row[
+                        "validation_balanced_accuracy"
+                    ]),
+                )
+                trial.set_user_attr(
+                    "trial_roc_auc",
+                    float(best_history_row["validation_roc_auc"]),
                 )
                 trial.set_user_attr(
                     "trial_validation_bce",
@@ -4250,22 +4264,111 @@ def run_walk_forward_fusion(
             gc.collect()
             if device == "mps":
                 torch.mps.empty_cache()
-            rows = [{
-                "scope": scope_name,
-                "trial": trial.number,
-                "state": trial.state.name,
-                "optuna_objective": trial.value,
-                "validation_bce": trial.user_attrs.get(
-                    "trial_validation_bce"
-                ),
-                "trial_balanced_accuracy_at_0_5": trial.user_attrs.get(
-                    "trial_balanced_accuracy_at_0_5"
-                ),
-                "trial_diagnostic_epoch": trial.user_attrs.get(
-                    "trial_diagnostic_epoch"
-                ),
-                "params_json": json.dumps(trial.params, sort_keys=True),
-            } for trial in study.trials]
+            rows = []
+            for trial in study.trials:
+                diagnostics = {
+                    "trial_diagnostic_epoch": trial.user_attrs.get(
+                        "trial_diagnostic_epoch"
+                    ),
+                    "trial_validation_bce": trial.user_attrs.get(
+                        "trial_validation_bce"
+                    ),
+                    "trial_accuracy_at_0_5": trial.user_attrs.get(
+                        "trial_accuracy_at_0_5"
+                    ),
+                    "trial_balanced_accuracy_at_0_5": (
+                        trial.user_attrs.get(
+                            "trial_balanced_accuracy_at_0_5"
+                        )
+                    ),
+                    "trial_roc_auc": trial.user_attrs.get(
+                        "trial_roc_auc"
+                    ),
+                }
+                history_path = (
+                    history_dir / f"trial_{trial.number}.csv"
+                )
+                if (
+                    any(value is None for value in diagnostics.values())
+                    and history_path.exists()
+                ):
+                    trial_history = pl.read_csv(history_path)
+                    diagnostic_epoch = diagnostics[
+                        "trial_diagnostic_epoch"
+                    ]
+                    if diagnostic_epoch is None and (
+                        "best_epoch" in trial_history.columns
+                    ):
+                        diagnostic_epoch = int(
+                            trial_history["best_epoch"][0]
+                        )
+                    if diagnostic_epoch is not None:
+                        selected_rows = trial_history.filter(
+                            pl.col("epoch") == int(diagnostic_epoch)
+                        )
+                        if selected_rows.height == 1:
+                            selected_row = selected_rows.row(
+                                0, named=True
+                            )
+                            diagnostics.update({
+                                "trial_diagnostic_epoch": int(
+                                    diagnostic_epoch
+                                ),
+                                "trial_validation_bce": (
+                                    diagnostics["trial_validation_bce"]
+                                    if diagnostics["trial_validation_bce"]
+                                    is not None else
+                                    selected_row["validation_bce"]
+                                ),
+                                "trial_accuracy_at_0_5": (
+                                    diagnostics[
+                                        "trial_accuracy_at_0_5"
+                                    ]
+                                    if diagnostics[
+                                        "trial_accuracy_at_0_5"
+                                    ] is not None else
+                                    selected_row["validation_accuracy"]
+                                ),
+                                "trial_balanced_accuracy_at_0_5": (
+                                    diagnostics[
+                                        "trial_balanced_accuracy_at_0_5"
+                                    ]
+                                    if diagnostics[
+                                        "trial_balanced_accuracy_at_0_5"
+                                    ] is not None else
+                                    selected_row[
+                                        "validation_balanced_accuracy"
+                                    ]
+                                ),
+                                "trial_roc_auc": (
+                                    diagnostics["trial_roc_auc"]
+                                    if diagnostics["trial_roc_auc"]
+                                    is not None else
+                                    selected_row["validation_roc_auc"]
+                                ),
+                            })
+                rows.append({
+                    "scope": scope_name,
+                    "trial": trial.number,
+                    "state": trial.state.name,
+                    "optuna_objective": trial.value,
+                    "validation_bce": diagnostics[
+                        "trial_validation_bce"
+                    ],
+                    "trial_accuracy_at_0_5": diagnostics[
+                        "trial_accuracy_at_0_5"
+                    ],
+                    "trial_balanced_accuracy_at_0_5": diagnostics[
+                        "trial_balanced_accuracy_at_0_5"
+                    ],
+                    "trial_roc_auc": diagnostics["trial_roc_auc"],
+                    "trial_diagnostic_epoch": diagnostics[
+                        "trial_diagnostic_epoch"
+                    ],
+                    "params_json": json.dumps(
+                        trial.params, sort_keys=True
+                    ),
+                })
             trials = pl.DataFrame(rows, infer_schema_length=None)
             manifest = {
                 **manifest,
@@ -4313,7 +4416,24 @@ def run_walk_forward_fusion(
                 "state": "FIXED_DEFAULT",
                 "optuna_objective": optuna_objective,
                 "validation_bce": -optuna_objective,
-                "trial_balanced_accuracy_at_0_5": inner_balanced_accuracy,
+                "trial_accuracy_at_0_5": float(next(
+                    row["validation_accuracy"]
+                    for row in history
+                    if int(row["epoch"])
+                    == int(history[0]["selected_epoch"])
+                )),
+                "trial_balanced_accuracy_at_0_5": float(next(
+                    row["validation_balanced_accuracy"]
+                    for row in history
+                    if int(row["epoch"])
+                    == int(history[0]["selected_epoch"])
+                )),
+                "trial_roc_auc": float(next(
+                    row["validation_roc_auc"]
+                    for row in history
+                    if int(row["epoch"])
+                    == int(history[0]["selected_epoch"])
+                )),
                 "trial_diagnostic_epoch": int(
                     history[0]["selected_epoch"]
                 ),
@@ -4635,7 +4755,9 @@ def run_walk_forward_fusion(
             "state": pl.String,
             "optuna_objective": pl.Float64,
             "validation_bce": pl.Float64,
+            "trial_accuracy_at_0_5": pl.Float64,
             "trial_balanced_accuracy_at_0_5": pl.Float64,
+            "trial_roc_auc": pl.Float64,
             "trial_diagnostic_epoch": pl.Int64,
             "params_json": pl.String,
             "outer_fold": pl.Int8,
