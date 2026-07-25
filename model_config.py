@@ -100,6 +100,8 @@ OPTUNA_TRIALS = 12
 SELECTION_PROTOCOL_VERSION = 8
 TRAINING_MODES = ("nested-folds", "full-only")
 DEFAULT_TRAINING_MODE = "full-only"
+CALIBRATE_DECISION_THRESHOLD = False
+FIXED_DECISION_THRESHOLD = 0.5
 
 # Feature classification shared by Stage 2 models.
 ID_COLUMNS = ("row_id", "date", "ticker")

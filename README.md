@@ -83,8 +83,13 @@ threshold. Checkpoints before the configured minimum are not eligible for
 selection, so every selected checkpoint and final refit runs for at least the
 minimum number of epochs.
 
-The runner performs purged inner epoch selection and threshold calibration,
-then initializes a fresh adapter and refits on all labeled training rows. It
-saves the compact Chronos adapter separately from the multimodal head and writes
-test metrics, predictions, and the final submission under the output directory
-selected for the adapter type.
+Decision thresholds are configured globally in `model_config.py`. Set
+`CALIBRATE_DECISION_THRESHOLD = False` and
+`FIXED_DECISION_THRESHOLD = 0.5` to classify directly at probability 0.5;
+set calibration to `True` to select a threshold on purged validation data.
+
+The runner performs purged inner epoch selection and applies the configured
+fixed or calibrated threshold policy, then initializes a fresh adapter and
+refits on all labeled training rows. It saves the compact Chronos adapter
+separately from the multimodal head and writes test metrics, predictions, and
+the final submission under the output directory selected for the adapter type.

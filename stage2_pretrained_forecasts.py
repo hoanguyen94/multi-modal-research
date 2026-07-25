@@ -27,6 +27,7 @@ from latent_fusion import (
 from model_config import (
     ADAPTER_LEARNING_RATE_MULTIPLIER,
     BASELINE_DIR,
+    CALIBRATE_DECISION_THRESHOLD,
     CHRONOS2_INPUT_COLUMNS,
     DATA_DIR,
     DEFAULT_PRICE_ENCODER,
@@ -36,6 +37,7 @@ from model_config import (
     EARLY_STOPPING_MIN_EPOCHS,
     EARLY_STOPPING_PATIENCE,
     EXPECTED_SUBMISSION_ROWS,
+    FIXED_DECISION_THRESHOLD,
     FOLD_PATH,
     FUSION_BATCH_SIZE,
     FUSION_DEPTH,
@@ -287,12 +289,17 @@ def main() -> None:
         "early_stopping_min_epochs": EARLY_STOPPING_MIN_EPOCHS,
         "early_stopping_patience": EARLY_STOPPING_PATIENCE,
         "early_stopping_min_delta": EARLY_STOPPING_MIN_DELTA,
+        "threshold_calibrated": CALIBRATE_DECISION_THRESHOLD,
+        "fixed_decision_threshold": FIXED_DECISION_THRESHOLD,
         "epoch_selection": (
             "post_optuna_inner_validation"
             if not args.no_tune and args.optuna_trials > 0 else
             "fixed_configuration_inner_validation"
         ),
-        "threshold_selection": "exact_inner_validation_balanced_accuracy",
+        "threshold_selection": (
+            "exact_inner_validation_balanced_accuracy"
+            if CALIBRATE_DECISION_THRESHOLD else "fixed"
+        ),
         "training_mode": args.training_mode,
     }, indent=2))
 
@@ -394,6 +401,8 @@ def main() -> None:
         adapter_learning_rate_multiplier=(
             ADAPTER_LEARNING_RATE_MULTIPLIER
         ),
+        calibrate_decision_threshold=CALIBRATE_DECISION_THRESHOLD,
+        fixed_decision_threshold=FIXED_DECISION_THRESHOLD,
         early_stopping_min_epochs=EARLY_STOPPING_MIN_EPOCHS,
         early_stopping_patience=EARLY_STOPPING_PATIENCE,
         early_stopping_min_delta=EARLY_STOPPING_MIN_DELTA,

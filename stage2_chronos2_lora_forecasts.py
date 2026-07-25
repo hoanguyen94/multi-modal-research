@@ -28,15 +28,16 @@ from chronos2_lora_fusion import (
 )
 from latent_fusion import (
     _apply_covariate_scaler,
-    _best_validation_threshold,
     _covariate_matrix,
     _fit_covariate_scaler,
     _purged_inner_positions,
+    _select_decision_threshold,
     parquet_embedding_dim,
     prepare_raw_embedding_store,
 )
 from model_config import (
     ADAPTER_LEARNING_RATE_MULTIPLIER,
+    CALIBRATE_DECISION_THRESHOLD,
     CHRONOS2_ADAPTER_OUTPUT_DIRS,
     CHRONOS2_INPUT_COLUMNS,
     CHRONOS2_LORA_ALPHA,
@@ -52,6 +53,7 @@ from model_config import (
     EARLY_STOPPING_MIN_EPOCHS,
     EARLY_STOPPING_PATIENCE,
     EXPECTED_SUBMISSION_ROWS,
+    FIXED_DECISION_THRESHOLD,
     FUSION_DEPTH,
     FUSION_DROPOUT,
     FUSION_HIDDEN_DIM,
@@ -193,6 +195,10 @@ def main() -> None:
         raise ValueError("--epochs and --batch-size must be positive")
     if args.learning_rate <= 0 or args.lora_learning_rate <= 0:
         raise ValueError("Learning rates must be positive")
+    if not 0.0 < FIXED_DECISION_THRESHOLD < 1.0:
+        raise ValueError(
+            "FIXED_DECISION_THRESHOLD must be strictly between 0 and 1"
+        )
     args.families = list(dict.fromkeys(args.families))
     required_packages = (
         ("chronos", "peft")
@@ -377,18 +383,25 @@ def main() -> None:
         early_stopping_patience=EARLY_STOPPING_PATIENCE,
         early_stopping_min_delta=EARLY_STOPPING_MIN_DELTA,
     )
-    validation_score = predict_lora_fusion(
-        selection_model,
-        index=train_index[validation_pos],
-        contexts=train_contexts,
-        covariates=validation_covariates,
-        text_indices=_slice_indices(train_text_indices, validation_pos),
-        stores=stores,
-        device=device,
-        batch_size=args.batch_size,
+    validation_score = (
+        predict_lora_fusion(
+            selection_model,
+            index=train_index[validation_pos],
+            contexts=train_contexts,
+            covariates=validation_covariates,
+            text_indices=_slice_indices(train_text_indices, validation_pos),
+            stores=stores,
+            device=device,
+            batch_size=args.batch_size,
+        )
+        if CALIBRATE_DECISION_THRESHOLD else
+        np.empty(0, dtype=np.float32)
     )
-    threshold = _best_validation_threshold(
-        train_target[validation_pos].astype(np.int8), validation_score
+    threshold = _select_decision_threshold(
+        train_target[validation_pos].astype(np.int8),
+        validation_score,
+        calibrate=CALIBRATE_DECISION_THRESHOLD,
+        fixed_threshold=FIXED_DECISION_THRESHOLD,
     )
     best_epoch = int(history[0]["best_epoch"])
     pl.DataFrame(history).write_csv(output_dir / "selection_history.csv")
@@ -422,6 +435,8 @@ def main() -> None:
         "text_attention_layers": TEXT_ATTENTION_LAYERS,
         "best_epoch": best_epoch,
         "decision_threshold": threshold,
+        "threshold_calibrated": CALIBRATE_DECISION_THRESHOLD,
+        "fixed_decision_threshold": FIXED_DECISION_THRESHOLD,
         "early_stopping_min_epochs": EARLY_STOPPING_MIN_EPOCHS,
         "early_stopping_patience": EARLY_STOPPING_PATIENCE,
         "early_stopping_min_delta": EARLY_STOPPING_MIN_DELTA,

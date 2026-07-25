@@ -31,11 +31,13 @@ from sklearn.metrics import (
 )
 from model_config import (
     ADAPTER_LEARNING_RATE_MULTIPLIER,
+    CALIBRATE_DECISION_THRESHOLD,
     CROSS_STOCK_ATTENTION_HEADS,
     EARLY_STOPPING_MIN_DELTA,
     EARLY_STOPPING_MIN_EPOCHS,
     EARLY_STOPPING_PATIENCE,
     EXPECTED_SUBMISSION_ROWS,
+    FIXED_DECISION_THRESHOLD,
     FUSION_BATCH_SIZE,
     FUSION_DEPTH,
     FUSION_DROPOUT,
@@ -3152,6 +3154,21 @@ def _best_validation_threshold(
     ])
 
 
+def _select_decision_threshold(
+    truth: np.ndarray,
+    score: np.ndarray,
+    *,
+    calibrate: bool,
+    fixed_threshold: float,
+) -> float:
+    """Return a validation-calibrated or fixed probability threshold."""
+    if not 0.0 < fixed_threshold < 1.0:
+        raise ValueError("fixed_threshold must be strictly between 0 and 1")
+    if calibrate:
+        return _best_validation_threshold(truth, score)
+    return float(fixed_threshold)
+
+
 def _dataframe_fingerprint(
     frame: pl.DataFrame,
     columns: Sequence[str] | None = None,
@@ -3270,6 +3287,8 @@ def run_walk_forward_fusion(
     cross_stock_attention: bool = False,
     cross_stock_attention_heads: int = CROSS_STOCK_ATTENTION_HEADS,
     adapter_learning_rate_multiplier: float = ADAPTER_LEARNING_RATE_MULTIPLIER,
+    calibrate_decision_threshold: bool = CALIBRATE_DECISION_THRESHOLD,
+    fixed_decision_threshold: float = FIXED_DECISION_THRESHOLD,
     early_stopping_min_epochs: int = EARLY_STOPPING_MIN_EPOCHS,
     early_stopping_patience: int = EARLY_STOPPING_PATIENCE,
     early_stopping_min_delta: float = EARLY_STOPPING_MIN_DELTA,
@@ -3322,6 +3341,10 @@ def run_walk_forward_fusion(
     if not 0.0 < adapter_learning_rate_multiplier <= 1.0:
         raise ValueError(
             "adapter_learning_rate_multiplier must be in (0, 1]"
+        )
+    if not 0.0 < fixed_decision_threshold < 1.0:
+        raise ValueError(
+            "fixed_decision_threshold must be strictly between 0 and 1"
         )
     if early_stopping_min_epochs < 1:
         raise ValueError("early_stopping_min_epochs must be positive")
@@ -3463,12 +3486,17 @@ def run_walk_forward_fusion(
         "early_stopping_min_epochs": int(early_stopping_min_epochs),
         "early_stopping_patience": int(early_stopping_patience),
         "early_stopping_min_delta": float(early_stopping_min_delta),
+        "threshold_calibrated": bool(calibrate_decision_threshold),
+        "fixed_decision_threshold": float(fixed_decision_threshold),
         "epoch_selection": (
             "post_optuna_inner_validation"
             if tune_hyperparameters and tuning_trials > 0 else
             "fixed_configuration_inner_validation"
         ),
-        "threshold_selection": "exact_inner_validation_balanced_accuracy",
+        "threshold_selection": (
+            "exact_inner_validation_balanced_accuracy"
+            if calibrate_decision_threshold else "fixed"
+        ),
         "cross_stock_attention": bool(cross_stock_attention),
     }, indent=2))
     if not covariate_columns:
@@ -3623,7 +3651,11 @@ def run_walk_forward_fusion(
             adapter_learning_rate_multiplier
         ),
         "epoch_selection": "post_optuna_inner_validation",
-        "threshold_selection": "exact_inner_validation_balanced_accuracy",
+        "threshold_selection": (
+            "exact_inner_validation_balanced_accuracy"
+            if calibrate_decision_threshold else "fixed"
+        ),
+        "fixed_decision_threshold": float(fixed_decision_threshold),
         "training_data_fingerprints": training_data_fingerprints,
         "train_target_rows": int(train_targets.height),
         "train_price_latent_rows": int(train_price_latents.height),
@@ -3925,7 +3957,7 @@ def run_walk_forward_fusion(
         raw_padding: np.ndarray | None,
         params: dict,
         candidate_seed: int,
-        calibrate_threshold: bool = True,
+        calibrate_threshold: bool = calibrate_decision_threshold,
     ) -> tuple[
         nn.Module,
         list[dict[str, float]],
@@ -4007,11 +4039,14 @@ def run_walk_forward_fusion(
         for row in history:
             row["calibration_best_epoch"] = float(selected_epoch)
             row["selected_epoch"] = float(selected_epoch)
-        threshold = 0.5
+        threshold = float(fixed_decision_threshold)
         inner_balanced_accuracy = float(
             selected_history_row["validation_balanced_accuracy"]
         )
-        if calibrate_threshold:
+        if (
+            calibrate_threshold
+            or not np.isclose(fixed_decision_threshold, 0.5)
+        ):
             score = predict_raw_fusion(
                 model,
                 inner_validation[1],
@@ -4026,8 +4061,11 @@ def run_walk_forward_fusion(
                 stock_group_ids=stock_groups(inner_validation[0]),
             )
             validation_truth = inner_validation[4].astype(np.int8)
-            threshold = _best_validation_threshold(
-                validation_truth, score
+            threshold = _select_decision_threshold(
+                validation_truth,
+                score,
+                calibrate=calibrate_threshold,
+                fixed_threshold=fixed_decision_threshold,
             )
             inner_balanced_accuracy = float(balanced_accuracy_score(
                 validation_truth,
@@ -4040,6 +4078,7 @@ def run_walk_forward_fusion(
             "decision_threshold": float(threshold),
             "inner_balanced_accuracy": inner_balanced_accuracy,
             "threshold_calibrated": bool(calibrate_threshold),
+            "fixed_decision_threshold": float(fixed_decision_threshold),
             "optuna_objective_name": (
                 "negative_validation_bce"
             ),
@@ -4837,6 +4876,8 @@ def run_walk_forward_fusion(
         },
         "final_hyperparameters": final_best_params,
         "final_decision_threshold": final_tuning_threshold,
+        "threshold_calibrated": bool(calibrate_decision_threshold),
+        "fixed_decision_threshold": float(fixed_decision_threshold),
         "final_inner_split": {
             key: str(value) if key.endswith(("_end", "_start")) else value
             for key, value in final_split_manifest.items()

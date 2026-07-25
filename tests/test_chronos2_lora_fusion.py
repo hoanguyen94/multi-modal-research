@@ -14,7 +14,11 @@ from chronos2_lora_fusion import (
     fit_lora_fusion,
     inject_toplora,
 )
-from latent_fusion import _early_stopping_reached, fit_raw_fusion_model
+from latent_fusion import (
+    _early_stopping_reached,
+    _select_decision_threshold,
+    fit_raw_fusion_model,
+)
 
 
 class FakePatch(nn.Module):
@@ -53,6 +57,28 @@ class FakeRawStore:
 
 
 class Chronos2LoRAFusionTests(unittest.TestCase):
+    def test_fixed_decision_threshold_does_not_require_validation_scores(self):
+        threshold = _select_decision_threshold(
+            np.empty(0, dtype=np.int8),
+            np.empty(0, dtype=np.float32),
+            calibrate=False,
+            fixed_threshold=0.5,
+        )
+        self.assertEqual(threshold, 0.5)
+
+    def test_fixed_decision_threshold_rejects_endpoints(self):
+        for threshold in (0.0, 1.0):
+            with self.subTest(threshold=threshold):
+                with self.assertRaisesRegex(
+                    ValueError, "strictly between 0 and 1"
+                ):
+                    _select_decision_threshold(
+                        np.empty(0, dtype=np.int8),
+                        np.empty(0, dtype=np.float32),
+                        calibrate=False,
+                        fixed_threshold=threshold,
+                    )
+
     def test_early_stopping_respects_minimum_epoch_and_patience(self):
         self.assertFalse(_early_stopping_reached(
             epoch=4,
