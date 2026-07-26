@@ -2798,6 +2798,20 @@ def _scope_text_latents(
     return row_paths
 
 
+def _price_feature_matrix(
+    frame: pl.DataFrame,
+    price_columns: Sequence[str],
+) -> np.ndarray:
+    """Preserve the row axis when an ablation has zero price features."""
+    if not price_columns:
+        return np.empty((frame.height, 0), dtype=np.float32)
+    return np.ascontiguousarray(
+        frame.select(price_columns).to_numpy().astype(
+            np.float32, copy=False
+        )
+    )
+
+
 def _assemble_fusion_arrays(
     row_ids: pl.DataFrame,
     price_latents: pl.DataFrame,
@@ -2931,7 +2945,7 @@ def _assemble_fusion_arrays(
         mask[row_index, family_index, field_index] = 1.0
 
     # Convert the remaining modalities to the layouts expected by the models.
-    price = np.ascontiguousarray(frame.select(price_columns).to_numpy().astype(np.float32))
+    price = _price_feature_matrix(frame, price_columns)
     text = np.ascontiguousarray(text)
     mask = np.ascontiguousarray(mask)
     target = frame["target_up"].to_numpy().astype(np.float32)
@@ -3011,9 +3025,7 @@ def _assemble_raw_fusion_arrays(
                 )
             indices[rows, fields] = aligned["embedding_row"].to_numpy()
         text_indices[family] = np.ascontiguousarray(indices)
-    price = np.ascontiguousarray(
-        frame.select(price_columns).to_numpy().astype(np.float32)
-    )
+    price = _price_feature_matrix(frame, price_columns)
     target = frame["target_up"].to_numpy().astype(np.float32)
     _require_finite("frozen price latents", price)
     if require_target:

@@ -7,11 +7,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import polars as pl
 import torch
 
 import stage2_tft_forecasts as stage2_tft
-from latent_fusion import TFTMarketEncoder
+from latent_fusion import (
+    TFTMarketEncoder,
+    _assemble_raw_fusion_arrays,
+    _price_feature_matrix,
+    _slice_raw_fusion_arrays,
+)
 from stage2_cross_stock_tft_forecasts import _cross_stock_output_dir
 from stage2_tft_forecasts import (
     _index_only_price_inputs,
@@ -101,6 +107,79 @@ class NoPretrainedPriceModelTests(unittest.TestCase):
 
         self.assertEqual(tuple(output.shape), (4, 8))
         self.assertTrue(torch.isfinite(output).all().item())
+
+    def test_inner_split_preserves_rows_with_zero_price_features(self):
+        index = pl.DataFrame({
+            "row_id": [1, 2, 3],
+            "date": [
+                date(2020, 1, 1),
+                date(2020, 1, 2),
+                date(2020, 1, 3),
+            ],
+            "ticker": ["A", "A", "A"],
+            "target_up": [0.0, 1.0, 0.0],
+        })
+        price = _price_feature_matrix(index, [])
+        arrays = (
+            index,
+            price,
+            {"qwen": np.zeros((3, 1), dtype=np.int64)},
+            None,
+            np.array([0.0, 1.0, 0.0], dtype=np.float32),
+        )
+
+        sliced = _slice_raw_fusion_arrays(
+            arrays,
+            np.array([0, 2], dtype=np.int64),
+        )
+
+        self.assertEqual(price.shape, (3, 0))
+        self.assertEqual(sliced[1].shape, (2, 0))
+        self.assertEqual(sliced[0]["row_id"].to_list(), [1, 3])
+
+    def test_raw_assembler_preserves_rows_without_price_latents(self):
+        price_inputs = pl.DataFrame({
+            "row_id": [1, 2, 3],
+            "date": [
+                date(2020, 1, 1),
+                date(2020, 1, 2),
+                date(2020, 1, 3),
+            ],
+            "ticker": ["A", "A", "A"],
+        })
+        targets = price_inputs.with_columns(
+            pl.Series("target_up", [0.0, 1.0, 0.0])
+        )
+        links = pl.DataFrame({
+            "row_id": [1, 2, 3],
+            "text_field": ["macro_1", "macro_1", "macro_1"],
+            "text_id": ["text-1", "text-2", "text-3"],
+        })
+        stores = {
+            "qwen": SimpleNamespace(index=pl.DataFrame({
+                "text_id": ["text-1", "text-2", "text-3"],
+                "embedding_row": [0, 1, 2],
+            }))
+        }
+
+        arrays = _assemble_raw_fusion_arrays(
+            price_inputs.select("row_id"),
+            price_inputs,
+            targets,
+            links,
+            stores,
+            ("qwen",),
+            ("macro_1",),
+        )
+        sliced = _slice_raw_fusion_arrays(
+            arrays,
+            np.array([0, 2], dtype=np.int64),
+        )
+
+        self.assertEqual(arrays[0].height, 3)
+        self.assertEqual(arrays[1].shape, (3, 0))
+        self.assertEqual(sliced[0].height, 2)
+        self.assertEqual(sliced[1].shape, (2, 0))
 
     def test_cross_stock_outputs_are_isolated_by_pretraining_mode(self):
         pretrained_args = SimpleNamespace(
