@@ -69,6 +69,7 @@ from model_config import (
     TRAIN_LINK_PATH,
     TRAIN_TARGET_PATH,
     CROSS_STOCK_ATTENTION_HEADS,
+    USE_PRETRAINED_PRICE_MODEL,
 )
 from stage2_pretrained_forecasts import (
     classify_covariates,
@@ -113,14 +114,28 @@ def parse_args(description: str | None = None) -> argparse.Namespace:
             "attended market variates."
         ),
     )
-    parser.add_argument(
+    pretrained_model_group = parser.add_mutually_exclusive_group()
+    pretrained_model_group.add_argument(
         "--no-pretrained-model",
+        dest="no_pretrained_model",
         action="store_true",
         help=(
             "Do not load or use a pretrained TimesFM/Chronos price model. "
             "The TFT still uses engineered static and temporal covariates, "
             "and the configured text embeddings remain enabled."
         ),
+    )
+    pretrained_model_group.add_argument(
+        "--use-pretrained-model",
+        dest="no_pretrained_model",
+        action="store_false",
+        help=(
+            "Use the selected pretrained TimesFM/Chronos price model, "
+            "overriding USE_PRETRAINED_PRICE_MODEL=False."
+        ),
+    )
+    parser.set_defaults(
+        no_pretrained_model=not USE_PRETRAINED_PRICE_MODEL
     )
     parser.add_argument(
         "--no-price-extraction", action="store_true",
@@ -160,7 +175,11 @@ def run_tft_pipeline(
     cross_stock_attention_heads: int = CROSS_STOCK_ATTENTION_HEADS,
 ) -> dict[str, pl.DataFrame]:
     no_pretrained_model = bool(
-        getattr(args, "no_pretrained_model", False)
+        getattr(
+            args,
+            "no_pretrained_model",
+            not USE_PRETRAINED_PRICE_MODEL,
+        )
     )
     if args.no_price_extraction and args.force_price_refresh:
         raise ValueError(

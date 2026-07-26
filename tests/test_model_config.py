@@ -10,6 +10,7 @@ from model_config import (
     OPTUNA_LEARNING_RATE_MAX,
     OPTUNA_LEARNING_RATE_MIN,
     OPTUNA_MARKET_DEPTH_CANDIDATES,
+    USE_PRETRAINED_PRICE_MODEL,
 )
 
 
@@ -33,6 +34,9 @@ class TftRegularizationConfigTests(unittest.TestCase):
             OPTUNA_LEARNING_RATE_MAX * ADAPTER_LEARNING_RATE_MULTIPLIER,
             6e-6,
         )
+
+    def test_pretrained_price_model_default_is_explicit(self):
+        self.assertIsInstance(USE_PRETRAINED_PRICE_MODEL, bool)
 
 
 if __name__ == "__main__":

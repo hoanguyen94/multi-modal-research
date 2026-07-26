@@ -129,6 +129,7 @@ KNOWN_FUTURE_PREFIXES = (
 # Frozen price encoders and shared fusion defaults.
 PRICE_ENCODERS = ("timesfm", "chronos2")
 DEFAULT_PRICE_ENCODER = "timesfm"
+USE_PRETRAINED_PRICE_MODEL = True
 TIMESFM_MODEL_ID = "google/timesfm-2.5-200m-pytorch"
 CHRONOS2_MODEL_ID = "amazon/chronos-2"
 PRICE_ENCODER_MODEL_IDS = {

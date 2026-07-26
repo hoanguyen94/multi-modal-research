@@ -12,6 +12,7 @@ import torch
 
 import stage2_tft_forecasts as stage2_tft
 from latent_fusion import TFTMarketEncoder
+from stage2_cross_stock_tft_forecasts import _cross_stock_output_dir
 from stage2_tft_forecasts import (
     _index_only_price_inputs,
     parse_args,
@@ -19,6 +20,32 @@ from stage2_tft_forecasts import (
 
 
 class NoPretrainedPriceModelTests(unittest.TestCase):
+    def test_cli_default_inherits_enabled_model_config(self):
+        with (
+            patch.object(
+                stage2_tft,
+                "USE_PRETRAINED_PRICE_MODEL",
+                True,
+            ),
+            patch.object(sys, "argv", ["stage2_tft_forecasts.py"]),
+        ):
+            args = parse_args()
+
+        self.assertFalse(args.no_pretrained_model)
+
+    def test_cli_default_inherits_disabled_model_config(self):
+        with (
+            patch.object(
+                stage2_tft,
+                "USE_PRETRAINED_PRICE_MODEL",
+                False,
+            ),
+            patch.object(sys, "argv", ["stage2_tft_forecasts.py"]),
+        ):
+            args = parse_args()
+
+        self.assertTrue(args.no_pretrained_model)
+
     def test_cli_toggle_is_available(self):
         with patch.object(
             sys,
@@ -28,6 +55,16 @@ class NoPretrainedPriceModelTests(unittest.TestCase):
             args = parse_args()
 
         self.assertTrue(args.no_pretrained_model)
+
+    def test_cli_explicit_enable_is_available(self):
+        with patch.object(
+            sys,
+            "argv",
+            ["stage2_tft_forecasts.py", "--use-pretrained-model"],
+        ):
+            args = parse_args()
+
+        self.assertFalse(args.no_pretrained_model)
 
     def test_index_only_inputs_have_no_price_latent_columns(self):
         origins = pl.DataFrame({
@@ -64,6 +101,22 @@ class NoPretrainedPriceModelTests(unittest.TestCase):
 
         self.assertEqual(tuple(output.shape), (4, 8))
         self.assertTrue(torch.isfinite(output).all().item())
+
+    def test_cross_stock_outputs_are_isolated_by_pretraining_mode(self):
+        pretrained_args = SimpleNamespace(
+            price_encoder="timesfm",
+            no_pretrained_model=False,
+        )
+        ablation_args = SimpleNamespace(
+            price_encoder="timesfm",
+            no_pretrained_model=True,
+        )
+
+        pretrained_path = _cross_stock_output_dir(pretrained_args)
+        ablation_path = _cross_stock_output_dir(ablation_args)
+
+        self.assertNotEqual(pretrained_path, ablation_path)
+        self.assertIn("no_pretrained_price", ablation_path.name)
 
     def test_pipeline_toggle_skips_pretrained_model_and_latents(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

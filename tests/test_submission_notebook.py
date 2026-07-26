@@ -44,7 +44,7 @@ class SubmissionNotebookTests(unittest.TestCase):
         )
         self.assertIn('FAMILIES = ["qwen"]', all_source)
         self.assertIn(
-            "USE_PRETRAINED_PRICE_MODEL = True",
+            "USE_PRETRAINED_PRICE_MODEL =",
             all_source,
         )
         self.assertIn(
