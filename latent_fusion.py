@@ -3395,8 +3395,10 @@ def run_walk_forward_fusion(
         raise ValueError("fusion_batch_size must be positive")
     if fusion_hidden_dim < 1:
         raise ValueError("fusion_hidden_dim must be positive")
-    if price_encoder not in {"timesfm", "chronos2"}:
-        raise ValueError("price_encoder must be 'timesfm' or 'chronos2'")
+    if price_encoder not in {"timesfm", "chronos2", "none"}:
+        raise ValueError(
+            "price_encoder must be 'timesfm', 'chronos2', or 'none'"
+        )
     if min(market_depth, fusion_depth) < 0:
         raise ValueError("Network depths cannot be negative")
     if residual_expansion < 1:
@@ -3494,17 +3496,22 @@ def run_walk_forward_fusion(
         raise ValueError(
             "fusion_hidden_dim must be divisible by every TFT attention head count"
         )
+    price_feature_prefix = (
+        "no_pretrained_price"
+        if price_encoder == "none" else price_encoder
+    )
     if cross_stock_attention:
         feature_set = (
-            f"{price_encoder}_temporal_tft_cross_stock_unified_raw_text_attention"
+            f"{price_feature_prefix}_temporal_tft_cross_stock_"
+            "unified_raw_text_attention"
         )
     elif market_encoder == "tft":
         feature_set = (
-            f"{price_encoder}_temporal_tft_unified_raw_text_attention"
+            f"{price_feature_prefix}_temporal_tft_unified_raw_text_attention"
         )
     else:
         feature_set = (
-            f"{price_encoder}_covariates_unified_raw_text_attention"
+            f"{price_feature_prefix}_covariates_unified_raw_text_attention"
         )
     if run_outer_folds:
         if fold_assignments is None:
@@ -3681,6 +3688,7 @@ def run_walk_forward_fusion(
     }
     study_signature = hashlib.sha256(json.dumps({
         "selection_protocol_version": SELECTION_PROTOCOL_VERSION,
+        "price_encoder": price_encoder,
         "market_encoder": market_encoder,
         "families": families,
         "family_dims": {
@@ -4727,7 +4735,7 @@ def run_walk_forward_fusion(
                 "model": model_name,
                 "selection": "nested_inner_validation",
                 "price_encoder": price_encoder,
-                "price_encoder_frozen": True,
+                "price_encoder_frozen": price_encoder != "none",
                 "market_encoder": market_encoder,
                 "covariates": list(covariate_columns),
                 "covariate_preprocessing": "outer-training median then zscore",
@@ -5162,7 +5170,8 @@ def run_walk_forward_fusion(
         )
         save_torch_model(final_dir / "fusion_models" / f"{model_name}.pt", model, {
             "scope": "final", "model": model_name,
-            "price_encoder": price_encoder, "price_encoder_frozen": True,
+            "price_encoder": price_encoder,
+            "price_encoder_frozen": price_encoder != "none",
             "market_encoder": market_encoder,
             "covariates": list(covariate_columns),
             "covariate_preprocessing": "all-training median then zscore",
