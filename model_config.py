@@ -56,9 +56,17 @@ CHRONOS2_TFT_OUTPUT_DIR = (
     / "stage2_pretrained_forecasts"
     / "chronos2_multivariate_temporal_tft_unified_raw_text_attention_0.5thres2"
 )
+
+NO_PRETRAIN_PRICE_ENC_TFT_OUTPUT_DIR = (
+    ARTIFACT_DIR
+    / "stage2_pretrained_forecasts"
+    / "no_pretrained_temporal_tft_unified_raw_text_attention"
+)
+
 TFT_OUTPUT_DIRS = {
     "timesfm": TFT_OUTPUT_DIR,
     "chronos2": CHRONOS2_TFT_OUTPUT_DIR,
+    "none": NO_PRETRAIN_PRICE_ENC_TFT_OUTPUT_DIR
 }
 CROSS_STOCK_TFT_OUTPUT_DIR = (
     ARTIFACT_DIR
@@ -127,7 +135,7 @@ KNOWN_FUTURE_PREFIXES = (
 )
 
 # Frozen price encoders and shared fusion defaults.
-PRICE_ENCODERS = ("timesfm", "chronos2")
+PRICE_ENCODERS = ("timesfm", "chronos2", "none")
 DEFAULT_PRICE_ENCODER = "timesfm"
 USE_PRETRAINED_PRICE_MODEL = True
 TIMESFM_MODEL_ID = "google/timesfm-2.5-200m-pytorch"
