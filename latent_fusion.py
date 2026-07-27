@@ -1650,6 +1650,21 @@ def _write_training_diagnostics(
 ) -> pl.DataFrame:
     """Persist outer-fold, inner-validation, and final-refit curves."""
     diagnostic_dir.mkdir(parents=True, exist_ok=True)
+    expected_model_files = {
+        f"{model_name}_fold_learning_curves{suffix}"
+        for model_name in diagnostic_histories
+        for suffix in (".csv", ".png")
+    }
+    for pattern in (
+        "*_fold_learning_curves.csv",
+        "*_fold_learning_curves.png",
+    ):
+        for stale_path in diagnostic_dir.glob(pattern):
+            if (
+                stale_path.name != "all_fold_learning_curves.csv"
+                and stale_path.name not in expected_model_files
+            ):
+                stale_path.unlink()
     combined_diagnostics = []
     for model_name, history_parts in diagnostic_histories.items():
         model_history = pl.concat(
@@ -1673,6 +1688,10 @@ def _write_training_diagnostics(
             "bce": pl.Float64,
             "train_bce": pl.Float64,
             "train_positive_rate": pl.Float64,
+            "configured_epochs": pl.Float64,
+            "early_stopping_min_epochs": pl.Float64,
+            "early_stopping_patience": pl.Float64,
+            "early_stopping_min_delta": pl.Float64,
             "validation_bce": pl.Float64,
             "validation_accuracy": pl.Float64,
             "validation_balanced_accuracy": pl.Float64,
@@ -1773,7 +1792,7 @@ def fit_raw_fusion_model(
     fusion_depth: int = 1,
     expansion: int = 2,
     dropout: float = 0.1,
-    epochs: int = 10,
+    epochs: int = FUSION_EPOCHS,
     batch_size: int = 128,
     learning_rate: float = 6e-5,
     weight_decay: float = 1e-4,
@@ -2007,6 +2026,12 @@ def fit_raw_fusion_model(
             "bce": float(train_bce),
             "train_bce": float(train_bce),
             "train_positive_rate": float(positive_count / len(target)),
+            "configured_epochs": float(epochs),
+            "early_stopping_min_epochs": float(
+                early_stopping_min_epochs
+            ),
+            "early_stopping_patience": float(early_stopping_patience),
+            "early_stopping_min_delta": float(early_stopping_min_delta),
         }
         if has_validation:
             epoch_metrics.update(_raw_fusion_validation_metrics(
@@ -3455,6 +3480,10 @@ def run_walk_forward_fusion(
         )
     if early_stopping_min_epochs < 1:
         raise ValueError("early_stopping_min_epochs must be positive")
+    if fusion_epochs < early_stopping_min_epochs:
+        raise ValueError(
+            "fusion_epochs must be at least early_stopping_min_epochs"
+        )
     if early_stopping_patience < 1:
         raise ValueError("early_stopping_patience must be positive")
     if early_stopping_min_delta < 0.0:
@@ -4215,7 +4244,7 @@ def run_walk_forward_fusion(
         raw_padding: np.ndarray | None,
         study_name: str,
         study_seed: int,
-    ) -> tuple[dict, float, pl.DataFrame, dict]:
+    ) -> tuple[dict, float, pl.DataFrame, dict, pl.DataFrame]:
         """Tune non-epoch parameters, then calibrate epoch and threshold."""
         _, _, split_manifest = ensure_inner_split(scope_name, base_arrays)
         history_dir = (
@@ -4569,7 +4598,7 @@ def run_walk_forward_fusion(
                 history_dir / "selected_learning_curves.png",
             )
         else:
-            print(
+            raise RuntimeError(
                 f"Selected inner history is unavailable for {scope_name}: "
                 f"{selected_history_path}"
             )
@@ -4588,7 +4617,13 @@ def run_walk_forward_fusion(
                 for key, value in manifest.items()
             },
         }, indent=2, sort_keys=True))
-        return best_params, threshold, trials, manifest
+        return (
+            best_params,
+            threshold,
+            trials,
+            manifest,
+            selected_history,
+        )
 
     # True nested selection: each outer fold owns an inner purged split.
     tuning_trial_parts: list[pl.DataFrame] = []
@@ -4610,7 +4645,13 @@ def run_walk_forward_fusion(
             _,
             _,
         ) = fold_arrays(fold, variants[tuning_variant])
-        fold_params, tuning_threshold, trials, split_manifest = tune_inner_scope(
+        (
+            fold_params,
+            tuning_threshold,
+            trials,
+            split_manifest,
+            _,
+        ) = tune_inner_scope(
             scope_name=f"outer_fold_{fold}",
             base_arrays=tuning_train,
             raw_covariates=tuning_train_raw,
@@ -4878,18 +4919,6 @@ def run_walk_forward_fusion(
     tuning_trials_table.write_csv(
         output_dir / "nested_optuna_trials.csv"
     )
-    final_selected_history_path = (
-        output_dir / "inner_selection_histories" /
-        "final_full_training" / "selected_learning_curves.csv"
-    )
-    if not final_selected_history_path.exists():
-        raise RuntimeError(
-            "Final inner-validation learning curves are missing: "
-            f"{final_selected_history_path}"
-        )
-    final_tuning_selection_history = pl.read_csv(
-        final_selected_history_path
-    )
     if nested_selection_rows:
         nested_selection = pl.DataFrame(
             nested_selection_rows, infer_schema_length=None
@@ -5041,6 +5070,7 @@ def run_walk_forward_fusion(
         final_tuning_threshold,
         final_trials,
         final_split_manifest,
+        final_tuning_selection_history,
     ) = tune_inner_scope(
         scope_name="final_full_training",
         base_arrays=final_tuning_arrays,
@@ -5190,6 +5220,27 @@ def run_walk_forward_fusion(
             raise RuntimeError(
                 "Final inner-selection history is missing diagnostics: "
                 f"{missing_selection_columns}"
+            )
+        selected_epoch = int(variant_params["epochs"])
+        recorded_epochs = {
+            int(epoch) for epoch in selection_history["epoch"].to_list()
+        }
+        if max(recorded_epochs) < early_stopping_min_epochs:
+            raise RuntimeError(
+                "Final inner-selection history ended before the configured "
+                f"minimum epoch: history_max={max(recorded_epochs)}, "
+                f"minimum={early_stopping_min_epochs}"
+            )
+        if selected_epoch < early_stopping_min_epochs:
+            raise RuntimeError(
+                "Final refit selected an epoch before the configured "
+                f"minimum: selected={selected_epoch}, "
+                f"minimum={early_stopping_min_epochs}"
+            )
+        if selected_epoch not in recorded_epochs:
+            raise RuntimeError(
+                "Final refit epoch is absent from its inner-selection "
+                f"history: selected={selected_epoch}"
             )
         selection_history_frame = selection_history.with_columns(
             pl.lit(-1).cast(pl.Int8).alias("fold"),
