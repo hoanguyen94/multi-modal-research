@@ -1570,6 +1570,8 @@ def _plot_fold_training_diagnostics(
             phases = part["phase"].drop_nulls().unique().to_list()
             if phases == ["final_full_refit"]:
                 label = "Final full-data refit"
+            elif phases == ["inner_validation_selection"]:
+                label = "Final inner validation"
         axes[0].plot(
             epoch, part["train_bce"].to_numpy(),
             color=color, linestyle="-", label=f"{label} train",
@@ -1646,7 +1648,7 @@ def _write_training_diagnostics(
     diagnostic_histories: dict[str, list[pl.DataFrame]],
     diagnostic_dir: Path,
 ) -> pl.DataFrame:
-    """Persist all available outer-fold and final-refit learning curves."""
+    """Persist outer-fold, inner-validation, and final-refit curves."""
     diagnostic_dir.mkdir(parents=True, exist_ok=True)
     combined_diagnostics = []
     for model_name, history_parts in diagnostic_histories.items():
@@ -4876,6 +4878,18 @@ def run_walk_forward_fusion(
     tuning_trials_table.write_csv(
         output_dir / "nested_optuna_trials.csv"
     )
+    final_selected_history_path = (
+        output_dir / "inner_selection_histories" /
+        "final_full_training" / "selected_learning_curves.csv"
+    )
+    if not final_selected_history_path.exists():
+        raise RuntimeError(
+            "Final inner-validation learning curves are missing: "
+            f"{final_selected_history_path}"
+        )
+    final_tuning_selection_history = pl.read_csv(
+        final_selected_history_path
+    )
     if nested_selection_rows:
         nested_selection = pl.DataFrame(
             nested_selection_rows, infer_schema_length=None
@@ -5079,6 +5093,7 @@ def run_walk_forward_fusion(
     final_prediction_parts = []
     final_thresholds: dict[str, float] = {}
     for variant, variant_families in variants.items():
+        selection_history = final_tuning_selection_history
         train_a = _assemble_raw_fusion_arrays(
             all_train_ids, train_price_latents, train_targets,
             train_links, stores, variant_families, text_fields,
@@ -5133,6 +5148,7 @@ def run_walk_forward_fusion(
                 "final_full_training" /
                 f"variant_{variant}_selection.csv"
             )
+            selection_history = pl.DataFrame(inner_history)
             del inner_model
         scaler = _fit_covariate_scaler(train_raw)
         train_cov = _apply_covariate_scaler(train_raw, scaler)
@@ -5160,8 +5176,31 @@ def run_walk_forward_fusion(
             )
             test_sequence = _apply_temporal_scaler(
                 test_sequence, test_padding, temporal_scaler
-            )
+        )
         model_name = fusion_model_name(variant)
+        required_selection_columns = {
+            "epoch",
+            "train_bce",
+            "validation_bce",
+        }
+        missing_selection_columns = sorted(
+            required_selection_columns - set(selection_history.columns)
+        )
+        if missing_selection_columns:
+            raise RuntimeError(
+                "Final inner-selection history is missing diagnostics: "
+                f"{missing_selection_columns}"
+            )
+        selection_history_frame = selection_history.with_columns(
+            pl.lit(-1).cast(pl.Int8).alias("fold"),
+            pl.lit(model_name).alias("model"),
+            pl.lit(variant).alias("variant"),
+            pl.lit("final_full_training").alias("scope"),
+            pl.lit("inner_validation_selection").alias("phase"),
+        )
+        diagnostic_histories.setdefault(model_name, []).append(
+            selection_history_frame
+        )
         model, history = fit_raw_fusion_model(
             train_a[1], train_cov, train_a[2], stores, train_a[4],
             device, text_dim=raw_text_dim,
