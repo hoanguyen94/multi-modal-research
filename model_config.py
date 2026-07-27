@@ -49,7 +49,7 @@ PRETRAINED_OUTPUT_DIRS = {
 TFT_OUTPUT_DIR = (
     ARTIFACT_DIR
     / "stage2_pretrained_forecasts"
-    / "timesfm_temporal_tft_unified_raw_text_attention_0.5thres2"
+    / "timesfm_temporal_tft_unified_raw_text_attention_0.5thres4"
 )
 CHRONOS2_TFT_OUTPUT_DIR = (
     ARTIFACT_DIR
@@ -172,7 +172,7 @@ FUSION_EPOCHS = 100
 PRICE_BATCH_SIZE = 16
 FUSION_BATCH_SIZE = 128
 ADAPTER_LEARNING_RATE_MULTIPLIER = 0.1
-EARLY_STOPPING_MIN_EPOCHS = 1
+EARLY_STOPPING_MIN_EPOCHS = 20
 EARLY_STOPPING_PATIENCE = 5
 EARLY_STOPPING_MIN_DELTA = 1e-5
 
