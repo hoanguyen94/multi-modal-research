@@ -1,3 +1,4 @@
+import ast
 import json
 import sys
 import tempfile
@@ -13,6 +14,7 @@ import torch
 
 import stage2_tft_forecasts as stage2_tft
 from latent_fusion import (
+    RawFusionArrays,
     TFTMarketEncoder,
     _assemble_raw_fusion_arrays,
     _price_feature_matrix,
@@ -23,6 +25,51 @@ from stage2_tft_forecasts import (
     _index_only_price_inputs,
     parse_args,
 )
+
+
+class FusionRunnerStructureTests(unittest.TestCase):
+    def test_walk_forward_runner_has_no_nested_function_definitions(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "latent_fusion.py"
+        ).read_text()
+        tree = ast.parse(source)
+        runner = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "run_walk_forward_fusion"
+        )
+
+        nested_functions = [
+            node.name
+            for node in runner.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        self.assertEqual(nested_functions, [])
+
+    def test_each_text_variant_owns_its_hyperparameter_selection(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "latent_fusion.py"
+        ).read_text()
+
+        self.assertNotIn("tuning_variant", source)
+        self.assertIn(
+            'selection_scope = f"outer_fold_{fold}_variant_{variant}"',
+            source,
+        )
+        self.assertIn("scope_name=selection_scope", source)
+        self.assertIn(
+            'scope_name=f"final_full_training_variant_{variant}"',
+            source,
+        )
+        self.assertIn(
+            'outer_best_params[fold][variant] = variant_params',
+            source,
+        )
+        self.assertIn(
+            'final_best_params_by_variant[variant] = variant_params',
+            source,
+        )
 
 
 class NoPretrainedPriceModelTests(unittest.TestCase):
@@ -120,11 +167,10 @@ class NoPretrainedPriceModelTests(unittest.TestCase):
             "target_up": [0.0, 1.0, 0.0],
         })
         price = _price_feature_matrix(index, [])
-        arrays = (
+        arrays = RawFusionArrays(
             index,
             price,
             {"qwen": np.zeros((3, 1), dtype=np.int64)},
-            None,
             np.array([0.0, 1.0, 0.0], dtype=np.float32),
         )
 
@@ -177,6 +223,7 @@ class NoPretrainedPriceModelTests(unittest.TestCase):
         )
 
         self.assertEqual(arrays[0].height, 3)
+        self.assertEqual(len(arrays), 4)
         self.assertEqual(arrays[1].shape, (3, 0))
         self.assertEqual(sliced[0].height, 2)
         self.assertEqual(sliced[1].shape, (2, 0))

@@ -112,6 +112,44 @@ class SubmissionNotebookTests(unittest.TestCase):
                     violations.append((cell_index, node.module))
         self.assertEqual(violations, [])
 
+    def test_fusion_runner_has_no_nested_function_definitions(self):
+        source = next(
+            "".join(cell["source"])
+            for cell in self.notebook["cells"]
+            if cell.get("cell_type") == "code"
+            and "def run_walk_forward_fusion" in "".join(cell.get("source", []))
+        )
+        tree = ast.parse(source)
+        runner = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "run_walk_forward_fusion"
+        )
+
+        nested_functions = [
+            node.name
+            for node in runner.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        self.assertEqual(nested_functions, [])
+
+    def test_tuning_training_and_testing_use_the_same_text_variant(self):
+        all_source = "\n".join(
+            "".join(cell.get("source", []))
+            for cell in self.notebook["cells"]
+        )
+
+        self.assertNotIn("tuning_variant", all_source)
+        self.assertIn(
+            'scope_name=f"final_full_training_variant_{variant}"',
+            all_source,
+        )
+        self.assertIn(
+            'final_best_params_by_variant[variant] = variant_params',
+            all_source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

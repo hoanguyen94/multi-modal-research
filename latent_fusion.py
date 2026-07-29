@@ -12,8 +12,10 @@ import gc
 import hashlib
 import json
 import shutil
+from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, NamedTuple, Sequence
 import numpy as np
 import polars as pl
 import pyarrow as pa
@@ -1474,8 +1476,13 @@ def _raw_fusion_validation_metrics(
     market_sequence: np.ndarray | None,
     sequence_padding_mask: np.ndarray | None,
     stock_group_ids: np.ndarray | None = None,
+    decision_threshold: float = 0.5,
 ) -> dict[str, float]:
-    """Evaluate one epoch without moving the training model off its device."""
+    """Evaluate one epoch at a threshold selected without these labels."""
+    if not 0.0 < decision_threshold < 1.0:
+        raise ValueError(
+            "decision_threshold must be strictly between 0 and 1"
+        )
     was_training = model.training
     model.eval()
     loss_sum = 0.0
@@ -1519,11 +1526,7 @@ def _raw_fusion_validation_metrics(
     if was_training:
         model.train()
     truth = target.astype(np.int8, copy=False)
-    prediction = (score >= 0.5).astype(np.int8)
-    optimized_threshold = _best_validation_threshold(truth, score)
-    optimized_prediction = (
-        score >= optimized_threshold
-    ).astype(np.int8)
+    prediction = (score >= decision_threshold).astype(np.int8)
     return {
         "validation_bce": loss_sum / len(target),
         "validation_accuracy": float(accuracy_score(truth, prediction)),
@@ -1531,10 +1534,7 @@ def _raw_fusion_validation_metrics(
             balanced_accuracy_score(truth, prediction)
         ),
         "validation_roc_auc": float(roc_auc_score(truth, score)),
-        "validation_optimized_balanced_accuracy": float(
-            balanced_accuracy_score(truth, optimized_prediction)
-        ),
-        "validation_optimized_threshold": float(optimized_threshold),
+        "validation_decision_threshold": float(decision_threshold),
         "validation_mean_probability": float(score.mean()),
         "validation_positive_rate": float(truth.mean()),
     }
@@ -1600,11 +1600,6 @@ def _plot_fold_training_diagnostics(
                 "validation_balanced_accuracy",
                 "-",
                 "balanced accuracy",
-            ),
-            (
-                "validation_optimized_balanced_accuracy",
-                "--",
-                "optimized balanced accuracy",
             ),
         )
         for column, linestyle, metric_label in validation_metrics:
@@ -1696,8 +1691,7 @@ def _write_training_diagnostics(
             "validation_accuracy": pl.Float64,
             "validation_balanced_accuracy": pl.Float64,
             "validation_roc_auc": pl.Float64,
-            "validation_optimized_balanced_accuracy": pl.Float64,
-            "validation_optimized_threshold": pl.Float64,
+            "validation_decision_threshold": pl.Float64,
             "validation_mean_probability": pl.Float64,
             "validation_positive_rate": pl.Float64,
             "best_epoch": pl.Float64,
@@ -1814,6 +1808,7 @@ def fit_raw_fusion_model(
     validation_market_sequence: np.ndarray | None = None,  # (N_validation, T, V)
     validation_sequence_padding_mask: np.ndarray | None = None,  # (N_validation, T); True = padding
     validation_stock_group_ids: np.ndarray | None = None,  # (N_validation,), date IDs
+    validation_decision_threshold: float = 0.5,
     select_best_checkpoint: bool = True,
     early_stopping_min_epochs: int = EARLY_STOPPING_MIN_EPOCHS,
     early_stopping_patience: int = EARLY_STOPPING_PATIENCE,
@@ -1839,6 +1834,10 @@ def fit_raw_fusion_model(
         raise ValueError("early_stopping_patience must be positive")
     if early_stopping_min_delta < 0.0:
         raise ValueError("early_stopping_min_delta cannot be negative")
+    if not 0.0 < validation_decision_threshold < 1.0:
+        raise ValueError(
+            "validation_decision_threshold must be strictly between 0 and 1"
+        )
     if cross_stock_attention and market_encoder != "tft":
         raise ValueError("Cross-stock attention currently requires TFT")
     if cross_stock_attention and stock_group_ids is None:
@@ -2050,6 +2049,7 @@ def fit_raw_fusion_model(
                     validation_stock_group_ids
                     if cross_stock_attention else None
                 ),
+                decision_threshold=validation_decision_threshold,
             ))
         history.append(epoch_metrics)
         if (
@@ -2436,7 +2436,7 @@ def generate_timesfm_price_latents(
                 records.append(record)
         if not records:
             continue
-        latent = _pooled_timesfm_hidden(wrapper, records, lookback, device)
+        latent = _pooled_timesfm_hidden(wrapper, records, lookback, device) #N, D_price
         identity = pl.DataFrame({
             "row_id": [row["row_id"] for row in kept],
             "date": [row["date"] for row in kept],
@@ -2984,6 +2984,15 @@ def _assemble_fusion_arrays(
     return frame.select(["row_id", "date", "ticker", "target_up"]), price, text, mask, target
 
 
+class RawFusionArrays(NamedTuple):
+    """Aligned inputs for raw-text fusion."""
+
+    index: pl.DataFrame
+    price: np.ndarray
+    text_indices: dict[str, np.ndarray]
+    target: np.ndarray
+
+
 def _assemble_raw_fusion_arrays(
     row_ids: pl.DataFrame,
     price_latents: pl.DataFrame,
@@ -2993,14 +3002,8 @@ def _assemble_raw_fusion_arrays(
     families: Sequence[str],
     text_fields: Sequence[str],
     require_target: bool = True,
-) -> tuple[
-    pl.DataFrame,
-    np.ndarray,
-    dict[str, np.ndarray],
-    None,
-    np.ndarray,
-]:
-    """Align rows to raw embedding-matrix indices without loading raw vectors."""
+) -> RawFusionArrays:
+    """Return ``(index, price, text_indices, target)`` for raw-text fusion."""
     scoped_ids = row_ids.select(pl.col("row_id").cast(pl.UInt64)).unique()
     scoped_price = price_latents.with_columns(pl.col("row_id").cast(pl.UInt64))
     scoped_targets = targets.select([
@@ -3057,11 +3060,10 @@ def _assemble_raw_fusion_arrays(
     _require_finite("frozen price latents", price)
     if require_target:
         _require_finite("training targets", target)
-    return (
+    return RawFusionArrays(
         frame.select(["row_id", "date", "ticker", "target_up"]),
         price,
         text_indices,
-        None,
         target,
     )
 
@@ -3358,21 +3360,932 @@ def _purged_inner_positions(
 
 
 def _slice_raw_fusion_arrays(
-    arrays: tuple,
+    arrays: RawFusionArrays,
     positions: np.ndarray,
-) -> tuple:
+) -> RawFusionArrays:
     """Select rows from assembled raw-fusion arrays without changing order."""
-    index, price, text_indices, placeholder, target = arrays
-    return (
-        index[positions],
-        np.ascontiguousarray(price[positions]),
+    return RawFusionArrays(
+        arrays.index[positions],
+        np.ascontiguousarray(arrays.price[positions]),
         {
             family: np.ascontiguousarray(values[positions])
-            for family, values in text_indices.items()
+            for family, values in arrays.text_indices.items()
         },
-        placeholder,
-        np.ascontiguousarray(target[positions]),
+        np.ascontiguousarray(arrays.target[positions]),
     )
+
+
+def _model_fit_params(params: dict) -> dict:
+    """Remove preprocessing-only hyperparameters before model creation."""
+    return {
+        key: value for key, value in params.items()
+        if key != "temporal_lookback"
+    }
+
+
+def _stock_groups(
+    index: pl.DataFrame,
+    *,
+    cross_stock_attention: bool,
+) -> np.ndarray | None:
+    """Return date groups only when cross-stock attention is enabled."""
+    return _date_group_ids(index) if cross_stock_attention else None
+
+
+def _fusion_model_name(
+    variant: str,
+    *,
+    price_encoder: str,
+    market_encoder: str,
+    cross_stock_attention: bool,
+) -> str:
+    """Build the stable artifact name for one fusion variant."""
+    if cross_stock_attention:
+        prefix = f"{price_encoder}_tft_cross_stock_unified_raw_text_plus"
+    elif market_encoder == "tft":
+        prefix = f"{price_encoder}_tft_unified_raw_text_plus"
+    else:
+        prefix = f"{price_encoder}_covariates_unified_raw_text_plus"
+    return f"{prefix}_{variant}"
+
+
+def _select_raw_families(
+    arrays: RawFusionArrays,
+    variant_families: Sequence[str],
+) -> RawFusionArrays:
+    """Keep only the requested raw embedding families."""
+    return RawFusionArrays(
+        arrays.index,
+        arrays.price,
+        {
+            family: arrays.text_indices[family]
+            for family in variant_families
+        },
+        arrays.target,
+    )
+
+
+def _scaled_temporal_view(
+    scaler_scope: str,
+    train_sequence: np.ndarray | None,
+    train_padding: np.ndarray | None,
+    validation_sequence: np.ndarray | None,
+    validation_padding: np.ndarray | None,
+    lookback: int,
+    *,
+    market_encoder: str,
+    lookback_candidates: Sequence[int],
+    scaler_cache: dict[tuple[str, int], dict[str, np.ndarray]],
+) -> tuple:
+    """Slice and scale cached maximum-length TFT histories."""
+    if market_encoder != "tft":
+        return (
+            train_sequence,
+            train_padding,
+            validation_sequence,
+            validation_padding,
+            None,
+        )
+    lookback = int(lookback)
+    if lookback not in lookback_candidates:
+        raise ValueError(f"Unsupported TFT lookback: {lookback}")
+    train_view = np.ascontiguousarray(
+        train_sequence[:, -lookback:, :]
+    )
+    train_mask = np.ascontiguousarray(train_padding[:, -lookback:])
+    validation_view = np.ascontiguousarray(
+        validation_sequence[:, -lookback:, :]
+    )
+    validation_mask = np.ascontiguousarray(
+        validation_padding[:, -lookback:]
+    )
+    cache_key = (str(scaler_scope), lookback)
+    if cache_key not in scaler_cache:
+        scaler_cache[cache_key] = _fit_temporal_scaler(
+            train_view, train_mask
+        )
+    scaler = scaler_cache[cache_key]
+    return (
+        _apply_temporal_scaler(train_view, train_mask, scaler),
+        train_mask,
+        _apply_temporal_scaler(
+            validation_view, validation_mask, scaler
+        ),
+        validation_mask,
+        scaler,
+    )
+
+
+def _ensure_inner_split(
+    scope_name: str,
+    arrays: RawFusionArrays,
+    *,
+    cache: dict[str, tuple[np.ndarray, np.ndarray, dict]],
+    purge_dates: int,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Create or reuse one purged split for an experiment scope."""
+    if scope_name not in cache:
+        cache[scope_name] = _purged_inner_positions(
+            arrays.index,
+            purge_dates=purge_dates,
+        )
+    return cache[scope_name]
+
+
+def _prepare_inner_candidate_data(
+    scope_name: str,
+    arrays: RawFusionArrays,
+    raw_covariates: np.ndarray,
+    raw_sequence: np.ndarray | None,
+    raw_padding: np.ndarray | None,
+    lookback: int | None,
+    *,
+    market_encoder: str,
+    ensure_inner_split: Callable,
+    scaled_temporal_view: Callable,
+) -> tuple:
+    """Prepare a purged inner split using training-only scalers."""
+    train_positions, validation_positions, manifest = (
+        ensure_inner_split(scope_name, arrays)
+    )
+    inner_train = _slice_raw_fusion_arrays(arrays, train_positions)
+    inner_validation = _slice_raw_fusion_arrays(
+        arrays, validation_positions
+    )
+    covariate_scaler = _fit_covariate_scaler(
+        raw_covariates[train_positions]
+    )
+    inner_train_cov = _apply_covariate_scaler(
+        raw_covariates[train_positions], covariate_scaler
+    )
+    inner_validation_cov = _apply_covariate_scaler(
+        raw_covariates[validation_positions], covariate_scaler
+    )
+    train_sequence = train_padding = None
+    validation_sequence = validation_padding = None
+    temporal_scaler = None
+    if market_encoder == "tft":
+        (
+            train_sequence,
+            train_padding,
+            validation_sequence,
+            validation_padding,
+            temporal_scaler,
+        ) = scaled_temporal_view(
+            f"inner_{scope_name}",
+            raw_sequence[train_positions],
+            raw_padding[train_positions],
+            raw_sequence[validation_positions],
+            raw_padding[validation_positions],
+            int(lookback),
+        )
+    return (
+        inner_train,
+        inner_validation,
+        inner_train_cov,
+        inner_validation_cov,
+        train_sequence,
+        train_padding,
+        validation_sequence,
+        validation_padding,
+        covariate_scaler,
+        temporal_scaler,
+        manifest,
+    )
+
+
+def _sample_fusion_hyperparameters(
+    trial,
+    *,
+    hidden_dim_candidates: Sequence[int],
+    lookback_candidates: Sequence[int],
+    market_encoder: str,
+    fusion_epochs: int,
+) -> dict:
+    """Sample one Optuna configuration from the shared search space."""
+    params = {
+        "hidden_dim": trial.suggest_categorical(
+            "hidden_dim", list(hidden_dim_candidates)
+        ),
+        "fusion_depth": trial.suggest_categorical(
+            "fusion_depth", list(OPTUNA_FUSION_DEPTH_CANDIDATES)
+        ),
+        "expansion": trial.suggest_categorical(
+            "expansion", list(OPTUNA_EXPANSION_CANDIDATES)
+        ),
+        "dropout": trial.suggest_categorical(
+            "dropout", list(OPTUNA_DROPOUT_CANDIDATES)
+        ),
+        "epochs": int(fusion_epochs),
+        "learning_rate": trial.suggest_float(
+            "learning_rate",
+            OPTUNA_LEARNING_RATE_MIN,
+            OPTUNA_LEARNING_RATE_MAX,
+            log=True,
+        ),
+        "weight_decay": trial.suggest_float(
+            "weight_decay",
+            OPTUNA_WEIGHT_DECAY_MIN,
+            OPTUNA_WEIGHT_DECAY_MAX,
+            log=True,
+        ),
+        "market_depth": (
+            trial.suggest_categorical(
+                "market_depth",
+                list(OPTUNA_MARKET_DEPTH_CANDIDATES),
+            )
+            if market_encoder == "mlp" else 0
+        ),
+    }
+    if market_encoder == "tft":
+        params["temporal_lookback"] = trial.suggest_categorical(
+            "temporal_lookback", list(lookback_candidates)
+        )
+    return params
+
+
+@dataclass
+class _FoldArrayStore:
+    """Prepare each outer fold once and expose family-specific views."""
+
+    scopes: dict[int, dict]
+    price_latents: pl.DataFrame
+    targets: pl.DataFrame
+    links: pl.DataFrame
+    stores: dict[str, RawEmbeddingStore]
+    families: Sequence[str]
+    text_fields: Sequence[str]
+    features: pl.DataFrame
+    covariate_columns: Sequence[str]
+    market_encoder: str
+    temporal_covariate_columns: Sequence[str]
+    max_temporal_lookback: int
+    cache: dict[int, tuple] = field(default_factory=dict)
+
+    def get(
+        self,
+        fold: int,
+        variant_families: Sequence[str],
+    ) -> tuple:
+        fold = int(fold)
+        if fold not in self.cache:
+            print(f"Preparing and caching fold {fold} arrays")
+            scope = self.scopes[fold]
+            train_arrays = _assemble_raw_fusion_arrays(
+                scope["train_ids"],
+                self.price_latents,
+                self.targets,
+                self.links,
+                self.stores,
+                self.families,
+                self.text_fields,
+            )
+            validation_arrays = _assemble_raw_fusion_arrays(
+                scope["validation_ids"],
+                self.price_latents,
+                self.targets,
+                self.links,
+                self.stores,
+                self.families,
+                self.text_fields,
+            )
+            train_raw = _covariate_matrix(
+                train_arrays.index,
+                self.features,
+                self.covariate_columns,
+            )
+            validation_raw = _covariate_matrix(
+                validation_arrays.index,
+                self.features,
+                self.covariate_columns,
+            )
+            scaler = _fit_covariate_scaler(train_raw)
+            train_sequence = train_padding = None
+            validation_sequence = validation_padding = None
+            if self.market_encoder == "tft":
+                train_sequence, train_padding = (
+                    _temporal_covariate_matrix(
+                        train_arrays.index,
+                        self.features,
+                        self.temporal_covariate_columns,
+                        self.max_temporal_lookback,
+                    )
+                )
+                validation_sequence, validation_padding = (
+                    _temporal_covariate_matrix(
+                        validation_arrays.index,
+                        self.features,
+                        self.temporal_covariate_columns,
+                        self.max_temporal_lookback,
+                    )
+                )
+            self.cache[fold] = (
+                train_arrays,
+                validation_arrays,
+                train_raw,
+                validation_raw,
+                scaler,
+                train_sequence,
+                train_padding,
+                validation_sequence,
+                validation_padding,
+                None,
+            )
+        (
+            train_arrays,
+            validation_arrays,
+            train_raw,
+            validation_raw,
+            scaler,
+            train_sequence,
+            train_padding,
+            validation_sequence,
+            validation_padding,
+            temporal_scaler,
+        ) = self.cache[fold]
+        return (
+            _select_raw_families(train_arrays, variant_families),
+            _select_raw_families(validation_arrays, variant_families),
+            train_raw,
+            validation_raw,
+            scaler,
+            train_sequence,
+            train_padding,
+            validation_sequence,
+            validation_padding,
+            temporal_scaler,
+        )
+
+
+@dataclass
+class _InnerSelectionEngine:
+    """Own inner-split model selection without closing over the pipeline runner."""
+
+    market_encoder: str
+    inner_candidate_data: Callable
+    stores: dict[str, RawEmbeddingStore]
+    device: str
+    raw_text_dim: int
+    fusion_batch_size: int
+    tft_attention_heads: int
+    text_attention_heads: int
+    text_attention_layers: int
+    cross_stock_attention: bool
+    cross_stock_attention_heads: int
+    stock_groups: Callable
+    adapter_learning_rate_multiplier: float
+    early_stopping_min_epochs: int
+    early_stopping_patience: int
+    early_stopping_min_delta: float
+    model_fit_params: Callable
+    fixed_decision_threshold: float
+    calibrate_decision_threshold: bool
+    ensure_inner_split: Callable
+    output_dir: Path
+    tune_hyperparameters: bool
+    tuning_trials: int
+    default_params: dict
+    fusion_epochs: int
+    sampled_hyperparameters: Callable
+
+    def fit_inner_candidate(
+        self,
+        *,
+        scope_name: str,
+        base_arrays: tuple,
+        raw_covariates: np.ndarray,
+        raw_sequence: np.ndarray | None,
+        raw_padding: np.ndarray | None,
+        params: dict,
+        candidate_seed: int,
+        calibrate_threshold: bool | None = None,
+    ) -> tuple[
+        nn.Module,
+        list[dict[str, float]],
+        float,
+        float,
+        float,
+        dict,
+    ]:
+        """Evaluate one configuration on the purged inner split."""
+        if calibrate_threshold is None:
+            calibrate_threshold = self.calibrate_decision_threshold
+        lookback = (
+            int(params["temporal_lookback"])
+            if self.market_encoder == "tft" else None
+        )
+        (
+            inner_train,
+            inner_validation,
+            inner_train_cov,
+            inner_validation_cov,
+            train_sequence,
+            train_padding,
+            validation_sequence,
+            validation_padding,
+            _,
+            _,
+            manifest,
+        ) = self.inner_candidate_data(
+            scope_name,
+            base_arrays,
+            raw_covariates,
+            raw_sequence,
+            raw_padding,
+            lookback,
+        )
+        model, history = fit_raw_fusion_model(
+            inner_train.price,
+            inner_train_cov,
+            inner_train.text_indices,
+            self.stores,
+            inner_train.target,
+            self.device,
+            text_dim=self.raw_text_dim,
+            batch_size=self.fusion_batch_size,
+            seed=candidate_seed,
+            market_encoder=self.market_encoder,
+            market_sequence=train_sequence,
+            sequence_padding_mask=train_padding,
+            market_attention_heads=self.tft_attention_heads,
+            text_attention_heads=self.text_attention_heads,
+            text_attention_layers=self.text_attention_layers,
+            cross_stock_attention=self.cross_stock_attention,
+            cross_stock_attention_heads=self.cross_stock_attention_heads,
+            stock_group_ids=self.stock_groups(inner_train.index),
+            validation_price=inner_validation.price,
+            validation_covariates=inner_validation_cov,
+            validation_text_indices=inner_validation.text_indices,
+            validation_target=inner_validation.target,
+            validation_market_sequence=validation_sequence,
+            validation_sequence_padding_mask=validation_padding,
+            validation_stock_group_ids=self.stock_groups(
+                inner_validation.index
+            ),
+            adapter_learning_rate_multiplier=(
+                self.adapter_learning_rate_multiplier
+            ),
+            select_best_checkpoint=True,
+            early_stopping_min_epochs=self.early_stopping_min_epochs,
+            early_stopping_patience=self.early_stopping_patience,
+            early_stopping_min_delta=self.early_stopping_min_delta,
+            **self.model_fit_params(params),
+        )
+        selected_epoch = int(history[0]["best_epoch"])
+        selected_history_row = next(
+            row for row in history
+            if int(row["epoch"]) == selected_epoch
+        )
+        optuna_objective = -float(
+            selected_history_row["validation_bce"]
+        )
+        for row in history:
+            row["calibration_best_epoch"] = float(selected_epoch)
+            row["selected_epoch"] = float(selected_epoch)
+        threshold = float(self.fixed_decision_threshold)
+        inner_balanced_accuracy = float(
+            selected_history_row["validation_balanced_accuracy"]
+        )
+        if (
+            calibrate_threshold
+            or not np.isclose(self.fixed_decision_threshold, 0.5)
+        ):
+            score = predict_raw_fusion(
+                model,
+                inner_validation.price,
+                inner_validation_cov,
+                inner_validation.text_indices,
+                self.stores,
+                self.device,
+                market_encoder=self.market_encoder,
+                market_sequence=validation_sequence,
+                sequence_padding_mask=validation_padding,
+                cross_stock_attention=self.cross_stock_attention,
+                stock_group_ids=self.stock_groups(inner_validation.index),
+            )
+            validation_truth = inner_validation.target.astype(np.int8)
+            threshold = _select_decision_threshold(
+                validation_truth,
+                score,
+                calibrate=calibrate_threshold,
+                fixed_threshold=self.fixed_decision_threshold,
+            )
+            inner_balanced_accuracy = float(balanced_accuracy_score(
+                validation_truth,
+                (score >= threshold).astype(np.int8),
+            ))
+        manifest = {
+            **manifest,
+            "inner_best_epoch": selected_epoch,
+            "selected_epoch": selected_epoch,
+            "decision_threshold": float(threshold),
+            "inner_balanced_accuracy": inner_balanced_accuracy,
+            "threshold_calibrated": bool(calibrate_threshold),
+            "fixed_decision_threshold": float(self.fixed_decision_threshold),
+            "optuna_objective_name": (
+                "negative_validation_bce"
+            ),
+            "optuna_objective_value": optuna_objective,
+        }
+        return (
+            model,
+            history,
+            threshold,
+            inner_balanced_accuracy,
+            optuna_objective,
+            manifest,
+        )
+
+    def tune_inner_scope(
+        self,
+        *,
+        scope_name: str,
+        base_arrays: tuple,
+        raw_covariates: np.ndarray,
+        raw_sequence: np.ndarray | None,
+        raw_padding: np.ndarray | None,
+        study_name: str,
+        study_seed: int,
+    ) -> tuple[dict, float, pl.DataFrame, dict, pl.DataFrame]:
+        """Tune non-epoch parameters, then calibrate epoch and threshold."""
+        _, _, split_manifest = self.ensure_inner_split(scope_name, base_arrays)
+        history_dir = (
+            self.output_dir / "inner_selection_histories" / scope_name
+        )
+        history_dir.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame(
+            [split_manifest], infer_schema_length=None
+        ).write_csv(
+            history_dir / "inner_split.csv"
+        )
+        if self.tune_hyperparameters and self.tuning_trials > 0:
+            try:
+                import optuna
+            except ImportError as error:
+                raise ImportError(
+                    "Hyperparameter tuning requires optuna; "
+                    "install it or pass --no-tune"
+                ) from error
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+            study = optuna.create_study(
+                study_name=study_name,
+                storage=f"sqlite:///{(self.output_dir / 'optuna_study.db').resolve()}",
+                load_if_exists=True,
+                direction="maximize",
+                sampler=optuna.samplers.TPESampler(
+                    seed=study_seed, multivariate=True
+                ),
+            )
+
+            def objective(trial) -> float:
+                params = self.sampled_hyperparameters(trial)
+                (
+                    model,
+                    history,
+                    _,
+                    inner_balanced_accuracy,
+                    optuna_objective,
+                    _,
+                ) = self.fit_inner_candidate(
+                    scope_name=scope_name,
+                    base_arrays=base_arrays,
+                    raw_covariates=raw_covariates,
+                    raw_sequence=raw_sequence,
+                    raw_padding=raw_padding,
+                    params=params,
+                    # Use common random numbers so Optuna compares model
+                    # configurations rather than different initializations.
+                    candidate_seed=study_seed,
+                    calibrate_threshold=False,
+                )
+                best_epoch = int(history[0]["selected_epoch"])
+                best_history_row = next(
+                    row for row in history
+                    if int(row["epoch"]) == best_epoch
+                )
+                trial.set_user_attr(
+                    "trial_diagnostic_epoch", best_epoch
+                )
+                trial.set_user_attr(
+                    "trial_accuracy_at_0_5",
+                    float(best_history_row["validation_accuracy"]),
+                )
+                trial.set_user_attr(
+                    "trial_balanced_accuracy_at_0_5",
+                    float(best_history_row[
+                        "validation_balanced_accuracy"
+                    ]),
+                )
+                trial.set_user_attr(
+                    "trial_roc_auc",
+                    float(best_history_row["validation_roc_auc"]),
+                )
+                trial.set_user_attr(
+                    "trial_validation_bce",
+                    -float(optuna_objective),
+                )
+                pl.DataFrame(history).with_columns(
+                    pl.lit(scope_name).alias("scope"),
+                    pl.lit(trial.number).cast(pl.Int64).alias("trial"),
+                ).write_csv(
+                    history_dir / f"trial_{trial.number}.csv"
+                )
+                del model
+                gc.collect()
+                if self.device == "mps":
+                    torch.mps.empty_cache()
+                return optuna_objective
+
+            completed_before = sum(
+                trial.state == optuna.trial.TrialState.COMPLETE
+                for trial in study.trials
+            )
+            remaining_trials = max(
+                0, int(self.tuning_trials) - completed_before
+            )
+            if remaining_trials:
+                study.optimize(
+                    objective,
+                    n_trials=remaining_trials,
+                    gc_after_trial=True,
+                )
+            complete_trials = [
+                trial for trial in study.trials
+                if trial.state == optuna.trial.TrialState.COMPLETE
+            ]
+            if not complete_trials:
+                raise RuntimeError(
+                    f"Optuna study {study_name} has no completed valid trial"
+                )
+            best_trial = max(
+                complete_trials, key=lambda trial: float(trial.value)
+            )
+            winning_params = {
+                **self.default_params,
+                **best_trial.params,
+                # Epoch is deliberately not inherited from the Optuna trial.
+                "epochs": int(self.fusion_epochs),
+            }
+            (
+                calibration_model,
+                calibration_history,
+                threshold,
+                calibration_inner_balanced_accuracy,
+                _,
+                manifest,
+            ) = self.fit_inner_candidate(
+                scope_name=scope_name,
+                base_arrays=base_arrays,
+                raw_covariates=raw_covariates,
+                raw_sequence=raw_sequence,
+                raw_padding=raw_padding,
+                params=winning_params,
+                # Calibrate epoch/threshold with a fresh initialization after
+                # Optuna has finished selecting all other hyperparameters.
+                candidate_seed=study_seed + 5_000_000,
+            )
+            selected_epoch = int(
+                calibration_history[0]["selected_epoch"]
+            )
+            best_params = {
+                **winning_params,
+                "epochs": selected_epoch,
+            }
+            calibration_history_frame = pl.DataFrame(
+                calibration_history
+            ).with_columns(
+                pl.lit(scope_name).alias("scope"),
+                pl.lit(best_trial.number).cast(pl.Int64).alias(
+                    "optuna_best_trial"
+                ),
+                pl.lit("post_optuna_epoch_calibration").alias("phase"),
+            )
+            selected_history_path = (
+                history_dir / "post_optuna_epoch_calibration.csv"
+            )
+            calibration_history_frame.write_csv(selected_history_path)
+            del calibration_model
+            gc.collect()
+            if self.device == "mps":
+                torch.mps.empty_cache()
+            rows = []
+            for trial in study.trials:
+                diagnostics = {
+                    "trial_diagnostic_epoch": trial.user_attrs.get(
+                        "trial_diagnostic_epoch"
+                    ),
+                    "trial_validation_bce": trial.user_attrs.get(
+                        "trial_validation_bce"
+                    ),
+                    "trial_accuracy_at_0_5": trial.user_attrs.get(
+                        "trial_accuracy_at_0_5"
+                    ),
+                    "trial_balanced_accuracy_at_0_5": (
+                        trial.user_attrs.get(
+                            "trial_balanced_accuracy_at_0_5"
+                        )
+                    ),
+                    "trial_roc_auc": trial.user_attrs.get(
+                        "trial_roc_auc"
+                    ),
+                }
+                history_path = (
+                    history_dir / f"trial_{trial.number}.csv"
+                )
+                if (
+                    any(value is None for value in diagnostics.values())
+                    and history_path.exists()
+                ):
+                    trial_history = pl.read_csv(history_path)
+                    diagnostic_epoch = diagnostics[
+                        "trial_diagnostic_epoch"
+                    ]
+                    if diagnostic_epoch is None and (
+                        "best_epoch" in trial_history.columns
+                    ):
+                        diagnostic_epoch = int(
+                            trial_history["best_epoch"][0]
+                        )
+                    if diagnostic_epoch is not None:
+                        selected_rows = trial_history.filter(
+                            pl.col("epoch") == int(diagnostic_epoch)
+                        )
+                        if selected_rows.height == 1:
+                            selected_row = selected_rows.row(
+                                0, named=True
+                            )
+                            diagnostics.update({
+                                "trial_diagnostic_epoch": int(
+                                    diagnostic_epoch
+                                ),
+                                "trial_validation_bce": (
+                                    diagnostics["trial_validation_bce"]
+                                    if diagnostics["trial_validation_bce"]
+                                    is not None else
+                                    selected_row["validation_bce"]
+                                ),
+                                "trial_accuracy_at_0_5": (
+                                    diagnostics[
+                                        "trial_accuracy_at_0_5"
+                                    ]
+                                    if diagnostics[
+                                        "trial_accuracy_at_0_5"
+                                    ] is not None else
+                                    selected_row["validation_accuracy"]
+                                ),
+                                "trial_balanced_accuracy_at_0_5": (
+                                    diagnostics[
+                                        "trial_balanced_accuracy_at_0_5"
+                                    ]
+                                    if diagnostics[
+                                        "trial_balanced_accuracy_at_0_5"
+                                    ] is not None else
+                                    selected_row[
+                                        "validation_balanced_accuracy"
+                                    ]
+                                ),
+                                "trial_roc_auc": (
+                                    diagnostics["trial_roc_auc"]
+                                    if diagnostics["trial_roc_auc"]
+                                    is not None else
+                                    selected_row["validation_roc_auc"]
+                                ),
+                            })
+                rows.append({
+                    "scope": scope_name,
+                    "trial": trial.number,
+                    "state": trial.state.name,
+                    "optuna_objective": trial.value,
+                    "validation_bce": diagnostics[
+                        "trial_validation_bce"
+                    ],
+                    "trial_accuracy_at_0_5": diagnostics[
+                        "trial_accuracy_at_0_5"
+                    ],
+                    "trial_balanced_accuracy_at_0_5": diagnostics[
+                        "trial_balanced_accuracy_at_0_5"
+                    ],
+                    "trial_roc_auc": diagnostics["trial_roc_auc"],
+                    "trial_diagnostic_epoch": diagnostics[
+                        "trial_diagnostic_epoch"
+                    ],
+                    "params_json": json.dumps(
+                        trial.params, sort_keys=True
+                    ),
+                })
+            trials = pl.DataFrame(rows, infer_schema_length=None)
+            manifest = {
+                **manifest,
+                "optuna_best_trial": int(best_trial.number),
+                "optuna_best_objective": float(best_trial.value),
+                "optuna_best_validation_bce": float(
+                    -best_trial.value
+                ),
+                "calibration_inner_balanced_accuracy": float(
+                    calibration_inner_balanced_accuracy
+                ),
+                "epoch_selection": (
+                    "post_optuna_inner_validation"
+                ),
+            }
+            selected_trial_number = int(best_trial.number)
+        else:
+            (
+                model,
+                history,
+                threshold,
+                inner_balanced_accuracy,
+                optuna_objective,
+                manifest,
+            ) = self.fit_inner_candidate(
+                scope_name=scope_name,
+                base_arrays=base_arrays,
+                raw_covariates=raw_covariates,
+                raw_sequence=raw_sequence,
+                raw_padding=raw_padding,
+                params=self.default_params,
+                candidate_seed=study_seed,
+            )
+            best_params = {
+                **self.default_params,
+                "epochs": int(history[0]["selected_epoch"]),
+            }
+            pl.DataFrame(history).with_columns(
+                pl.lit(scope_name).alias("scope"),
+                pl.lit(0).cast(pl.Int64).alias("trial"),
+            ).write_csv(history_dir / "fixed_default.csv")
+            trials = pl.DataFrame([{
+                "scope": scope_name,
+                "trial": 0,
+                "state": "FIXED_DEFAULT",
+                "optuna_objective": optuna_objective,
+                "validation_bce": -optuna_objective,
+                "trial_accuracy_at_0_5": float(next(
+                    row["validation_accuracy"]
+                    for row in history
+                    if int(row["epoch"])
+                    == int(history[0]["selected_epoch"])
+                )),
+                "trial_balanced_accuracy_at_0_5": float(next(
+                    row["validation_balanced_accuracy"]
+                    for row in history
+                    if int(row["epoch"])
+                    == int(history[0]["selected_epoch"])
+                )),
+                "trial_roc_auc": float(next(
+                    row["validation_roc_auc"]
+                    for row in history
+                    if int(row["epoch"])
+                    == int(history[0]["selected_epoch"])
+                )),
+                "trial_diagnostic_epoch": int(
+                    history[0]["selected_epoch"]
+                ),
+                "params_json": json.dumps(self.default_params, sort_keys=True),
+            }], infer_schema_length=None)
+            del model
+            selected_trial_number = 0
+            selected_history_path = history_dir / "fixed_default.csv"
+            manifest = {
+                **manifest,
+                "epoch_selection": "fixed_configuration_inner_validation",
+            }
+        if selected_history_path.exists():
+            selected_history = pl.read_csv(selected_history_path)
+            selected_history.write_csv(
+                history_dir / "selected_learning_curves.csv"
+            )
+            _plot_inner_selection_diagnostics(
+                selected_history,
+                history_dir / "selected_learning_curves.png",
+            )
+        else:
+            raise RuntimeError(
+                f"Selected inner history is unavailable for {scope_name}: "
+                f"{selected_history_path}"
+            )
+        (history_dir / "selection.json").write_text(json.dumps({
+            "scope": scope_name,
+            "selected_trial": selected_trial_number,
+            "epoch_selection": manifest["epoch_selection"],
+            "hyperparameters": best_params,
+            "selected_epoch": int(best_params["epochs"]),
+            "decision_threshold": float(threshold),
+            "inner_split": {
+                key: (
+                    str(value)
+                    if key.endswith(("_end", "_start")) else value
+                )
+                for key, value in manifest.items()
+            },
+        }, indent=2, sort_keys=True))
+        return (
+            best_params,
+            threshold,
+            trials,
+            manifest,
+            selected_history,
+        )
 
 
 def run_walk_forward_fusion(
@@ -3688,7 +4601,6 @@ def run_walk_forward_fusion(
     variants = {family: (family,) for family in families}
     if len(families) > 1:
         variants["all_families"] = tuple(families)
-    tuning_variant = "all_families" if "all_families" in variants else families[0]
     fingerprint_feature_columns = list(dict.fromkeys([
         "row_id",
         "date",
@@ -3832,845 +4744,112 @@ def run_walk_forward_fusion(
     if market_encoder == "tft":
         default_params["temporal_lookback"] = int(temporal_lookback)
 
-    fold_array_cache: dict[int, tuple] = {}
     temporal_scaler_cache: dict[
         tuple[str, int], dict[str, np.ndarray]
     ] = {}
 
-    def model_fit_params(params: dict) -> dict:
-        """Remove preprocessing-only hyperparameters before model creation."""
-        return {
-            key: value for key, value in params.items()
-            if key != "temporal_lookback"
-        }
+    model_fit_params = _model_fit_params
+    stock_groups = partial(
+        _stock_groups,
+        cross_stock_attention=cross_stock_attention,
+    )
+    fusion_model_name = partial(
+        _fusion_model_name,
+        price_encoder=price_encoder,
+        market_encoder=market_encoder,
+        cross_stock_attention=cross_stock_attention,
+    )
+    fold_arrays = _FoldArrayStore(
+        scopes=fold_scopes,
+        price_latents=train_price_latents,
+        targets=train_targets,
+        links=train_links,
+        stores=stores,
+        families=families,
+        text_fields=text_fields,
+        features=train_features,
+        covariate_columns=covariate_columns,
+        market_encoder=market_encoder,
+        temporal_covariate_columns=temporal_covariate_columns,
+        max_temporal_lookback=max_temporal_lookback,
+    ).get
 
-    def stock_groups(index: pl.DataFrame) -> np.ndarray | None:
-        return _date_group_ids(index) if cross_stock_attention else None
-
-    def fusion_model_name(variant: str) -> str:
-        if cross_stock_attention:
-            prefix = (
-                f"{price_encoder}_tft_cross_stock_unified_raw_text_plus"
-            )
-        elif market_encoder == "tft":
-            prefix = f"{price_encoder}_tft_unified_raw_text_plus"
-        else:
-            prefix = f"{price_encoder}_covariates_unified_raw_text_plus"
-        return f"{prefix}_{variant}"
-
-    def select_families(
-        arrays: tuple, variant_families: Sequence[str]
-    ) -> tuple:
-        index, price, all_text_indices, placeholder, target = arrays
-        selected_indices = {
-            family: all_text_indices[family] for family in variant_families
-        }
-        return index, price, selected_indices, placeholder, target
-
-    def fold_arrays(fold: int, variant_families: Sequence[str]):
-        fold = int(fold)
-        if fold not in fold_array_cache:
-            print(f"Preparing and caching fold {fold} arrays")
-            scope = fold_scopes[fold]
-            train_arrays = _assemble_raw_fusion_arrays(
-                scope["train_ids"], train_price_latents, train_targets,
-                train_links, stores, families, text_fields,
-            )
-            val_arrays = _assemble_raw_fusion_arrays(
-                scope["validation_ids"], train_price_latents, train_targets,
-                train_links, stores, families, text_fields,
-            )
-            train_index, val_index = train_arrays[0], val_arrays[0]
-            train_raw = _covariate_matrix(
-                train_index, train_features, covariate_columns
-            )
-            val_raw = _covariate_matrix(
-                val_index, train_features, covariate_columns
-            )
-            scaler = _fit_covariate_scaler(train_raw)
-            train_sequence = train_padding = val_sequence = val_padding = None
-            temporal_scaler = None
-            if market_encoder == "tft":
-                train_sequence, train_padding = _temporal_covariate_matrix(
-                    train_index, train_features, temporal_covariate_columns,
-                    max_temporal_lookback,
-                )
-                val_sequence, val_padding = _temporal_covariate_matrix(
-                    val_index, train_features, temporal_covariate_columns,
-                    max_temporal_lookback,
-                )
-            fold_array_cache[fold] = (
-                train_arrays,
-                val_arrays,
-                train_raw,
-                val_raw,
-                scaler,
-                train_sequence,
-                train_padding,
-                val_sequence,
-                val_padding,
-                temporal_scaler,
-            )
-        (
-            train_arrays, val_arrays, train_raw, val_raw, scaler,
-            train_sequence, train_padding, val_sequence, val_padding,
-            temporal_scaler,
-        ) = fold_array_cache[fold]
-        return (
-            select_families(train_arrays, variant_families),
-            select_families(val_arrays, variant_families),
-            train_raw,
-            val_raw,
-            scaler,
-            train_sequence,
-            train_padding,
-            val_sequence,
-            val_padding,
-            temporal_scaler,
-        )
-
-    def scaled_temporal_view(
-        scaler_scope: str,
-        train_sequence: np.ndarray | None,
-        train_padding: np.ndarray | None,
-        val_sequence: np.ndarray | None,
-        val_padding: np.ndarray | None,
-        lookback: int,
-    ) -> tuple:
-        """Slice and fold-scale cached maximum-length TFT histories."""
-        if market_encoder != "tft":
-            return (
-                train_sequence, train_padding, val_sequence, val_padding, None
-            )
-        lookback = int(lookback)
-        if lookback not in lookback_candidates:
-            raise ValueError(f"Unsupported TFT lookback: {lookback}")
-        train_view = np.ascontiguousarray(
-            train_sequence[:, -lookback:, :]
-        )
-        train_mask = np.ascontiguousarray(
-            train_padding[:, -lookback:]
-        )
-        val_view = np.ascontiguousarray(
-            val_sequence[:, -lookback:, :]
-        )
-        val_mask = np.ascontiguousarray(
-            val_padding[:, -lookback:]
-        )
-        cache_key = (str(scaler_scope), lookback)
-        if cache_key not in temporal_scaler_cache:
-            temporal_scaler = _fit_temporal_scaler(train_view, train_mask)
-            temporal_scaler_cache[cache_key] = temporal_scaler
-        temporal_scaler = temporal_scaler_cache[cache_key]
-        train_view = _apply_temporal_scaler(
-            train_view, train_mask, temporal_scaler
-        )
-        val_view = _apply_temporal_scaler(
-            val_view, val_mask, temporal_scaler
-        )
-        return train_view, train_mask, val_view, val_mask, temporal_scaler
+    scaled_temporal_view = partial(
+        _scaled_temporal_view,
+        market_encoder=market_encoder,
+        lookback_candidates=lookback_candidates,
+        scaler_cache=temporal_scaler_cache,
+    )
 
     inner_split_cache: dict[
         str,
         tuple[np.ndarray, np.ndarray, dict],
     ] = {}
 
-    def ensure_inner_split(
-        scope_name: str,
-        base_arrays: tuple,
-    ) -> tuple[np.ndarray, np.ndarray, dict]:
-        if scope_name not in inner_split_cache:
-            inner_split_cache[scope_name] = _purged_inner_positions(
-                base_arrays[0],
-                purge_dates=forecast_horizon_weekdays,
-            )
-        return inner_split_cache[scope_name]
+    ensure_inner_split = partial(
+        _ensure_inner_split,
+        cache=inner_split_cache,
+        purge_dates=forecast_horizon_weekdays,
+    )
 
-    def inner_candidate_data(
-        scope_name: str,
-        base_arrays: tuple,
-        raw_covariates: np.ndarray,
-        raw_sequence: np.ndarray | None,
-        raw_padding: np.ndarray | None,
-        lookback: int | None,
-    ) -> tuple:
-        """Prepare the purged inner split using training-only scalers."""
-        (
-            train_positions,
-            validation_positions,
-            manifest,
-        ) = ensure_inner_split(
-            scope_name, base_arrays
-        )
-        inner_train = _slice_raw_fusion_arrays(
-            base_arrays, train_positions
-        )
-        inner_validation = _slice_raw_fusion_arrays(
-            base_arrays, validation_positions
-        )
-        covariate_scaler = _fit_covariate_scaler(
-            raw_covariates[train_positions]
-        )
-        inner_train_cov = _apply_covariate_scaler(
-            raw_covariates[train_positions], covariate_scaler
-        )
-        inner_validation_cov = _apply_covariate_scaler(
-            raw_covariates[validation_positions], covariate_scaler
-        )
-        train_sequence = train_padding = None
-        validation_sequence = validation_padding = None
-        temporal_scaler = None
-        if market_encoder == "tft":
-            (
-                train_sequence,
-                train_padding,
-                validation_sequence,
-                validation_padding,
-                temporal_scaler,
-            ) = scaled_temporal_view(
-                f"inner_{scope_name}",
-                raw_sequence[train_positions],
-                raw_padding[train_positions],
-                raw_sequence[validation_positions],
-                raw_padding[validation_positions],
-                int(lookback),
-            )
-        return (
-            inner_train,
-            inner_validation,
-            inner_train_cov,
-            inner_validation_cov,
-            train_sequence,
-            train_padding,
-            validation_sequence,
-            validation_padding,
-            covariate_scaler,
-            temporal_scaler,
-            manifest,
-        )
+    inner_candidate_data = partial(
+        _prepare_inner_candidate_data,
+        market_encoder=market_encoder,
+        ensure_inner_split=ensure_inner_split,
+        scaled_temporal_view=scaled_temporal_view,
+    )
 
-    def sampled_hyperparameters(trial) -> dict:
-        params = {
-            "hidden_dim": trial.suggest_categorical(
-                "hidden_dim", list(hidden_dim_candidates)
-            ),
-            "fusion_depth": trial.suggest_categorical(
-                "fusion_depth", list(OPTUNA_FUSION_DEPTH_CANDIDATES)
-            ),
-            "expansion": trial.suggest_categorical(
-                "expansion", list(OPTUNA_EXPANSION_CANDIDATES)
-            ),
-            "dropout": trial.suggest_categorical(
-                "dropout", list(OPTUNA_DROPOUT_CANDIDATES)
-            ),
-            "epochs": int(fusion_epochs),
-            "learning_rate": trial.suggest_float(
-                "learning_rate",
-                OPTUNA_LEARNING_RATE_MIN,
-                OPTUNA_LEARNING_RATE_MAX,
-                log=True,
-            ),
-            "weight_decay": trial.suggest_float(
-                "weight_decay",
-                OPTUNA_WEIGHT_DECAY_MIN,
-                OPTUNA_WEIGHT_DECAY_MAX,
-                log=True,
-            ),
-            "market_depth": (
-                trial.suggest_categorical(
-                    "market_depth",
-                    list(OPTUNA_MARKET_DEPTH_CANDIDATES),
-                )
-                if market_encoder == "mlp" else 0
-            ),
-        }
-        if market_encoder == "tft":
-            params["temporal_lookback"] = trial.suggest_categorical(
-                "temporal_lookback", list(lookback_candidates)
-            )
-        return params
+    sampled_hyperparameters = partial(
+        _sample_fusion_hyperparameters,
+        hidden_dim_candidates=hidden_dim_candidates,
+        lookback_candidates=lookback_candidates,
+        market_encoder=market_encoder,
+        fusion_epochs=fusion_epochs,
+    )
 
-    def fit_inner_candidate(
-        *,
-        scope_name: str,
-        base_arrays: tuple,
-        raw_covariates: np.ndarray,
-        raw_sequence: np.ndarray | None,
-        raw_padding: np.ndarray | None,
-        params: dict,
-        candidate_seed: int,
-        calibrate_threshold: bool = calibrate_decision_threshold,
-    ) -> tuple[
-        nn.Module,
-        list[dict[str, float]],
-        float,
-        float,
-        float,
-        dict,
-    ]:
-        """Evaluate one configuration on the purged inner split."""
-        lookback = (
-            int(params["temporal_lookback"])
-            if market_encoder == "tft" else None
-        )
-        (
-            inner_train,
-            inner_validation,
-            inner_train_cov,
-            inner_validation_cov,
-            train_sequence,
-            train_padding,
-            validation_sequence,
-            validation_padding,
-            _,
-            _,
-            manifest,
-        ) = inner_candidate_data(
-            scope_name,
-            base_arrays,
-            raw_covariates,
-            raw_sequence,
-            raw_padding,
-            lookback,
-        )
-        model, history = fit_raw_fusion_model(
-            inner_train[1],
-            inner_train_cov,
-            inner_train[2],
-            stores,
-            inner_train[4],
-            device,
-            text_dim=raw_text_dim,
-            batch_size=fusion_batch_size,
-            seed=candidate_seed,
-            market_encoder=market_encoder,
-            market_sequence=train_sequence,
-            sequence_padding_mask=train_padding,
-            market_attention_heads=tft_attention_heads,
-            text_attention_heads=text_attention_heads,
-            text_attention_layers=text_attention_layers,
-            cross_stock_attention=cross_stock_attention,
-            cross_stock_attention_heads=cross_stock_attention_heads,
-            stock_group_ids=stock_groups(inner_train[0]),
-            validation_price=inner_validation[1],
-            validation_covariates=inner_validation_cov,
-            validation_text_indices=inner_validation[2],
-            validation_target=inner_validation[4],
-            validation_market_sequence=validation_sequence,
-            validation_sequence_padding_mask=validation_padding,
-            validation_stock_group_ids=stock_groups(
-                inner_validation[0]
-            ),
-            adapter_learning_rate_multiplier=(
-                adapter_learning_rate_multiplier
-            ),
-            select_best_checkpoint=True,
-            early_stopping_min_epochs=early_stopping_min_epochs,
-            early_stopping_patience=early_stopping_patience,
-            early_stopping_min_delta=early_stopping_min_delta,
-            **model_fit_params(params),
-        )
-        selected_epoch = int(history[0]["best_epoch"])
-        selected_history_row = next(
-            row for row in history
-            if int(row["epoch"]) == selected_epoch
-        )
-        optuna_objective = -float(
-            selected_history_row["validation_bce"]
-        )
-        for row in history:
-            row["calibration_best_epoch"] = float(selected_epoch)
-            row["selected_epoch"] = float(selected_epoch)
-        threshold = float(fixed_decision_threshold)
-        inner_balanced_accuracy = float(
-            selected_history_row["validation_balanced_accuracy"]
-        )
-        if (
-            calibrate_threshold
-            or not np.isclose(fixed_decision_threshold, 0.5)
-        ):
-            score = predict_raw_fusion(
-                model,
-                inner_validation[1],
-                inner_validation_cov,
-                inner_validation[2],
-                stores,
-                device,
-                market_encoder=market_encoder,
-                market_sequence=validation_sequence,
-                sequence_padding_mask=validation_padding,
-                cross_stock_attention=cross_stock_attention,
-                stock_group_ids=stock_groups(inner_validation[0]),
-            )
-            validation_truth = inner_validation[4].astype(np.int8)
-            threshold = _select_decision_threshold(
-                validation_truth,
-                score,
-                calibrate=calibrate_threshold,
-                fixed_threshold=fixed_decision_threshold,
-            )
-            inner_balanced_accuracy = float(balanced_accuracy_score(
-                validation_truth,
-                (score >= threshold).astype(np.int8),
-            ))
-        manifest = {
-            **manifest,
-            "inner_best_epoch": selected_epoch,
-            "selected_epoch": selected_epoch,
-            "decision_threshold": float(threshold),
-            "inner_balanced_accuracy": inner_balanced_accuracy,
-            "threshold_calibrated": bool(calibrate_threshold),
-            "fixed_decision_threshold": float(fixed_decision_threshold),
-            "optuna_objective_name": (
-                "negative_validation_bce"
-            ),
-            "optuna_objective_value": optuna_objective,
-        }
-        return (
-            model,
-            history,
-            threshold,
-            inner_balanced_accuracy,
-            optuna_objective,
-            manifest,
-        )
+    selection_engine = _InnerSelectionEngine(
+        market_encoder=market_encoder,
+        inner_candidate_data=inner_candidate_data,
+        stores=stores,
+        device=device,
+        raw_text_dim=raw_text_dim,
+        fusion_batch_size=fusion_batch_size,
+        tft_attention_heads=tft_attention_heads,
+        text_attention_heads=text_attention_heads,
+        text_attention_layers=text_attention_layers,
+        cross_stock_attention=cross_stock_attention,
+        cross_stock_attention_heads=cross_stock_attention_heads,
+        stock_groups=stock_groups,
+        adapter_learning_rate_multiplier=adapter_learning_rate_multiplier,
+        early_stopping_min_epochs=early_stopping_min_epochs,
+        early_stopping_patience=early_stopping_patience,
+        early_stopping_min_delta=early_stopping_min_delta,
+        model_fit_params=model_fit_params,
+        fixed_decision_threshold=fixed_decision_threshold,
+        calibrate_decision_threshold=calibrate_decision_threshold,
+        ensure_inner_split=ensure_inner_split,
+        output_dir=output_dir,
+        tune_hyperparameters=tune_hyperparameters,
+        tuning_trials=tuning_trials,
+        default_params=default_params,
+        fusion_epochs=fusion_epochs,
+        sampled_hyperparameters=sampled_hyperparameters,
+    )
 
-    def tune_inner_scope(
-        *,
-        scope_name: str,
-        base_arrays: tuple,
-        raw_covariates: np.ndarray,
-        raw_sequence: np.ndarray | None,
-        raw_padding: np.ndarray | None,
-        study_name: str,
-        study_seed: int,
-    ) -> tuple[dict, float, pl.DataFrame, dict, pl.DataFrame]:
-        """Tune non-epoch parameters, then calibrate epoch and threshold."""
-        _, _, split_manifest = ensure_inner_split(scope_name, base_arrays)
-        history_dir = (
-            output_dir / "inner_selection_histories" / scope_name
-        )
-        history_dir.mkdir(parents=True, exist_ok=True)
-        pl.DataFrame(
-            [split_manifest], infer_schema_length=None
-        ).write_csv(
-            history_dir / "inner_split.csv"
-        )
-        if tune_hyperparameters and tuning_trials > 0:
-            try:
-                import optuna
-            except ImportError as error:
-                raise ImportError(
-                    "Hyperparameter tuning requires optuna; "
-                    "install it or pass --no-tune"
-                ) from error
-            optuna.logging.set_verbosity(optuna.logging.WARNING)
-            study = optuna.create_study(
-                study_name=study_name,
-                storage=f"sqlite:///{(output_dir / 'optuna_study.db').resolve()}",
-                load_if_exists=True,
-                direction="maximize",
-                sampler=optuna.samplers.TPESampler(
-                    seed=study_seed, multivariate=True
-                ),
-            )
-
-            def objective(trial) -> float:
-                params = sampled_hyperparameters(trial)
-                (
-                    model,
-                    history,
-                    _,
-                    inner_balanced_accuracy,
-                    optuna_objective,
-                    _,
-                ) = fit_inner_candidate(
-                    scope_name=scope_name,
-                    base_arrays=base_arrays,
-                    raw_covariates=raw_covariates,
-                    raw_sequence=raw_sequence,
-                    raw_padding=raw_padding,
-                    params=params,
-                    # Use common random numbers so Optuna compares model
-                    # configurations rather than different initializations.
-                    candidate_seed=study_seed,
-                    calibrate_threshold=False,
-                )
-                best_epoch = int(history[0]["selected_epoch"])
-                best_history_row = next(
-                    row for row in history
-                    if int(row["epoch"]) == best_epoch
-                )
-                trial.set_user_attr(
-                    "trial_diagnostic_epoch", best_epoch
-                )
-                trial.set_user_attr(
-                    "trial_accuracy_at_0_5",
-                    float(best_history_row["validation_accuracy"]),
-                )
-                trial.set_user_attr(
-                    "trial_balanced_accuracy_at_0_5",
-                    float(best_history_row[
-                        "validation_balanced_accuracy"
-                    ]),
-                )
-                trial.set_user_attr(
-                    "trial_roc_auc",
-                    float(best_history_row["validation_roc_auc"]),
-                )
-                trial.set_user_attr(
-                    "trial_validation_bce",
-                    -float(optuna_objective),
-                )
-                pl.DataFrame(history).with_columns(
-                    pl.lit(scope_name).alias("scope"),
-                    pl.lit(trial.number).cast(pl.Int64).alias("trial"),
-                ).write_csv(
-                    history_dir / f"trial_{trial.number}.csv"
-                )
-                del model
-                gc.collect()
-                if device == "mps":
-                    torch.mps.empty_cache()
-                return optuna_objective
-
-            completed_before = sum(
-                trial.state == optuna.trial.TrialState.COMPLETE
-                for trial in study.trials
-            )
-            remaining_trials = max(
-                0, int(tuning_trials) - completed_before
-            )
-            if remaining_trials:
-                study.optimize(
-                    objective,
-                    n_trials=remaining_trials,
-                    gc_after_trial=True,
-                )
-            complete_trials = [
-                trial for trial in study.trials
-                if trial.state == optuna.trial.TrialState.COMPLETE
-            ]
-            if not complete_trials:
-                raise RuntimeError(
-                    f"Optuna study {study_name} has no completed valid trial"
-                )
-            best_trial = max(
-                complete_trials, key=lambda trial: float(trial.value)
-            )
-            winning_params = {
-                **default_params,
-                **best_trial.params,
-                # Epoch is deliberately not inherited from the Optuna trial.
-                "epochs": int(fusion_epochs),
-            }
-            (
-                calibration_model,
-                calibration_history,
-                threshold,
-                calibration_inner_balanced_accuracy,
-                _,
-                manifest,
-            ) = fit_inner_candidate(
-                scope_name=scope_name,
-                base_arrays=base_arrays,
-                raw_covariates=raw_covariates,
-                raw_sequence=raw_sequence,
-                raw_padding=raw_padding,
-                params=winning_params,
-                # Calibrate epoch/threshold with a fresh initialization after
-                # Optuna has finished selecting all other hyperparameters.
-                candidate_seed=study_seed + 5_000_000,
-            )
-            selected_epoch = int(
-                calibration_history[0]["selected_epoch"]
-            )
-            best_params = {
-                **winning_params,
-                "epochs": selected_epoch,
-            }
-            calibration_history_frame = pl.DataFrame(
-                calibration_history
-            ).with_columns(
-                pl.lit(scope_name).alias("scope"),
-                pl.lit(best_trial.number).cast(pl.Int64).alias(
-                    "optuna_best_trial"
-                ),
-                pl.lit("post_optuna_epoch_calibration").alias("phase"),
-            )
-            selected_history_path = (
-                history_dir / "post_optuna_epoch_calibration.csv"
-            )
-            calibration_history_frame.write_csv(selected_history_path)
-            del calibration_model
-            gc.collect()
-            if device == "mps":
-                torch.mps.empty_cache()
-            rows = []
-            for trial in study.trials:
-                diagnostics = {
-                    "trial_diagnostic_epoch": trial.user_attrs.get(
-                        "trial_diagnostic_epoch"
-                    ),
-                    "trial_validation_bce": trial.user_attrs.get(
-                        "trial_validation_bce"
-                    ),
-                    "trial_accuracy_at_0_5": trial.user_attrs.get(
-                        "trial_accuracy_at_0_5"
-                    ),
-                    "trial_balanced_accuracy_at_0_5": (
-                        trial.user_attrs.get(
-                            "trial_balanced_accuracy_at_0_5"
-                        )
-                    ),
-                    "trial_roc_auc": trial.user_attrs.get(
-                        "trial_roc_auc"
-                    ),
-                }
-                history_path = (
-                    history_dir / f"trial_{trial.number}.csv"
-                )
-                if (
-                    any(value is None for value in diagnostics.values())
-                    and history_path.exists()
-                ):
-                    trial_history = pl.read_csv(history_path)
-                    diagnostic_epoch = diagnostics[
-                        "trial_diagnostic_epoch"
-                    ]
-                    if diagnostic_epoch is None and (
-                        "best_epoch" in trial_history.columns
-                    ):
-                        diagnostic_epoch = int(
-                            trial_history["best_epoch"][0]
-                        )
-                    if diagnostic_epoch is not None:
-                        selected_rows = trial_history.filter(
-                            pl.col("epoch") == int(diagnostic_epoch)
-                        )
-                        if selected_rows.height == 1:
-                            selected_row = selected_rows.row(
-                                0, named=True
-                            )
-                            diagnostics.update({
-                                "trial_diagnostic_epoch": int(
-                                    diagnostic_epoch
-                                ),
-                                "trial_validation_bce": (
-                                    diagnostics["trial_validation_bce"]
-                                    if diagnostics["trial_validation_bce"]
-                                    is not None else
-                                    selected_row["validation_bce"]
-                                ),
-                                "trial_accuracy_at_0_5": (
-                                    diagnostics[
-                                        "trial_accuracy_at_0_5"
-                                    ]
-                                    if diagnostics[
-                                        "trial_accuracy_at_0_5"
-                                    ] is not None else
-                                    selected_row["validation_accuracy"]
-                                ),
-                                "trial_balanced_accuracy_at_0_5": (
-                                    diagnostics[
-                                        "trial_balanced_accuracy_at_0_5"
-                                    ]
-                                    if diagnostics[
-                                        "trial_balanced_accuracy_at_0_5"
-                                    ] is not None else
-                                    selected_row[
-                                        "validation_balanced_accuracy"
-                                    ]
-                                ),
-                                "trial_roc_auc": (
-                                    diagnostics["trial_roc_auc"]
-                                    if diagnostics["trial_roc_auc"]
-                                    is not None else
-                                    selected_row["validation_roc_auc"]
-                                ),
-                            })
-                rows.append({
-                    "scope": scope_name,
-                    "trial": trial.number,
-                    "state": trial.state.name,
-                    "optuna_objective": trial.value,
-                    "validation_bce": diagnostics[
-                        "trial_validation_bce"
-                    ],
-                    "trial_accuracy_at_0_5": diagnostics[
-                        "trial_accuracy_at_0_5"
-                    ],
-                    "trial_balanced_accuracy_at_0_5": diagnostics[
-                        "trial_balanced_accuracy_at_0_5"
-                    ],
-                    "trial_roc_auc": diagnostics["trial_roc_auc"],
-                    "trial_diagnostic_epoch": diagnostics[
-                        "trial_diagnostic_epoch"
-                    ],
-                    "params_json": json.dumps(
-                        trial.params, sort_keys=True
-                    ),
-                })
-            trials = pl.DataFrame(rows, infer_schema_length=None)
-            manifest = {
-                **manifest,
-                "optuna_best_trial": int(best_trial.number),
-                "optuna_best_objective": float(best_trial.value),
-                "optuna_best_validation_bce": float(
-                    -best_trial.value
-                ),
-                "calibration_inner_balanced_accuracy": float(
-                    calibration_inner_balanced_accuracy
-                ),
-                "epoch_selection": (
-                    "post_optuna_inner_validation"
-                ),
-            }
-            selected_trial_number = int(best_trial.number)
-        else:
-            (
-                model,
-                history,
-                threshold,
-                inner_balanced_accuracy,
-                optuna_objective,
-                manifest,
-            ) = fit_inner_candidate(
-                scope_name=scope_name,
-                base_arrays=base_arrays,
-                raw_covariates=raw_covariates,
-                raw_sequence=raw_sequence,
-                raw_padding=raw_padding,
-                params=default_params,
-                candidate_seed=study_seed,
-            )
-            best_params = {
-                **default_params,
-                "epochs": int(history[0]["selected_epoch"]),
-            }
-            pl.DataFrame(history).with_columns(
-                pl.lit(scope_name).alias("scope"),
-                pl.lit(0).cast(pl.Int64).alias("trial"),
-            ).write_csv(history_dir / "fixed_default.csv")
-            trials = pl.DataFrame([{
-                "scope": scope_name,
-                "trial": 0,
-                "state": "FIXED_DEFAULT",
-                "optuna_objective": optuna_objective,
-                "validation_bce": -optuna_objective,
-                "trial_accuracy_at_0_5": float(next(
-                    row["validation_accuracy"]
-                    for row in history
-                    if int(row["epoch"])
-                    == int(history[0]["selected_epoch"])
-                )),
-                "trial_balanced_accuracy_at_0_5": float(next(
-                    row["validation_balanced_accuracy"]
-                    for row in history
-                    if int(row["epoch"])
-                    == int(history[0]["selected_epoch"])
-                )),
-                "trial_roc_auc": float(next(
-                    row["validation_roc_auc"]
-                    for row in history
-                    if int(row["epoch"])
-                    == int(history[0]["selected_epoch"])
-                )),
-                "trial_diagnostic_epoch": int(
-                    history[0]["selected_epoch"]
-                ),
-                "params_json": json.dumps(default_params, sort_keys=True),
-            }], infer_schema_length=None)
-            del model
-            selected_trial_number = 0
-            selected_history_path = history_dir / "fixed_default.csv"
-            manifest = {
-                **manifest,
-                "epoch_selection": "fixed_configuration_inner_validation",
-            }
-        if selected_history_path.exists():
-            selected_history = pl.read_csv(selected_history_path)
-            selected_history.write_csv(
-                history_dir / "selected_learning_curves.csv"
-            )
-            _plot_inner_selection_diagnostics(
-                selected_history,
-                history_dir / "selected_learning_curves.png",
-            )
-        else:
-            raise RuntimeError(
-                f"Selected inner history is unavailable for {scope_name}: "
-                f"{selected_history_path}"
-            )
-        (history_dir / "selection.json").write_text(json.dumps({
-            "scope": scope_name,
-            "selected_trial": selected_trial_number,
-            "epoch_selection": manifest["epoch_selection"],
-            "hyperparameters": best_params,
-            "selected_epoch": int(best_params["epochs"]),
-            "decision_threshold": float(threshold),
-            "inner_split": {
-                key: (
-                    str(value)
-                    if key.endswith(("_end", "_start")) else value
-                )
-                for key, value in manifest.items()
-            },
-        }, indent=2, sort_keys=True))
-        return (
-            best_params,
-            threshold,
-            trials,
-            manifest,
-            selected_history,
-        )
 
     # True nested selection: each outer fold owns an inner purged split.
     tuning_trial_parts: list[pl.DataFrame] = []
     nested_selection_rows: list[dict] = []
-    outer_best_params: dict[int, dict] = {}
+    outer_best_params: dict[int, dict[str, dict]] = {}
     prediction_parts = []
     diagnostic_histories: dict[str, list[pl.DataFrame]] = {}
     for fold in fold_numbers:
         fold = int(fold)
-        (
-            tuning_train,
-            _,
-            tuning_train_raw,
-            _,
-            _,
-            tuning_train_sequence,
-            tuning_train_padding,
-            _,
-            _,
-            _,
-        ) = fold_arrays(fold, variants[tuning_variant])
-        (
-            fold_params,
-            tuning_threshold,
-            trials,
-            split_manifest,
-            _,
-        ) = tune_inner_scope(
-            scope_name=f"outer_fold_{fold}",
-            base_arrays=tuning_train,
-            raw_covariates=tuning_train_raw,
-            raw_sequence=tuning_train_sequence,
-            raw_padding=tuning_train_padding,
-            study_name=(
-                f"{price_encoder}_{market_encoder}_nested_outer_fold_{fold}_"
-                f"{study_signature}_v{SELECTION_PROTOCOL_VERSION}"
-            ),
-            study_seed=seed + 10_000 * fold,
-        )
-        outer_best_params[fold] = fold_params
-        tuning_trial_parts.append(
-            trials.with_columns(
-                pl.lit(fold).cast(pl.Int8).alias("outer_fold")
-            )
-        )
-
-        for variant, variant_families in variants.items():
+        outer_best_params[fold] = {}
+        for variant_index, (
+            variant,
+            variant_families,
+        ) in enumerate(variants.items()):
             (
                 train_a,
                 val_a,
@@ -4683,45 +4862,35 @@ def run_walk_forward_fusion(
                 val_padding,
                 _,
             ) = fold_arrays(fold, variant_families)
-            variant_params = dict(fold_params)
-            threshold = float(tuning_threshold)
-            selection_manifest = split_manifest
-
-            # Non-tuning text variants share the selected architecture but get
-            # their own inner-selected epoch and probability threshold.
-            if variant != tuning_variant:
-                variant_selection_params = {
-                    **variant_params,
-                    "epochs": int(fusion_epochs),
-                }
-                (
-                    inner_model,
-                    inner_history,
-                    threshold,
-                    _,
-                    _,
-                    selection_manifest,
-                ) = fit_inner_candidate(
-                    scope_name=f"outer_fold_{fold}",
-                    base_arrays=train_a,
-                    raw_covariates=train_raw,
-                    raw_sequence=train_sequence,
-                    raw_padding=train_padding,
-                    params=variant_selection_params,
-                    candidate_seed=seed + 20_000 * fold,
-                )
-                variant_params["epochs"] = int(
-                    inner_history[0]["selected_epoch"]
-                )
-                pl.DataFrame(inner_history).with_columns(
-                    pl.lit(f"outer_fold_{fold}").alias("scope"),
+            selection_scope = f"outer_fold_{fold}_variant_{variant}"
+            (
+                variant_params,
+                threshold,
+                trials,
+                selection_manifest,
+                _,
+            ) = selection_engine.tune_inner_scope(
+                scope_name=selection_scope,
+                base_arrays=train_a,
+                raw_covariates=train_raw,
+                raw_sequence=train_sequence,
+                raw_padding=train_padding,
+                study_name=(
+                    f"{price_encoder}_{market_encoder}_nested_outer_fold_"
+                    f"{fold}_{variant}_{study_signature}_"
+                    f"v{SELECTION_PROTOCOL_VERSION}"
+                ),
+                study_seed=(
+                    seed + 10_000 * fold + 1_000 * variant_index
+                ),
+            )
+            outer_best_params[fold][variant] = variant_params
+            tuning_trial_parts.append(
+                trials.with_columns(
+                    pl.lit(fold).cast(pl.Int8).alias("outer_fold"),
                     pl.lit(variant).alias("variant"),
-                ).write_csv(
-                    output_dir / "inner_selection_histories" /
-                    f"outer_fold_{fold}" /
-                    f"variant_{variant}_selection.csv"
                 )
-                del inner_model
+            )
 
             scaler = _fit_covariate_scaler(train_raw)
             train_cov = _apply_covariate_scaler(train_raw, scaler)
@@ -4754,11 +4923,11 @@ def run_walk_forward_fusion(
                 f"{model_name}.pt"
             )
             model, history = fit_raw_fusion_model(
-                train_a[1],
+                train_a.price,
                 train_cov,
-                train_a[2],
+                train_a.text_indices,
                 stores,
-                train_a[4],
+                train_a.target,
                 device,
                 text_dim=raw_text_dim,
                 batch_size=fusion_batch_size,
@@ -4771,14 +4940,15 @@ def run_walk_forward_fusion(
                 text_attention_layers=text_attention_layers,
                 cross_stock_attention=cross_stock_attention,
                 cross_stock_attention_heads=cross_stock_attention_heads,
-                stock_group_ids=stock_groups(train_a[0]),
-                validation_price=val_a[1],
+                stock_group_ids=stock_groups(train_a.index),
+                validation_price=val_a.price,
                 validation_covariates=val_cov,
-                validation_text_indices=val_a[2],
-                validation_target=val_a[4],
+                validation_text_indices=val_a.text_indices,
+                validation_target=val_a.target,
                 validation_market_sequence=val_sequence,
                 validation_sequence_padding_mask=val_padding,
-                validation_stock_group_ids=stock_groups(val_a[0]),
+                validation_stock_group_ids=stock_groups(val_a.index),
+                validation_decision_threshold=threshold,
                 adapter_learning_rate_multiplier=(
                     adapter_learning_rate_multiplier
                 ),
@@ -4848,20 +5018,21 @@ def run_walk_forward_fusion(
             )
             score = predict_raw_fusion(
                 model,
-                val_a[1],
+                val_a.price,
                 val_cov,
-                val_a[2],
+                val_a.text_indices,
                 stores,
                 device,
                 market_encoder=market_encoder,
                 market_sequence=val_sequence,
                 sequence_padding_mask=val_padding,
                 cross_stock_attention=cross_stock_attention,
-                stock_group_ids=stock_groups(val_a[0]),
+                stock_group_ids=stock_groups(val_a.index),
             )
-            prediction_parts.append(val_a[0].with_columns(
+            prediction_parts.append(val_a.index.with_columns(
                 pl.lit(feature_set).alias("feature_set"),
                 pl.lit(model_name).alias("model"),
+                pl.lit(variant).alias("variant"),
                 pl.lit(config_id).alias("config_id"),
                 pl.lit(fold).cast(pl.Int8).alias("fold"),
                 pl.col("target_up").cast(pl.Int8).alias("y_true"),
@@ -4901,7 +5072,7 @@ def run_walk_forward_fusion(
     if tuning_trial_parts:
         tuning_trials_table = pl.concat(
             tuning_trial_parts, how="diagonal_relaxed"
-        ).sort(["outer_fold", "trial"])
+        ).sort(["outer_fold", "variant", "trial"])
     else:
         tuning_trials_table = pl.DataFrame(schema={
             "scope": pl.String,
@@ -4915,6 +5086,7 @@ def run_walk_forward_fusion(
             "trial_diagnostic_epoch": pl.Int64,
             "params_json": pl.String,
             "outer_fold": pl.Int8,
+            "variant": pl.String,
         })
     tuning_trials_table.write_csv(
         output_dir / "nested_optuna_trials.csv"
@@ -4958,6 +5130,7 @@ def run_walk_forward_fusion(
             "ticker": pl.String,
             "feature_set": pl.String,
             "model": pl.String,
+            "variant": pl.String,
             "config_id": pl.String,
             "fold": pl.Int8,
             "y_true": pl.Int8,
@@ -4974,8 +5147,9 @@ def run_walk_forward_fusion(
             .cast(pl.Int8).alias("y_pred")
         )
         .select([
-            "feature_set", "model", "config_id", "fold", "row_id", "date",
-            "ticker", "y_true", "y_score", "y_pred", "decision_threshold",
+            "feature_set", "model", "variant", "config_id", "fold",
+            "row_id", "date", "ticker", "y_true", "y_score", "y_pred",
+            "decision_threshold",
         ])
         .sort(["model", "fold", "date", "ticker"])
     )
@@ -4983,8 +5157,8 @@ def run_walk_forward_fusion(
     for partition in oof_predictions.partition_by(["model", "fold"], as_dict=False):
         first = partition.row(0, named=True)
         train_rows = fold_arrays(
-            int(first["fold"]), variants[tuning_variant]
-        )[0][0].height
+            int(first["fold"]), variants[first["variant"]]
+        )[0].index.height
         metric_rows.append(_metric_row(
             feature_set, first["model"], first["config_id"],
             json.dumps({"selection": "nested_inner_validation"}),
@@ -5040,90 +5214,19 @@ def run_walk_forward_fusion(
     all_train_ids = final_targets.select("row_id")
     all_test_ids = scoped_test_price.select("row_id")
 
-    # Repeat inner-only selection on the complete labeled training set. The
-    # selected epoch is then used for a fresh refit that includes every row.
-    final_tuning_arrays = _assemble_raw_fusion_arrays(
-        all_train_ids,
-        train_price_latents,
-        train_targets,
-        train_links,
-        stores,
-        variants[tuning_variant],
-        text_fields,
-    )
-    final_tuning_raw = _covariate_matrix(
-        final_tuning_arrays[0], train_features, covariate_columns
-    )
-    final_tuning_sequence = final_tuning_padding = None
-    if market_encoder == "tft":
-        (
-            final_tuning_sequence,
-            final_tuning_padding,
-        ) = _temporal_covariate_matrix(
-            final_tuning_arrays[0],
-            train_features,
-            temporal_covariate_columns,
-            max_temporal_lookback,
-        )
-    (
-        final_best_params,
-        final_tuning_threshold,
-        final_trials,
-        final_split_manifest,
-        final_tuning_selection_history,
-    ) = tune_inner_scope(
-        scope_name="final_full_training",
-        base_arrays=final_tuning_arrays,
-        raw_covariates=final_tuning_raw,
-        raw_sequence=final_tuning_sequence,
-        raw_padding=final_tuning_padding,
-        study_name=(
-            f"{price_encoder}_{market_encoder}_nested_final_"
-            f"{study_signature}_v{SELECTION_PROTOCOL_VERSION}"
-        ),
-        study_seed=seed + 900_000,
-    )
-    final_trials = final_trials.with_columns(
-        pl.lit(None).cast(pl.Int8).alias("outer_fold")
-    )
-    tuning_trials_table = pl.concat(
-        [tuning_trials_table, final_trials],
-        how="diagonal_relaxed",
-    )
-    tuning_trials_table.write_csv(
-        output_dir / "nested_optuna_trials.csv"
-    )
-    (output_dir / "best_hyperparameters.json").write_text(json.dumps({
-        "selection": "nested_inner_validation",
-        "epoch_selection": final_split_manifest["epoch_selection"],
-        "optuna_study_signature": study_signature,
-        "cross_stock_attention": bool(cross_stock_attention),
-        "cross_stock_attention_heads": (
-            cross_stock_attention_heads
-            if cross_stock_attention else None
-        ),
-        "training_mode": (
-            "nested-folds" if run_outer_folds else "full-only"
-        ),
-        "outer_fold_hyperparameters": {
-            str(fold): params
-            for fold, params in outer_best_params.items()
-        },
-        "final_hyperparameters": final_best_params,
-        "final_decision_threshold": final_tuning_threshold,
-        "threshold_calibrated": bool(calibrate_decision_threshold),
-        "fixed_decision_threshold": float(fixed_decision_threshold),
-        "final_inner_split": {
-            key: str(value) if key.endswith(("_end", "_start")) else value
-            for key, value in final_split_manifest.items()
-        },
-        "test_data_used_for_selection": False,
-    }, indent=2, sort_keys=True))
-
+    # Each text-family variant performs its own inner-only selection before
+    # its fresh all-row refit. No hyperparameters cross between variants.
     final_prediction_parts = []
     final_thresholds: dict[str, float] = {}
-    for variant, variant_families in variants.items():
-        selection_history = final_tuning_selection_history
+    final_best_params_by_variant: dict[str, dict] = {}
+    final_thresholds_by_variant: dict[str, float] = {}
+    final_split_manifests: dict[str, dict] = {}
+    final_epoch_selection: dict[str, str] = {}
+    final_trial_parts: list[pl.DataFrame] = []
+    for variant_index, (
+        variant,
+        variant_families,
+    ) in enumerate(variants.items()):
         train_a = _assemble_raw_fusion_arrays(
             all_train_ids, train_price_latents, train_targets,
             train_links, stores, variant_families, text_fields,
@@ -5133,53 +5236,48 @@ def run_walk_forward_fusion(
             scoped_test_links, stores, variant_families, text_fields,
             require_target=False,
         )
-        train_raw = _covariate_matrix(train_a[0], train_features, covariate_columns)
-        test_raw = _covariate_matrix(test_a[0], scoped_test_features, covariate_columns)
-        variant_params = dict(final_best_params)
-        threshold = float(final_tuning_threshold)
-        variant_selection_manifest = final_split_manifest
+        train_raw = _covariate_matrix(
+            train_a.index, train_features, covariate_columns
+        )
+        test_raw = _covariate_matrix(
+            test_a.index, scoped_test_features, covariate_columns
+        )
         raw_train_sequence = raw_train_padding = None
         if market_encoder == "tft":
             raw_train_sequence, raw_train_padding = _temporal_covariate_matrix(
-                train_a[0],
+                train_a.index,
                 train_features,
                 temporal_covariate_columns,
                 max_temporal_lookback,
             )
-        if variant != tuning_variant:
-            variant_selection_params = {
-                **variant_params,
-                "epochs": int(fusion_epochs),
-            }
-            (
-                inner_model,
-                inner_history,
-                threshold,
-                _,
-                _,
-                variant_selection_manifest,
-            ) = fit_inner_candidate(
-                scope_name="final_full_training",
-                base_arrays=train_a,
-                raw_covariates=train_raw,
-                raw_sequence=raw_train_sequence,
-                raw_padding=raw_train_padding,
-                params=variant_selection_params,
-                candidate_seed=seed + 910_000,
-            )
-            variant_params["epochs"] = int(
-                inner_history[0]["selected_epoch"]
-            )
-            pl.DataFrame(inner_history).with_columns(
-                pl.lit("final_full_training").alias("scope"),
-                pl.lit(variant).alias("variant"),
-            ).write_csv(
-                output_dir / "inner_selection_histories" /
-                "final_full_training" /
-                f"variant_{variant}_selection.csv"
-            )
-            selection_history = pl.DataFrame(inner_history)
-            del inner_model
+        (
+            variant_params,
+            threshold,
+            final_trials,
+            variant_selection_manifest,
+            selection_history,
+        ) = selection_engine.tune_inner_scope(
+            scope_name=f"final_full_training_variant_{variant}",
+            base_arrays=train_a,
+            raw_covariates=train_raw,
+            raw_sequence=raw_train_sequence,
+            raw_padding=raw_train_padding,
+            study_name=(
+                f"{price_encoder}_{market_encoder}_nested_final_{variant}_"
+                f"{study_signature}_v{SELECTION_PROTOCOL_VERSION}"
+            ),
+            study_seed=seed + 900_000 + 1_000 * variant_index,
+        )
+        final_best_params_by_variant[variant] = variant_params
+        final_thresholds_by_variant[variant] = float(threshold)
+        final_split_manifests[variant] = variant_selection_manifest
+        final_epoch_selection[variant] = variant_selection_manifest[
+            "epoch_selection"
+        ]
+        final_trial_parts.append(final_trials.with_columns(
+            pl.lit(None).cast(pl.Int8).alias("outer_fold"),
+            pl.lit(variant).alias("variant"),
+        ))
         scaler = _fit_covariate_scaler(train_raw)
         train_cov = _apply_covariate_scaler(train_raw, scaler)
         test_cov = _apply_covariate_scaler(test_raw, scaler)
@@ -5191,11 +5289,11 @@ def run_walk_forward_fusion(
         )
         if market_encoder == "tft":
             train_sequence, train_padding = _temporal_covariate_matrix(
-                train_a[0], train_features, temporal_covariate_columns,
+                train_a.index, train_features, temporal_covariate_columns,
                 selected_temporal_lookback,
             )
             test_sequence, test_padding = _temporal_covariate_matrix(
-                test_a[0], scoped_test_features, temporal_covariate_columns,
+                test_a.index, scoped_test_features, temporal_covariate_columns,
                 selected_temporal_lookback,
             )
             temporal_scaler = _fit_temporal_scaler(
@@ -5253,7 +5351,11 @@ def run_walk_forward_fusion(
             selection_history_frame
         )
         model, history = fit_raw_fusion_model(
-            train_a[1], train_cov, train_a[2], stores, train_a[4],
+            train_a.price,
+            train_cov,
+            train_a.text_indices,
+            stores,
+            train_a.target,
             device, text_dim=raw_text_dim,
             batch_size=fusion_batch_size, seed=seed,
             market_encoder=market_encoder,
@@ -5264,7 +5366,7 @@ def run_walk_forward_fusion(
             text_attention_layers=text_attention_layers,
             cross_stock_attention=cross_stock_attention,
             cross_stock_attention_heads=cross_stock_attention_heads,
-            stock_group_ids=stock_groups(train_a[0]),
+            stock_group_ids=stock_groups(train_a.index),
             adapter_learning_rate_multiplier=(
                 adapter_learning_rate_multiplier
             ),
@@ -5338,15 +5440,20 @@ def run_walk_forward_fusion(
             final_history_frame
         )
         score = predict_raw_fusion(
-            model, test_a[1], test_cov, test_a[2], stores, device,
+            model,
+            test_a.price,
+            test_cov,
+            test_a.text_indices,
+            stores,
+            device,
             market_encoder=market_encoder,
             market_sequence=test_sequence,
             sequence_padding_mask=test_padding,
             cross_stock_attention=cross_stock_attention,
-            stock_group_ids=stock_groups(test_a[0]),
+            stock_group_ids=stock_groups(test_a.index),
         )
         final_thresholds[model_name] = threshold
-        final_prediction_parts.append(test_a[0].with_columns(
+        final_prediction_parts.append(test_a.index.with_columns(
             (pl.col("row_id") - test_row_offset).cast(pl.UInt32).alias("row_id"),
             pl.lit(model_name).alias("model"),
             pl.Series("y_score", score.astype(np.float32)),
@@ -5358,6 +5465,47 @@ def run_walk_forward_fusion(
         gc.collect()
         if device == "mps":
             torch.mps.empty_cache()
+
+    if final_trial_parts:
+        tuning_trials_table = pl.concat(
+            [tuning_trials_table, *final_trial_parts],
+            how="diagonal_relaxed",
+        ).sort(["outer_fold", "variant", "trial"], nulls_last=True)
+    tuning_trials_table.write_csv(
+        output_dir / "nested_optuna_trials.csv"
+    )
+    (output_dir / "best_hyperparameters.json").write_text(json.dumps({
+        "selection": "per_variant_nested_inner_validation",
+        "epoch_selection": final_epoch_selection,
+        "optuna_study_signature": study_signature,
+        "cross_stock_attention": bool(cross_stock_attention),
+        "cross_stock_attention_heads": (
+            cross_stock_attention_heads
+            if cross_stock_attention else None
+        ),
+        "training_mode": (
+            "nested-folds" if run_outer_folds else "full-only"
+        ),
+        "outer_fold_hyperparameters": {
+            str(fold): params
+            for fold, params in outer_best_params.items()
+        },
+        "final_hyperparameters": final_best_params_by_variant,
+        "final_decision_threshold": final_thresholds_by_variant,
+        "threshold_calibrated": bool(calibrate_decision_threshold),
+        "fixed_decision_threshold": float(fixed_decision_threshold),
+        "final_inner_split": {
+            variant: {
+                key: (
+                    str(value)
+                    if key.endswith(("_end", "_start")) else value
+                )
+                for key, value in manifest.items()
+            }
+            for variant, manifest in final_split_manifests.items()
+        },
+        "test_data_used_for_selection": False,
+    }, indent=2, sort_keys=True))
 
     training_diagnostics = _write_training_diagnostics(
         diagnostic_histories,

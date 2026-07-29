@@ -16,6 +16,7 @@ from chronos2_lora_fusion import (
 )
 from latent_fusion import (
     _early_stopping_reached,
+    _raw_fusion_validation_metrics,
     _select_decision_threshold,
     fit_raw_fusion_model,
 )
@@ -57,6 +58,41 @@ class FakeRawStore:
 
 
 class Chronos2LoRAFusionTests(unittest.TestCase):
+    def test_validation_metrics_apply_supplied_training_threshold(self):
+        class ProbabilityModel(nn.Module):
+            def forward(self, price, covariates, articles, masks):
+                del covariates, articles, masks
+                return torch.logit(price[:, 0])
+
+        with patch(
+            "latent_fusion._best_validation_threshold",
+            side_effect=AssertionError(
+                "evaluation labels must not select a new threshold"
+            ),
+        ):
+            metrics = _raw_fusion_validation_metrics(
+                ProbabilityModel(),
+                np.array([[0.60], [0.70]], dtype=np.float32),
+                np.zeros((2, 1), dtype=np.float32),
+                {},
+                {},
+                np.array([0.0, 1.0], dtype=np.float32),
+                "cpu",
+                2,
+                "mlp",
+                None,
+                None,
+                decision_threshold=0.65,
+            )
+
+        self.assertEqual(metrics["validation_accuracy"], 1.0)
+        self.assertEqual(metrics["validation_balanced_accuracy"], 1.0)
+        self.assertEqual(metrics["validation_decision_threshold"], 0.65)
+        self.assertNotIn(
+            "validation_optimized_threshold",
+            metrics,
+        )
+
     def test_fixed_decision_threshold_does_not_require_validation_scores(self):
         threshold = _select_decision_threshold(
             np.empty(0, dtype=np.int8),
@@ -182,7 +218,7 @@ class Chronos2LoRAFusionTests(unittest.TestCase):
         with patch(
             "latent_fusion._raw_fusion_validation_metrics",
             return_value=validation_metrics,
-        ):
+        ) as validation_metric_mock:
             _, history = fit_raw_fusion_model(
                 values,
                 values,
@@ -206,6 +242,7 @@ class Chronos2LoRAFusionTests(unittest.TestCase):
                 validation_covariates=values,
                 validation_text_indices=text_indices,
                 validation_target=target,
+                validation_decision_threshold=0.65,
                 early_stopping_min_epochs=3,
                 early_stopping_patience=1,
             )
@@ -213,6 +250,11 @@ class Chronos2LoRAFusionTests(unittest.TestCase):
         self.assertEqual(len(history), 4)
         self.assertEqual(history[0]["best_epoch"], 3.0)
         self.assertEqual(history[-1]["stopped_early"], 1.0)
+        self.assertTrue(validation_metric_mock.call_args_list)
+        self.assertTrue(all(
+            call.kwargs["decision_threshold"] == 0.65
+            for call in validation_metric_mock.call_args_list
+        ))
 
     def test_toplora_starts_as_the_frozen_base_map(self):
         base = nn.Linear(4, 3, bias=False)
